@@ -1,0 +1,39 @@
+# === Python 通用 ===
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === 虚拟环境 & 密钥（重中之重）===
+.venv/
+.env
+.env.local
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# === 工具缓存 ===
+.ruff_cache/
+.pytest_cache/
+
+# === 项目运行时产物 ===
+chroma_db/              # 向量库（代码默认路径）
+data/chroma_db/
+data/chroma/
+data/vault/             # 个人笔记，不进 git
+data/*.db
+models/                 # reranker 模型 ~1.1GB
+eval/results/           # 评测结果
+
+# === Notebook 检查点 ===
+notebooks/.ipynb_checkpoints/
+
+# === OS ===
+.DS_Store
+Thumbs.db
