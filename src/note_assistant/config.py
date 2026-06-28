@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     longcat_model: str
 
     # === Retrieval ===
+    bm25_index_path: Path = Path("./data/bm25.pkl")
     chunk_size: int = 800
     chunk_overlap: int = 150
     bm25_weight: float = 0.3

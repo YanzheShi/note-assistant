@@ -26,3 +26,11 @@ class ExtractedChunk:
     placeholder: str   # 在原文中的占位符
     raw: str           # 原始内容
     context: str       # 前后文（用于生成描述/summary）
+
+
+@dataclass
+class Chunk:
+    """切分后的 chunk，业务层统一结构"""
+    page_content: str
+    metadata: Dict[str, Any]
+    kind: str = "text"  # "text" | "extracted_summary" | "front_matter"

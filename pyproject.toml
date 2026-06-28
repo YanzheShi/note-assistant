@@ -2,7 +2,7 @@
 name = "note-assistant"
 version = "0.1.0"
 description = "RAG-powered personal knowledge base assistant for Obsidian notes"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     # LangChain
     "langchain==1.3.11",
@@ -16,6 +16,7 @@ dependencies = [
     "FlagEmbedding",
     # Retrieval
     "rank-bm25",
+    "jieba",
     # Vector DB
     "chromadb>=1.0,<2",
     # Parsing
@@ -29,6 +30,9 @@ dependencies = [
     "tqdm",
     "langchain-core>=1.4.8",
     "ollama>=0.6.2",
+    "transformers>=5.12.1",
+    "openai>=2.44.0",
+    "jieba>=0.42.1",
 ]
 
 [build-system]

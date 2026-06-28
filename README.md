@@ -79,13 +79,9 @@ Obsidian 是我的个人知识库，累计数百篇 Markdown 笔记，涵盖技�
 > 
 > 已装 Ollama，bge-m 3 C-MTEB 中文 65.79 > v 1.5 的 64.53，且 8192 上下文更长。代价是 Ollama 只暴露 dense 向量，sparse 用 BM 25 补——等价替代，不亏。
 
-> 📌 **为什么 DeepSeek V 4-Pro 而不是继续 V 3.2？**​
-> 
-> V 3.2 的永久折扣已取消，V 4-Pro 国产 coding SOTA（80.6% SWE-bench），¥3/¥6 绝对值仍白菜，8 天项目估计烧 20~40 元。
-
 > 📌 **为什么 FastAPI 而不是 LangServe 直接挂？**​
 > 
-> LangServe 够 V 1 用，但后续要加"来源溯源格式化 + 双链扩展 + 流式 yield"时，FastAPI 自己写更可控，简历上也更像"后端"而非"调库"。
+> LangServe 够 V 1 用，但后续要加"来源溯源格式化 + 双链扩展 + 流式 yield"时，FastAPI 自己写更可控
 
 
 ## 三、项目难点
@@ -97,4 +93,3 @@ Obsidian 是我的个人知识库，累计数百篇 Markdown 笔记，涵盖技�
 | Markdown 表格              | ✅ 但要结构化                    | 表级 summary + 行级切片，双路存     |
 | Mermaid 流程图              | ✅ 但特殊                      | 源码保留 + LLM 生成文字描述一起 embed |
 | 图片                       | ⚠️ 看情况                     | 路径存 metadata + 两种可选方案（见下） |
-|       

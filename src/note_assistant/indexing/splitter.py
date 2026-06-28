@@ -10,7 +10,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from note_assistant.config import settings
-from note_assistant.indexing.types import DocNode
+from note_assistant.indexing.types import DocNode, Chunk
 from note_assistant.indexing.vault_loader import VaultLoader
 
 
@@ -63,22 +63,25 @@ def docnode_to_lc_doc(node: DocNode) -> Document:
     业务层 DocNode → LC Document，仅用于调用 LC Splitter/VectorStore
     注意：不转 front_matter（嵌套结构，Chroma 不支持）
     """
+    metadata = {
+        "filepath": node.filepath,
+        "title": node.title,
+        "wikilinks": node.wikilinks,
+        # 不转front_matter（嵌套结构，Chroma不支持），双链直接从DocNode.headings取行号
+    }
+    # ChromaDB 不接受空列表作为 metadata 值，tags 为空则不设置
+    if node.tags:
+        metadata["tags"] = node.tags
     return Document(
         page_content=node.raw_md,
-        metadata={
-            "filepath": node.filepath,
-            "title": node.title,
-            "tags": node.tags,
-            "wikilinks": node.wikilinks,
-            # 不转front_matter（嵌套结构，Chroma不支持），双链直接从DocNode.headings取行号
-        },
+        metadata=metadata,
     )
 
 
 # ================================================================
 # v1: 单层 Recursive（基线，你下午填实现）
 # ================================================================
-def split_v1(node: DocNode, sp: RecursiveCharacterTextSplitter) -> List[Dict[str, Any]]:
+def split_v1(node: DocNode, sp: RecursiveCharacterTextSplitter) -> List[Chunk]:
     """
     基线版本：纯 Recursive 切分，不保留标题层级
     你下午要实现的核心点：
@@ -97,10 +100,10 @@ def split_v1(node: DocNode, sp: RecursiveCharacterTextSplitter) -> List[Dict[str
 
         # 基线版不添加heading_path，因为没有标题层级信息
         meta.update({"chunk_index": i})
-        result.append({
-            "page_content": chunk.page_content,
-            "metadata": meta,
-        })
+        result.append(Chunk(
+            page_content=chunk.page_content,
+            metadata=meta,
+        ))
 
     return result
 
@@ -111,14 +114,14 @@ def split_v2(
     node: DocNode,
     header_sp: MarkdownHeaderTextSplitter,
     child_sp: RecursiveCharacterTextSplitter,
-) -> List[Dict[str, Any]]:
+) -> List[Chunk]:
     """
     生产路候选：HeaderSplitter 保标题层级 → Recursive 细切
-    你下午要实现的核心决策点：
+    核心决策点：
     1. HeaderSplitter 调用 split_text，入参是 node.raw_md（不是 LC Document）
-    2. heading_path 拼接逻辑：h1 空时 skip（适配你的 ## 起手笔记，避免 "> 一、xxx" 这种畸形路径）
-    3. wikilinks 整篇级缝入每个 chunk（还是等 Day3 再做 chunk 级？）
-    4. 确认 h1/h2/h3 是否正确继承到子 chunk 的 metadata
+    2. heading_path 拼接逻辑：h1 空时 skip（适配 ## 起手笔记，避免 "> 一、xxx" 畸形路径）
+    3. wikilinks 整篇级缝入每个 chunk（Day3 可升级到 chunk 级）
+    4. h1/h2/h3 正确继承到子 chunk 的 metadata
     """
     # 1. 得到父块（List[Document]）
     parent_chunks = header_sp.split_text(node.raw_md)
@@ -138,7 +141,10 @@ def split_v2(
 
         hp = " > ".join(p for p in hp_parts if p) or "无标题"
         meta["heading_path"] = hp
-        result.append({"page_content": fc.page_content, "metadata": meta})
+        result.append(Chunk(
+            page_content=fc.page_content,
+            metadata=meta,
+        ))
 
     return result
 
@@ -150,7 +156,7 @@ def split_v2b(
     node: DocNode,
     header_sp: MarkdownHeaderTextSplitter,
     child_sp: RecursiveCharacterTextSplitter,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> Dict[str, List[Chunk]]:
     """
     预留 Hierarchical Parent-Child 模式：
     - parents：HeaderSplitter 切出的未细切父 chunk
@@ -168,7 +174,7 @@ def split_v3(
     node: DocNode,
     header_sp: MarkdownHeaderTextSplitter,
     child_sp: RecursiveCharacterTextSplitter,
-) -> List[Dict[str, Any]]:
+) -> List[Chunk]:
     """
     预留 chunk 级 wikilinks 能力：
     每个 chunk 的 content 重扫 [[...]]，仅保留本 chunk 出现的链接
@@ -200,14 +206,16 @@ if __name__ == "__main__":
     result = split_v1(test_node, sp_v1)
 
     for i, c in enumerate(result):
-        print(f"{i}: , {c}")
+        hp = c.metadata.get("heading_path", "N/A")
+        print(f"[{i}] hp={hp} | {c.page_content[:60]!r}...")
 
     print('-' * 100)
 
     result = split_v2(test_node, hs_v2, cs_v2)
 
     for i, c in enumerate(result):
-        print(f"{i}: , {c}")
+        hp = c.metadata.get("heading_path", "N/A")
+        print(f"[{i}] hp={hp} | {c.page_content[:60]!r}...")
 
     # TODO: 初始化 splitter（调用 make_splitters）
     # TODO: 分别调用 v1/v2 切分测试笔记

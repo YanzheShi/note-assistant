@@ -3,7 +3,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from note_assistant.indexing.types import ExtractedChunk
+from note_assistant.indexing.types import DocNode, ExtractedChunk, Chunk
 
 
 class RichPreprocessor:
@@ -33,23 +33,23 @@ class RichPreprocessor:
 
         return text
 
-    def process_with_meta(self, md_text: str, front_matter: dict) -> tuple[str, list[dict]]:
+    def process_with_meta(self, node: DocNode) -> tuple[str, list[Chunk]]:
         """
         处理文本 + 从 front_matter 生成额外可检索 chunk。
-        调用方应把 front_matter 从 VaultLoader 传进来。
+        入参是 DocNode，直接从 node 取 raw_md 和 front_matter。
 
         返回: (cleaned_text, extra_chunks)
-            extra_chunks: list[{"page_content": str, "metadata": dict}]
+            extra_chunks: list[Chunk] — front_matter 衍生的可检索 chunk
         """
-        cleaned = self.process(md_text)
-        extra_chunks = self._build_front_matter_chunks(front_matter)
+        cleaned = self.process(node.raw_md)
+        extra_chunks = self._build_front_matter_chunks(node.front_matter)
         return cleaned, extra_chunks
 
     # ──────────────────────────────────────────────
     # 还原（切分后调用）
     # ──────────────────────────────────────────────
 
-    def restore(self, chunks: list[dict]) -> list[dict]:
+    def restore(self, chunks: list[Chunk]) -> list[Chunk]:
         """
         将 chunk 中的占位符还原为原始内容。
         在 split() 之后、embed 之前调用。
@@ -61,8 +61,8 @@ class RichPreprocessor:
         """
         restored = []
         for chunk in chunks:
-            content = chunk["page_content"]
-            metadata = dict(chunk.get("metadata", {}))
+            content = chunk.page_content
+            metadata = dict(chunk.metadata)
 
             # 找出这个 chunk 里出现了哪些占位符
             found = self._find_placeholders(content)
@@ -78,10 +78,11 @@ class RichPreprocessor:
                 for ext in found:
                     content = content.replace(ext.placeholder, ext.raw)
 
-            restored.append({
-                "page_content": content,
-                "metadata": metadata,
-            })
+            restored.append(Chunk(
+                page_content=content,
+                metadata=metadata,
+                kind=chunk.kind,
+            ))
         return restored
 
     def _find_placeholders(self, text: str) -> list[ExtractedChunk]:
@@ -102,7 +103,7 @@ class RichPreprocessor:
     # 富结构摘要 → 可检索 chunk
     # ──────────────────────────────────────────────
 
-    def generate_summaries(self) -> list[dict]:
+    def generate_summaries(self) -> list[Chunk]:
         """
         为抽取的富结构生成可检索的文本描述，作为独立 chunk 入库。
 
@@ -111,7 +112,7 @@ class RichPreprocessor:
               metadata 标记 source="extracted" + 对应 placeholder，
               命中后 restore 阶段可以还原原始内容。
 
-        返回: list[{"page_content": str, "metadata": dict}]
+        返回: list[Chunk]
         """
         summary_chunks = []
         for ext in self.extracted:
@@ -143,21 +144,22 @@ class RichPreprocessor:
             else:
                 summary = ext.raw[:200]
 
-            summary_chunks.append({
-                "page_content": summary,
-                "metadata": {
+            summary_chunks.append(Chunk(
+                page_content=summary,
+                metadata={
                     "kind": ext.kind,
                     "source": "extracted_summary",
                     "placeholder": ext.placeholder,
-                }
-            })
+                },
+                kind="extracted_summary",
+            ))
         return summary_chunks
 
     # ──────────────────────────────────────────────
     # Front Matter → 可检索 chunk
     # ──────────────────────────────────────────────
 
-    def _build_front_matter_chunks(self, front_matter: dict) -> list[dict]:
+    def _build_front_matter_chunks(self, front_matter: dict) -> list[Chunk]:
         """
         把 YAML front_matter 中的 tags / aliases 转成可检索 chunk。
         这些内容不在正文里出现，但用户可能通过 tag 搜索。
@@ -171,13 +173,14 @@ class RichPreprocessor:
                 tags_text = ", ".join(str(t) for t in tags)
             else:
                 tags_text = str(tags)
-            chunks.append({
-                "page_content": f"Tags: {tags_text}",
-                "metadata": {
+            chunks.append(Chunk(
+                page_content=f"Tags: {tags_text}",
+                metadata={
                     "kind": "tags",
                     "source": "front_matter",
-                }
-            })
+                },
+                kind="front_matter",
+            ))
 
         # aliases → 一个独立 chunk（解决 "RAG" 也能搜到 "Retrieval-Augmented Generation" 的问题）
         aliases = front_matter.get("aliases")
@@ -186,13 +189,14 @@ class RichPreprocessor:
                 aliases_text = ", ".join(str(a) for a in aliases)
             else:
                 aliases_text = str(aliases)
-            chunks.append({
-                "page_content": f"别名: {aliases_text}",
-                "metadata": {
+            chunks.append(Chunk(
+                page_content=f"别名: {aliases_text}",
+                metadata={
                     "kind": "aliases",
                     "source": "front_matter",
-                }
-            })
+                },
+                kind="front_matter",
+            ))
 
         return chunks
 

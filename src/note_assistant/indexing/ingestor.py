@@ -1,9 +1,10 @@
 import chromadb
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List
 
 from note_assistant.config import settings
 from note_assistant.indexing.embedder import OllamaEmbedder
+from note_assistant.indexing.types import Chunk
 from note_assistant.indexing.vault_loader import VaultLoader
 from note_assistant.indexing.preprocessor import RichPreprocessor
 from note_assistant.indexing.splitter import make_splitters, split_v2
@@ -32,9 +33,9 @@ class Ingestor:
     # ──────────────────────────────────────────────
     # 增量：先删旧 chunk，再写新 chunk
     # ──────────────────────────────────────────────
-    def upsert(self, chunks: List[Dict[str, Any]]) -> int:
+    def upsert(self, chunks: List[Chunk]) -> int:
         """
-        chunks: [{"page_content": str, "metadata": dict}, ...]
+        chunks: List[Chunk]
         统一 upsert，自动生成 ID + embedding。
         """
         if not chunks:
@@ -42,13 +43,17 @@ class Ingestor:
 
         ids = []
         for i, c in enumerate(chunks):
-            fp = c["metadata"].get("filepath", "unknown")
-            kind = c["metadata"].get("kind", "text")
-            ids.append(self._make_id(fp, i, kind))
+            fp = c.metadata.get("filepath", "unknown")
+            ids.append(self._make_id(fp, i, c.kind))
 
-        embeddings = self.embedder.embed([c["page_content"] for c in chunks])
-        metadatas = [c.get("metadata", {}) for c in chunks]
-        documents = [c["page_content"] for c in chunks]
+        # ChromaDB 不接受空列表作为 metadata 值，清理掉
+        metadatas = []
+        for c in chunks:
+            clean = {k: v for k, v in c.metadata.items() if not (isinstance(v, list) and len(v) == 0)}
+            metadatas.append(clean)
+
+        embeddings = self.embedder.embed([c.page_content for c in chunks])
+        documents = [c.page_content for c in chunks]
 
         self.collection.upsert(
             ids=ids,
@@ -89,8 +94,8 @@ class Ingestor:
         total_chunks = 0
 
         for node in docs:
-            # 1. preprocessor 抽取富结构 → cleaned text
-            cleaned, _ = preprocessor.process_with_meta(node.raw_md, node.front_matter)
+            # 1. preprocessor 抽取富结构 → cleaned text + front_matter chunks
+            cleaned, fm_chunks = preprocessor.process_with_meta(node)
 
             # 2. header + recursive 切分
             chunks = split_v2(node, hs, cs)
@@ -100,20 +105,21 @@ class Ingestor:
 
             # 4. 补 wikilinks + filepath metadata（整篇级）
             for c in chunks:
-                c["metadata"]["wikilinks"] = node.wikilinks
-                c["metadata"]["filepath"] = node.filepath
-                c["metadata"]["title"] = node.title
-                c["metadata"]["tags"] = node.tags
-                c["metadata"]["kind"] = "text"
+                c.metadata["wikilinks"] = node.wikilinks
+                c.metadata["filepath"] = node.filepath
+                c.metadata["title"] = node.title
+                # ChromaDB 不接受空列表作为 metadata 值，tags 为空则不设置
+                if node.tags:
+                    c.metadata["tags"] = node.tags
 
-            # 5. 辅路：富结构 summary chunks
+            # 5. 辅路：富结构 summary chunks（补 metadata）
             summary_chunks = preprocessor.generate_summaries()
             for sc in summary_chunks:
-                sc["metadata"]["filepath"] = node.filepath
-                sc["metadata"]["title"] = node.title
+                sc.metadata["filepath"] = node.filepath
+                sc.metadata["title"] = node.title
 
             # 6. 入库
-            all_chunks = chunks + summary_chunks
+            all_chunks = chunks + summary_chunks + fm_chunks
             n = self.upsert(all_chunks)
             total_chunks += n
 
@@ -123,4 +129,4 @@ class Ingestor:
 if __name__ == "__main__":
     ing = Ingestor()
     stats = ing.index_vault(wipe=True)
-    print(f"✅ 索引完成: {stats["files"]} 篇 → {stats["chunks"]} chunks")
+    print(f"✅ 索引完成: {stats['files']} 篇 → {stats['chunks']} chunks")
