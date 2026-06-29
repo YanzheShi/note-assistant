@@ -477,8 +477,8 @@ title: Test
             # 不应以 " > " 开头（空 h1 被 skip）
             assert not hp.startswith(" > ")
 
-    def test_v2_metadata_has_heading_fields(self, tmp_path):
-        """v2 chunk metadata 应包含 h1-h4 字段（来自 MarkdownHeaderTextSplitter）"""
+    def test_v2_propagates_node_metadata(self, tmp_path):
+        """v2 chunk 应携带 node 的基础 metadata（filepath/title/wikilinks）"""
         node = _make_node(tmp_path, "v2_meta.md", """---
 title: Test
 ---
@@ -491,7 +491,8 @@ title: Test
         chunks = split_v2(node, hs, cs)
 
         for c in chunks:
-            # MarkdownHeaderTextSplitter 产出 h1/h2/h3/h4 字段
+            assert c.metadata.get("filepath") == "v2_meta.md"
+            assert c.metadata.get("title") == "Test"
             assert "h2" in c.metadata or "h1" in c.metadata
 
 

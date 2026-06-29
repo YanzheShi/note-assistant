@@ -1,8 +1,3 @@
-"""
-Splitter 模块框架 —— 所有 TODO 是你下午要完成的决策/实现点
-核心约束：输入是 DocNode（业务层），LC 转换仅在内部边界发生，对外不暴露 LC 类型
-"""
-
 from typing import List, Dict, Any
 from pathlib import Path
 
@@ -133,9 +128,19 @@ def split_v2(
     # 2. 细切父块（继承metadata）
     fine_chunks = child_sp.split_documents(parent_chunks)
 
+    # 构建整篇级 metadata（与 v1 保持一致）
+    base_meta = {
+        "filepath": node.filepath,
+        "title": node.title,
+        "wikilinks": node.wikilinks,
+    }
+    if node.tags:
+        base_meta["tags"] = node.tags
+
     result = []
     for fc in fine_chunks:
-        meta = dict(fc.metadata)
+        # 先放整篇级 metadata，再用 chunk 自身的 h1-h4 覆盖
+        meta = {**base_meta, **fc.metadata}
         # 从metadata里取h1-h4，拼接成路径
         hp_parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4"]]
 

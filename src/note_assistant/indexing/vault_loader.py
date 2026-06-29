@@ -1,4 +1,3 @@
-# src/note_assistant/indexing/vault_loader.py
 from pathlib import Path
 import re
 import yaml

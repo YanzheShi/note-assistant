@@ -16,7 +16,6 @@
   - 为什么用chromadb而不用FAISS?
     - 个人项目，存储量级小，并发要求低，而且chromadb ，检索，持久化都方便
 
-  - 
   - 先用已有的，安装好的模型，看实现效果如何？ 避免项目初期和调试期消耗过多token
 
 - **拒掉的路**:
@@ -36,7 +35,7 @@
 2. 一开始加载笔记的时候返回粗略的 dict 模型，其他流程在取值的时候，容易因为拼写或记错了导致 key error。所以需要抽象出一个  DocNode的一个类，这样的话后续流程解析 doc 的 key时不容易出错。 而且正儿链路的结构统一
 3. 
 
-## [2026-06-26]  问题：  md 中存在大量的代码，表格，mermaid 流程代码块，这些结构化的内容在切分时候被切断
+## [2026-06-27]  问题：  md 中存在大量的代码，表格，mermaid 流程代码块，这些结构化的内容在切分时候被切断
 
 一开始使用 markdownHeadersplier 和 RecursiveCharacterTextSplitter， 发现会截断代码或者表格，后续询问 ai 了解需要用预处理占位符来 避免这种情况， 也就是 在切分前 先把这些不可切分的块使用不可能被切分占位符代替，等到切分完毕后， 再把占位符替换为原始内容， 恢复完之后用 恢复后的每个chunk的 内容存入向量数据库。
 
@@ -62,5 +61,33 @@
 
 
 
+## [2026-06-28]  优化：bm25 语义检索引入jieba 进行分词
 
-- 
+bm25 默认分词按空格分词， 不适用于中文，jieba可以根据中文语义进行合理分词
+
+分词 jieba.lcut()  直接返回 分词列表，  cut() 方法返回的是执行器
+
+---
+
+## [2026-06-28]  Day 2：混合检索 + Reranker
+
+### 完成
+- **BM25 稀疏检索** (`src/retrieval/sparse_retriever.py`)：jieba 分词 + BM25Okapi，pickle 持久化，from_chroma 从 ChromaDB 建索引
+- **混合检索** (`src/retrieval/hybrid.py`)：dense + sparse 加权融合，alpha 来自 config
+- **Reranker** (`src/retrieval/reranker.py`)：FlagReranker 交叉编码，batch 推理
+- **Query 改写** (`src/retrieval/query_rewrite.py`)：口语 → 陈述句
+- **统一类型** (`src/retrieval/types.py`)：`RetrievalResult` 统一三档检索返回值
+- **对比脚本** (`scripts/compare_retrieval.py`)：A 纯向量 / B 混合 / C 混合+rerank
+- **split_v2 修复**：chunk 现在携带 node 基础 metadata（filepath/title/wikilinks）
+- **测试**：81/82 通过（indexing 24 + retrieval 50 + config 1 已有问题）
+
+### 踩坑
+- `FlagEmbedding 1.4.0` 调 `prepare_for_model()`，`transformers >= 4.34` 已移除 → 加兼容层 monkey-patch
+- `transformers 5.x` 需要 `tokenizers` 从源码编译（需 Rust）→ 降级到 4.44.0
+- Windows GBK 编码导致 emoji 打印报错 → `sys.stdout.reconfigure(encoding="utf-8")`
+- `settings.reranker_model` 写 HuggingFace 名称会联网下载 → 改为本地路径
+
+### 待做（Day 3）
+- 双链图 + 增量索引（见 Day 3 计划）
+
+

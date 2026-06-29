@@ -1,4 +1,3 @@
-# src/note_assistant/config.py
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
@@ -26,7 +25,7 @@ class Settings(BaseSettings):
     collection_name: str = "obsidian_notes"
 
     # === Reranker ===
-    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_model: str = str(PROJECT_ROOT / "models" / "BAAI" / "bge-reranker-v2-m3")
     reranker_top_k: int = 10
 
     # === LLM ===
