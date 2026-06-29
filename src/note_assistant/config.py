@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     embed_dim: int = 1024
 
     # === Vector Store ===
-    chroma_persist_dir: Path = Path("./chroma_db")
+    chroma_persist_dir: Path = Path("./data/chroma")
     collection_name: str = "obsidian_notes"
 
     # === Reranker ===

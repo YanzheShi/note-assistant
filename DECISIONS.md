@@ -89,5 +89,34 @@ bm25 默认分词按空格分词， 不适用于中文，jieba可以根据中文
 
 ### 待做（Day 3）
 - 双链图 + 增量索引（见 Day 3 计划）
+## [2026-06-29]  对wikilink 建图
+使用networkx 保存图， 文档相对路径作为节点， 关联文档建立边
+
+---
+
+## [2026-06-29]  Day 3：图扩展 + 增量索引
+
+### 完成
+- **WikiGraph** (`src/retrieval/graph.py`)：NetworkX 有向图，BFS hop 扩展 + decay score
+- **SyncDB** (`src/note_assistant/indexing/sync.py`)：SQLite 记录 mtime + sha256，增量重索引
+- **RAGChain** (`src/note_assistant/pipeline/rag_chain.py`)：检索 → rerank → 图扩展 → 生成
+- **Generator** (`src/note_assistant/generation/generator.py`)：LangChain ChatPromptTemplate + 流式输出
+- **脚本**：`scripts/full_reindex.py`（全量）、`scripts/reindex.py`（增量）、`scripts/demo_e2e.py`（端到端测试）
+- **测试**：112/113 通过（Day 3 新增 31 个测试）
+
+### 踩坑
+- `_fetch_neighbor_chunks` 用 `collection.query()` 需要 embedding，但 `OllamaEmbedder` 没有 `embed_query()` 方法 → 改用 `collection.get()` 按 metadata 过滤
+- `Generator._format_context` 期望 `RetrievalResult`（属性访问 `.metadata`），但 `rag_chain` 最初传了 `list[str]` → 统一为 `RetrievalResult` 格式
+- `RetrievalResult` 没有默认构造函数（`score` 必须传）→ 图扩展 chunks 的 score 设为 0.0
+- `ChatPromptTemplate.from_messages` 把 `{xxx}` 当模板变量 → 用 `.partial()` 固定 context，只留 `question` 为变量
+- Windows 脚本打印 emoji 报错 → 所有脚本加 `sys.stdout.reconfigure(encoding="utf-8")`
+
+### 待优化（TODO）
+- [ ] **图扩展 chunk 数量未限制**：当前 `_fetch_neighbor_chunks` 对每个邻居文件取所有 chunks（实测拿了 21 个），导致 prompt 膨胀。应限制每个邻居最多 2-3 个 chunk，或加相关性过滤
+- [ ] **图扩展内容无 score 区分**：图扩展 chunks 的 score=0.0，和 rerank 结果混在一起，LLM 无法区分直接命中 vs 关联推荐。应在 prompt 中标注来源类型
+- [ ] **stub 节点未建图时动态更新**：当前 stub 节点只在 `build_from_docs()` 时创建，后续新增笔记不会自动补全断链。增量索引时应检查 stub 节点是否能匹配到新笔记
+- [ ] **BM25 索引未随增量更新**：`reindex.py` 只更新 ChromaDB，未重建 BM25 索引 → 新增/变更文件的 sparse 检索失效
+
+
 
 
