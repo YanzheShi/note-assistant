@@ -28,7 +28,11 @@ class Settings(BaseSettings):
     reranker_model: str = str(PROJECT_ROOT / "models" / "BAAI" / "bge-reranker-v2-m3")
     reranker_top_k: int = 10
 
+
     # === LLM ===
+    agnes_api_key: str
+    agnes_base_url: str
+    agnes_model: str
     deepseek_api_key: str
     longcat_api_key: str
     deepseek_base_url: str = "https://api.deepseek.com/v1"

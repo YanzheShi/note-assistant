@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from note_assistant.pipeline.rag_chain import RAGChain
+from note_assistant.retrieval.types import RetrievalResult
 
 
 # ================================================================
@@ -34,6 +35,11 @@ def _make_mock_retriever():
     retriever.search.return_value = [_make_retrieval_result()]
     retriever.dense.collection.query.return_value = {
         "documents": [["neighbor chunk 1", "neighbor chunk 2"]]
+    }
+    # _fetch_neighbor_chunks 走 ingestor.collection.get
+    retriever.ingestor.collection.get.return_value = {
+        "documents": ["chunk from ingestor"],
+        "metadatas": [{"filepath": "test.md"}],
     }
     return retriever
 
@@ -135,7 +141,9 @@ class TestFetchNeighborChunks:
         )
         neighbors = [("[[不存在的笔记]]", 1.0), ("real_note.md", 1.0)]
         chunks = r._fetch_neighbor_chunks(neighbors)
-        assert len(chunks) == 2 # （stub 被跳过，只取 real_note 的 chunks）
+        # stub 被跳过，只取 real_note 的 1 个 chunk
+        assert len(chunks) == 1
+        assert isinstance(chunks[0], RetrievalResult)
         pass
 
     def test_fetch_from_real_files(self):
@@ -147,5 +155,7 @@ class TestFetchNeighborChunks:
         )
         neighbors = [("test.md", 1.0)]
         chunks = r._fetch_neighbor_chunks(neighbors)
-        assert chunks == ["neighbor chunk 1", "neighbor chunk 2"]
+        # ingestor.get 返回 1 个 chunk
+        assert len(chunks) == 1
+        assert isinstance(chunks[0], RetrievalResult)
         pass
