@@ -160,10 +160,18 @@ def main():
         print(f"\n  总计: {stats['chunks']} chunks 待写入")
         return
 
-    # ─── 5. 向量化 ────────────────────────────
+    # ─── 5. 向量化（分批 Embedding） ────────────
     print("\n[5/6] 向量化（Embedding）...")
     t0 = time.time()
-    embeddings = ingestor.embedder.embed([c.page_content for c in all_chunks])
+    embed_batch_size = 100
+    all_embeddings = []
+    texts = [c.page_content for c in all_chunks]
+    for i in range(0, len(texts), embed_batch_size):
+        batch = texts[i:i + embed_batch_size]
+        embs = ingestor.embedder.embed(batch)
+        all_embeddings.extend(embs)
+        print(f"     vectorizing {len(all_embeddings)}/{len(texts)}")
+    embeddings = all_embeddings
     t1 = time.time()
     print(f"  ✅ 向量化完成: {len(embeddings)} 个向量  ({t1 - t0:.2f}s)")
     print(f"     模型: {settings.embed_model}  维度: {len(embeddings[0]) if embeddings else 0}")

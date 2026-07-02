@@ -15,9 +15,11 @@ RAG 完整管线：检索 -> 图扩展 -> Rerank -> 生成。
         ->
     Generator.generate() -> 最终回答
 """
+import asyncio
 import logging
+import time
 from dataclasses import dataclass, asdict
-from typing import List
+from typing import AsyncIterator, List
 
 from note_assistant.retrieval.types import RetrievalResult
 
@@ -126,6 +128,86 @@ class RAGChain:
             graph_expansion=len(graph_expand_chunks),
             retrieved=len(hybrid_result),
         )
+
+    # ------------------------------------------------------------------
+    # 流式入口
+    # ------------------------------------------------------------------
+
+    async def ask_stream(self, question: str, top_k: int | None = None) -> AsyncIterator[dict]:
+        """
+        真流式问答：检索（同步）→ 流式生成（逐 token）→ 推送 sources。
+
+        流程：
+        1. 同步检索 + rerank + 图扩展（和 ask() 一样）
+        2. yield meta 事件（含检索耗时+图扩展数）
+        3. 流式生成，逐 token yield
+        4. 最后 yield sources 事件
+
+        Yields:
+            {"type": "meta", "retrieve_ms": int, "graph_expansion": int}
+            {"type": "char", "content": str}
+            {"type": "sources", "content": list[SourceInfo], "graph_expansion": int}
+
+        面试考点：
+        - 检索是同步的（~200ms），用 run_in_executor 包进 async context 也没必要
+        - 真正的"流"在 LLM 生成阶段（几秒到十几秒）
+        - sources 在检索完成后就已确定，但放最后推送避免干扰阅读
+        """
+        t0 = time.time()
+
+        # ── 同步检索（放到线程池，避免阻塞 async generator 的事件循环） ──
+        def _do_retrieval():
+            hybrid_result = self.retriever.search(question, top_k=top_k)
+            rerank_result = self.reranker.rerank(question, hybrid_result, top_k=top_k)
+            hit_files_paths = [doc.metadata["filepath"] for doc in rerank_result]
+
+            graph_expand_chunks = []
+            if self.graph and hit_files_paths:
+                expand_file_paths = self.graph.expand(hit_files_paths)
+                graph_expand_chunks = self._fetch_neighbor_chunks(expand_file_paths)
+
+            merge_chunks = rerank_result + graph_expand_chunks
+
+            # 组装 sources
+            sources = []
+            for r in rerank_result:
+                sources.append(SourceInfo(
+                    type="direct",
+                    filepath=r.metadata.get("filepath", ""),
+                    heading=r.metadata.get("heading_path", ""),
+                    preview=r.page_content[:200],
+                    score=r.score,
+                ))
+
+            return merge_chunks, sources, len(graph_expand_chunks)
+
+        merge_chunks, sources, graph_exp_count = await asyncio.to_thread(_do_retrieval)
+        t1 = time.time()
+
+        # ── yield meta ──
+        yield {
+            "type": "meta",
+            "retrieve_ms": int((t1 - t0) * 1000),
+            "graph_expansion": graph_exp_count,
+        }
+
+        # ── 流式生成 ──
+        answer_text = ""
+        if self.generator:
+            try:
+                async for token in self.generator.generate_stream(question, merge_chunks):
+                    answer_text += token
+                    yield {"type": "char", "content": token}
+            except Exception as e:
+                logging.error(f"流式生成失败: {e}")
+                yield {"type": "char", "content": f"\n\n[生成中断: {e}]"}
+
+        # ── 最后 yield sources ──
+        yield {
+            "type": "sources",
+            "content": [s.to_dict() for s in sources],
+            "graph_expansion": graph_exp_count,
+        }
 
     # ------------------------------------------------------------------
     # 图扩展辅助
