@@ -210,6 +210,134 @@ class RAGChain:
         }
 
     # ------------------------------------------------------------------
+    # 跟踪检索入口（逐步骤输出）
+    # ------------------------------------------------------------------
+
+    async def ask_with_trace(self, question: str, top_k: int | None = None) -> AsyncIterator[dict]:
+        """
+        真·逐步骤检索：每完成一步立即 yield，前端实时展示。
+
+        流程：
+            1. Embedding       → yield trace + 得到向量
+            2. 稠密检索         → yield trace + 得到结果
+            3. 稀疏检索         → yield trace + 得到结果
+            4. 融合排序         → yield trace + 得到结果
+            5. Rerank          → yield trace + 得到结果
+            6. 图扩展           → yield trace + 得到结果
+            7. 流式生成         → yield char
+            8. 推送 sources
+
+        Yields:
+            {"type": "trace", "step": "embedding", "ms": 150, "status": "done"}
+            {"type": "trace", "step": "dense_retrieval", "ms": 200, "results": 50, "status": "done"}
+            {"type": "trace", "step": "sparse_retrieval", ...}
+            {"type": "trace", "step": "hybrid_fusion", ...}
+            {"type": "trace", "step": "rerank", ...}
+            {"type": "trace", "step": "graph_expansion", ...}
+            {"type": "meta", ...}
+            {"type": "char", ...}
+            {"type": "sources", ...}
+
+        面试考点：
+        - 每个检索步骤单独 await asyncio.to_thread，确保事件循环不被阻塞
+        - 前端可在收到 trace 事件后立即展示，实现"边检索边显示"
+        """
+        top_k = top_k or self.retriever.top_k
+        t_global = time.time()
+
+        # ── 1. Embedding ──
+        t0 = time.time()
+        query_embedding = await asyncio.to_thread(self.retriever.embedder.embed_one, question)
+        yield {"type": "trace", "step": "embedding", "ms": int((time.time() - t0) * 1000), "status": "done"}
+
+        # ── 2. 稠密检索 ──
+        t0 = time.time()
+        dense_results = await asyncio.to_thread(self.retriever._dense_search, query_embedding, 50)
+        yield {
+            "type": "trace", "step": "dense_retrieval", "ms": int((time.time() - t0) * 1000),
+            "results": len(dense_results), "status": "done",
+            "preview": dense_results[0].page_content[:100] if dense_results else "",
+        }
+
+        # ── 3. 稀疏检索 ──
+        t0 = time.time()
+        sparse_results = await asyncio.to_thread(self.retriever._sparse_search, question, 50)
+        yield {
+            "type": "trace", "step": "sparse_retrieval", "ms": int((time.time() - t0) * 1000),
+            "results": len(sparse_results), "status": "done",
+            "preview": sparse_results[0].page_content[:100] if sparse_results else "",
+        }
+
+        # ── 4. 融合排序 ──
+        t0 = time.time()
+        merged = await asyncio.to_thread(self.retriever._merge_results, dense_results, sparse_results)
+        merged = merged[:top_k]
+        yield {
+            "type": "trace", "step": "hybrid_fusion", "ms": int((time.time() - t0) * 1000),
+            "results": len(merged), "status": "done",
+        }
+
+        # ── 5. Rerank ──
+        t0 = time.time()
+        rerank_result = await asyncio.to_thread(self.reranker.rerank, question, merged, top_k)
+        yield {
+            "type": "trace", "step": "rerank", "ms": int((time.time() - t0) * 1000),
+            "results": len(rerank_result), "status": "done",
+            "preview": rerank_result[0].page_content[:100] if rerank_result else "",
+        }
+
+        # ── 6. 图扩展 ──
+        hit_files_paths = [doc.metadata["filepath"] for doc in rerank_result]
+        graph_expand_chunks = []
+        graph_exp_count = 0
+        if self.graph and hit_files_paths:
+            t0 = time.time()
+            expand_file_paths = await asyncio.to_thread(self.graph.expand, hit_files_paths)
+            graph_expand_chunks = await asyncio.to_thread(self._fetch_neighbor_chunks, expand_file_paths)
+            graph_exp_count = len(graph_expand_chunks)
+            yield {
+                "type": "trace", "step": "graph_expansion", "ms": int((time.time() - t0) * 1000),
+                "results": graph_exp_count, "status": "done",
+            }
+
+        merge_chunks = rerank_result + graph_expand_chunks
+        t_retrieval = time.time()
+
+        # ── 组装 sources ──
+        sources = []
+        for r in rerank_result:
+            sources.append(SourceInfo(
+                type="direct",
+                filepath=r.metadata.get("filepath", ""),
+                heading=r.metadata.get("heading_path", ""),
+                preview=r.page_content[:200],
+                score=r.score,
+            ))
+
+        # ── yield meta ──
+        yield {
+            "type": "meta",
+            "retrieve_ms": int((t_retrieval - t_global) * 1000),
+            "graph_expansion": graph_exp_count,
+        }
+
+        # ── 流式生成 ──
+        if self.generator:
+            try:
+                async for token in self.generator.generate_stream(question, merge_chunks):
+                    yield {"type": "char", "content": token}
+            except Exception as e:
+                logging.error(f"流式生成失败: {e}")
+                yield {"type": "char", "content": f"\n\n[生成中断: {e}]"}
+
+        # ── 最后 yield sources ──
+        yield {
+            "type": "sources",
+            "content": [s.to_dict() for s in sources],
+            "graph_expansion": graph_exp_count,
+        }
+
+    # ------------------------------------------------------------------
     # 图扩展辅助
     # ------------------------------------------------------------------
 

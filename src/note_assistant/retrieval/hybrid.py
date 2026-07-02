@@ -3,7 +3,8 @@
 混合检索器：dense（ChromaDB 向量）+ sparse（BM25 稀疏）加权融合
 """
 
-from typing import List
+import time
+from typing import List, AsyncIterator
 
 from note_assistant.config import settings
 from note_assistant.indexing.embedder import OllamaEmbedder
@@ -171,6 +172,44 @@ class HybridRetriever:
 
         # 4. 截断
         return merged[:top_k]
+
+    # ──────────────────────────────────────────────
+    # 跟踪检索（逐步骤输出）
+    # ──────────────────────────────────────────────
+
+    def search_with_trace(self, query: str, top_k: int | None = None) -> tuple[list[RetrievalResult], list[dict]]:
+        """
+        混合检索 + 逐步骤跟踪信息。
+
+        Returns:
+            (merged_results, trace_steps)
+            trace_steps: [{"step": "embedding", "ms": 150},
+                          {"step": "dense_retrieval", "results": 50, "ms": 200}, ...]
+        """
+        top_k = top_k if top_k is not None else self.top_k
+        trace = []
+
+        # 1. Embedding
+        t0 = time.time()
+        query_embedding = self.embedder.embed_one(query)
+        trace.append({"step": "embedding", "ms": int((time.time() - t0) * 1000)})
+
+        # 2. Dense 检索
+        t0 = time.time()
+        dense_results = self._dense_search(query_embedding, n_results=50)
+        trace.append({"step": "dense_retrieval", "results": len(dense_results), "ms": int((time.time() - t0) * 1000)})
+
+        # 3. Sparse 检索
+        t0 = time.time()
+        sparse_results = self._sparse_search(query, top_k=50)
+        trace.append({"step": "sparse_retrieval", "results": len(sparse_results), "ms": int((time.time() - t0) * 1000)})
+
+        # 4. 融合
+        t0 = time.time()
+        merged = self._merge_results(dense_results, sparse_results)
+        trace.append({"step": "hybrid_fusion", "results": len(merged), "ms": int((time.time() - t0) * 1000)})
+
+        return merged[:top_k], trace
 
     # ──────────────────────────────────────────────
     # 便捷方法：从 ChromaDB 建 BM25 索引
