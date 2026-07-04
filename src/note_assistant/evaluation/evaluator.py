@@ -8,7 +8,9 @@
         1. rag_chain.ask(question) → AskResponse
         2. 提取 retrieved_files + context（sources 中的 preview）
         3. 计算检索指标：compute_retrieval_metrics()
-        4. 计算生成指标：compute_generation_metrics()
+        4. 计算生成指标：
+           use_ragas=False → compute_generation_metrics()（手写指标）
+           use_ragas=True  → batch_compute_ragas()（RAGAS + 手写混合）
         ↓
     汇总所有问题的指标 → EvalReport
 """
@@ -92,19 +94,26 @@ class Evaluator:
         report.save("eval_report.json")
         print(report.retrieval_metrics_avg)
 
+    支持两种生成指标模式：
+        use_ragas=False (默认) — 使用手写指标（ROUGE-L/BLEU/语义相似度 + LLM prompt）
+        use_ragas=True          — 使用 RAGAS 指标（faithfulness/context_precision/context_recall）
+                                  + 手写指标（ROUGE-L/BLEU/语义相似度）作为补充
+
     rag_chain 只需要有 ask(question) → AskResponse 方法即可（鸭子类型）。
     llm 单独传是因为 RAGChain 内部可能没有暴露 LLM 实例。
     """
 
-    def __init__(self, rag_chain, llm=None):
+    def __init__(self, rag_chain, llm=None, use_ragas: bool = False):
         """
         Args:
             rag_chain: RAGChain 实例（或任何有 ask 方法的对象）
             llm: 可选的 LLM 实例，用于 faithfulness + answer_relevance
                  需要有 invoke(messages) 方法
+            use_ragas: 是否使用 RAGAS 框架计算生成指标（默认 False，使用手写指标）
         """
         self.rag_chain = rag_chain
         self.llm = llm
+        self.use_ragas = use_ragas
 
     def run(self, dataset: EvalDataset, k_values: List[int] | None = None) -> EvalReport:
         """
@@ -124,24 +133,51 @@ class Evaluator:
         Returns:
             EvalReport
         """
-
         eval_results = []
+
+        # RAGAS 模式：先收集所有数据，最后批量调用 RAGAS evaluate()
+        if self.use_ragas:
+            ragas_questions: List[str] = []
+            ragas_answers: List[str] = []
+            ragas_contexts: List[List[str]] = []
+            ragas_ground_truths: List[str] = []
+
         for question in dataset.questions:
 
             start = time.time()
             try:
-                ans = self.rag_chain.ask(question)
+                ans = self.rag_chain.ask(question.question)
             except Exception as e:
                 logger.error(f"评测失败: {e}")
                 ans = AskResponse(answer="", sources=[], graph_expansion=0, retrieved=0)
 
             elapsed = (time.time() - start) * 1000
-            
-            retrieved_files = [source.filepath for source in ans.sources]
-            context = " ".join(s.preview for s in ans.sources)
 
-            retrieval_metrics = compute_retrieval_metrics(retrieved_files, question.relevant_files, k_values)
-            generation_metrics = compute_generation_metrics(ans.answer, question.golden_answer, llm=self.llm, context=context, question=question.question)
+            retrieved_files = [source.filepath for source in ans.sources]
+
+            retrieval_metrics = compute_retrieval_metrics(
+                retrieved_files, question.relevant_files, k_values
+            )
+
+            if self.use_ragas:
+                # RAGAS 模式：收集数据，稍后统一批量评估
+                ragas_questions.append(question.question)
+                ragas_answers.append(ans.answer)
+                ragas_contexts.append([s.preview for s in ans.sources])
+                ragas_ground_truths.append(question.golden_answer)
+                # 生成指标先留空，RAGAS 跑完后填充
+                generation_metrics_dict: Dict[str, float] = {}
+            else:
+                # 手写指标模式：逐条计算
+                context = " ".join(s.preview for s in ans.sources)
+                generation_metrics = compute_generation_metrics(
+                    ans.answer,
+                    question.golden_answer,
+                    llm=self.llm,
+                    context=context,
+                    question=question.question,
+                )
+                generation_metrics_dict = generation_metrics.to_dict()
 
             eval_results.append(
                 SingleEvalResult(
@@ -149,13 +185,30 @@ class Evaluator:
                     retrieved_files=retrieved_files,
                     generated_answer=ans.answer,
                     retrieval_metrics=_flatten_retrieval_metrics(retrieval_metrics),
-                    generation_metrics=generation_metrics.to_dict(),
+                    generation_metrics=generation_metrics_dict,
                     elapsed_ms=elapsed,
                 )
             )
 
+        # RAGAS 模式：批量评估后填充生成指标
+        if self.use_ragas and ragas_questions:
+            from note_assistant.evaluation.ragas_metrics import batch_compute_ragas
+
+            try:
+                ragas_scores = batch_compute_ragas(
+                    questions=ragas_questions,
+                    answers=ragas_answers,
+                    contexts=ragas_contexts,
+                    ground_truths=ragas_ground_truths,
+                )
+                for i, r in enumerate(eval_results):
+                    if i < len(ragas_scores):
+                        r.generation_metrics = ragas_scores[i]
+            except Exception as e:
+                logger.error(f"RAGAS 批量评估失败，报告将只包含检索指标: {e}")
+
         avg_retrieval, avg_generation = self._aggregate_metrics(eval_results)
-        avg_elapsed = sum(result.elapsed_ms  for result in eval_results) / len(eval_results)
+        avg_elapsed = sum(result.elapsed_ms for result in eval_results) / len(eval_results)
         return EvalReport(
             dataset_name=dataset.name,
             total_questions=len(dataset.questions),
@@ -189,11 +242,12 @@ class Evaluator:
 
         return avg_retrieval, avg_generation
 
-    def run_single(self, question: str, golden_answer: str, relevant_files: List[str]) -> SingleEvalResult:
+    def run_single(self, question: str, golden_answer: str, relevant_files: List[str], context: str = "") -> SingleEvalResult:
         """
         评测单条问题（调试用）。
 
         和 run() 的逻辑相同，只是不聚合，直接返回 SingleEvalResult。
+        暂不支持 use_ragas=True 模式（调试用建议走手写指标，更轻量）。
         """
         start = time.time()
         try:
@@ -210,19 +264,32 @@ class Evaluator:
         retrieval_metrics = compute_retrieval_metrics(
             retrieved_files, relevant_files
         )
-        generation_metrics = compute_generation_metrics(
-            ans.answer,
-            golden_answer,
-            llm=self.llm,
-            context=context,
-            question=question,
-        )
+
+        if self.use_ragas:
+            # 单条场景用 batch_compute_ragas 包装一下
+            from note_assistant.evaluation.ragas_metrics import batch_compute_ragas
+            scores = batch_compute_ragas(
+                questions=[question],
+                answers=[ans.answer],
+                contexts=[[s.preview for s in ans.sources]],
+                ground_truths=[golden_answer],
+            )
+            generation_metrics_dict = scores[0] if scores else {}
+        else:
+            generation_metrics = compute_generation_metrics(
+                ans.answer,
+                golden_answer,
+                llm=self.llm,
+                context=context,
+                question=question,
+            )
+            generation_metrics_dict = generation_metrics.to_dict()
 
         return SingleEvalResult(
-                question=question,
-                retrieved_files=retrieved_files,
-                generated_answer=ans.answer,
-                retrieval_metrics=_flatten_retrieval_metrics(retrieval_metrics),
-                generation_metrics=generation_metrics.to_dict(),
-                elapsed_ms=elapsed,
-            )
+            question=question,
+            retrieved_files=retrieved_files,
+            generated_answer=ans.answer,
+            retrieval_metrics=_flatten_retrieval_metrics(retrieval_metrics),
+            generation_metrics=generation_metrics_dict,
+            elapsed_ms=elapsed,
+        )

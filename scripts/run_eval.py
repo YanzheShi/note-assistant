@@ -31,10 +31,16 @@ def build_rag_chain():
     from note_assistant.pipeline.rag_chain import RAGChain
     from note_assistant.retrieval.hybrid import HybridRetriever
     from note_assistant.retrieval.reranker import LocalReranker
-    
+    from note_assistant.generation.generator import Generator
+
     retriever = HybridRetriever()
     reranker = LocalReranker()
-    return RAGChain(hybrid_retriever=retriever, reranker=reranker)
+    try:
+        generator = Generator()
+    except Exception as e:
+        logger.warning(f"Generator 初始化失败（答案将为空）: {e}")
+        generator = None
+    return RAGChain(hybrid_retriever=retriever, reranker=reranker, generator=generator)
 
 
 def main():
@@ -60,6 +66,11 @@ def main():
         "--verbose", "-v",
         action="store_true",
         help="详细输出每条问题的指标",
+    )
+    parser.add_argument(
+        "--ragas",
+        action="store_true",
+        help="使用 RAGAS 框架评估生成指标（默认使用手写指标）",
     )
     args = parser.parse_args()
 
@@ -91,7 +102,7 @@ def main():
     logger.info("开始评测...")
     from note_assistant.evaluation.evaluator import Evaluator
     
-    evaluator = Evaluator(rag_chain)
+    evaluator = Evaluator(rag_chain, use_ragas=args.ragas)
     report = evaluator.run(dataset, k_values=args.k)
 
     # 输出报告

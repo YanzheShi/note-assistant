@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Set
 
 
@@ -117,6 +118,7 @@ def ndcg_at_k(retrieved_files: List[str], relevant_files: Set[str], k: int | Non
         nDCG@K = DCG@K / IDCG@K
 
     其中 rel_i ∈ {0, 1} 表示第 i 个检索结果是否相关。
+    注意：重复文档只计一次相关（后续重复视为不相关），防止 nDCG > 1。
 
     边界情况：
     - relevant_files 为空 → 返回 0.0
@@ -134,7 +136,16 @@ def ndcg_at_k(retrieved_files: List[str], relevant_files: Set[str], k: int | Non
         return 0.0
 
     top_k = retrieved_files[:k] if k else retrieved_files
-    rels = [1 if f in relevant_files else 0 for f in top_k]
+
+    # 去重：每个文件第一次出现算相关，后续重复算不相关
+    seen: Set[str] = set()
+    rels = []
+    for f in top_k:
+        if f in relevant_files and f not in seen:
+            rels.append(1)
+            seen.add(f)
+        else:
+            rels.append(0)
 
     dcg = sum(rels[i] / math.log2(i + 2) for i in range(len(top_k)))
     ideal_len = min(len(top_k), len(relevant_files)) if k is None else min(k, len(relevant_files))
@@ -154,6 +165,12 @@ def compute_retrieval_metrics(
     """
     一站式计算所有检索指标。
 
+    路径归一化：如果 relevant_files 是短文件名（不含路径分隔符），
+    则自动从 retrieved_files 中提取 basename 进行比较。
+    支持两种匹配方式：
+        - 短文件名匹配："BM25.md" 匹配 ".../BM25.md" 或 "...\\BM25.md"
+        - 全路径匹配：直接字符串相等
+
     Args:
         retrieved_files: 检索返回的文件路径列表
         relevant_files: 金标准相关文件集合
@@ -164,6 +181,12 @@ def compute_retrieval_metrics(
     """
     if k_values is None:
         k_values = [3, 5, 10]
+
+    # 路径归一化：如果 relevant_files 是短文件名，提取 basename 匹配
+    if relevant_files:
+        sample = next(iter(relevant_files))
+        if not any(sep in sample for sep in ("/", "\\")):
+            retrieved_files = [Path(f).name for f in retrieved_files]
 
     mrr_score = mrr(retrieved_files, relevant_files)
     recall = {k: recall_at_k(retrieved_files, relevant_files, k) for k in k_values}

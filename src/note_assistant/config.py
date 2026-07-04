@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     reranker_model: str = str(PROJECT_ROOT / "models" / "BAAI" / "bge-reranker-v2-m3")
     reranker_top_k: int = 10
 
+    # === RAGAS ===
+    ragas_base_url: str = "http://localhost:11434/v1"
+    ragas_api_key: str = "ollama"
+    ragas_llm_model: str = "qwen2.5:0.5b"
+
 
     # === LLM ===
     agnes_api_key: str
