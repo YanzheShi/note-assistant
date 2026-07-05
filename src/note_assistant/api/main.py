@@ -38,6 +38,13 @@ from note_assistant.api.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# ─── 日志落盘 ──────────────────────────────────────────────────
+_log_dir = settings.chroma_persist_dir.parent / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+_fh = logging.FileHandler(_log_dir / "api.log", encoding="utf-8")
+_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(_fh)
+
 # ─── 全局 RAG Chain ──────────────────────────────────────────
 # lifespan 中初始化，启动后常驻内存
 rag_chain = None
@@ -133,7 +140,7 @@ async def ask(req: AskRequest):
         raise HTTPException(status_code=503, detail="RAG Chain 未初始化，请检查后端状态")
 
     t0 = time.time()
-    ask_response = rag_chain.ask(req.question)
+    ask_response = rag_chain.ask(req.question, history=req.history)
 
     t1 = time.time()
 
@@ -185,7 +192,7 @@ async def ask_stream(req: AskRequest):
         import json as _json
 
         try:
-            async for event in rag_chain.ask_stream(req.question):
+            async for event in rag_chain.ask_stream(req.question, history=req.history):
                 event_type = event.get("type")
 
                 if event_type == "sources":
@@ -250,7 +257,7 @@ async def ask_trace(req: AskRequest):
         import json as _json
 
         try:
-            async for event in rag_chain.ask_with_trace(req.question):
+            async for event in rag_chain.ask_with_trace(req.question, history=req.history):
                 yield f"data: {_json.dumps(event)}\n\n"
         except Exception as e:
             logger.error(f"ask_trace 异常: {e}")

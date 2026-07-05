@@ -88,30 +88,34 @@ class TestInit:
 
 class TestAsk:
     def test_ask_returns_valid_structure(self):
-        """ask 应返回包含 answer/sources 等字段的字典"""
+        """ask 应返回 AskResponse dataclass"""
+        mock_gen = MagicMock()
+        mock_gen.generate.return_value = "测试答案"
         r = RAGChain(
             _make_mock_retriever(),
             _make_mock_reranker(),
             graph=_make_mock_graph(),
-            generator=MagicMock(return_value="测试答案"),
+            generator=mock_gen,
         )
         result = r.ask("测试问题")
-        assert "answer" in result
-        assert "sources" in result
-        assert "graph_expansion" in result
-        assert "retrieved" in result
-        pass
+        assert hasattr(result, "answer")
+        assert hasattr(result, "sources")
+        assert hasattr(result, "graph_expansion")
+        assert hasattr(result, "retrieved")
 
     def test_ask_without_graph(self):
         """不传 graph 也能正常工作（跳过扩展）"""
+        mock_gen = MagicMock()
+        mock_gen.generate.return_value = "无图测试答案"
         r = RAGChain(
             _make_mock_retriever(),
             _make_mock_reranker(),
             graph=None,
-            generator=MagicMock(return_value="无图测试答案"),
+            generator=mock_gen,
         )
         result = r.ask("测试问题")
-        assert result["graph_expansion"] == 0
+        assert result.graph_expansion == 0
+        assert result.answer == "无图测试答案"
         pass
 
     def test_ask_without_generator(self):
@@ -123,7 +127,7 @@ class TestAsk:
             generator=None,
         )
         result = r.ask("无生成器测试")
-        assert result["answer"] == ""
+        assert result.answer == ""
         pass
 
 

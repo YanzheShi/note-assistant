@@ -1,6 +1,6 @@
 # src/note_assistant/generation/generator.py
 """
-答案生成器：RAG 终步，流式输出
+答案生成器：RAG 终步，流式输出。支持多轮对话历史注入。
 """
 
 from langchain.chat_models import init_chat_model
@@ -10,9 +10,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from note_assistant.config import settings
 from note_assistant.retrieval.types import RetrievalResult
 
+# 保留的最近对话轮数（再往前可能 context window 撑爆且参考价值低）
+MAX_HISTORY_TURNS = 10
+
 
 class Generator:
-    """答案生成器：检索结果 + 用户问题 → 最终回答"""
+    """答案生成器：检索结果 + 用户问题 + 历史 → 最终回答"""
 
     SYSTEM_PROMPT = (
         "你是一个个人知识库助手，基于用户提供的笔记内容回答问题。\n"
@@ -48,46 +51,77 @@ class Generator:
             streaming=True
         )
 
-    def build_prompt(self, question: str, context: list[dict]) -> ChatPromptTemplate:
-        context_text = self._format_context(context)
-        # 用 partial 把 system + context 固定，只留 question 为变量
-        return ChatPromptTemplate.from_messages([
-            ("system", self.SYSTEM_PROMPT),
-            ("human", "## 参考笔记\n{context_text}\n\n## 问题\n{question}"),
-        ]).partial(context_text=context_text)
-
-    def generate(self, question: str, context: list[dict]) -> str:
+    @staticmethod
+    def _format_history(history: list[dict]) -> list[tuple[str, str]]:
         """
-        非流式生成完整答案。
+        将历史对话格式化为 LangChain 消息元组列表。
+
+        只保留最近 MAX_HISTORY_TURNS 轮（避免撑爆 context window），
+        且只保留 role 和 content 字段（过滤掉 sources/timing 等前端字段）。
+        """
+        truncated = history[-(MAX_HISTORY_TURNS * 2):]  # 每轮 2 条消息
+        messages = []
+        for msg in truncated:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                # LangChain 用 "human" 对应 "user"，"ai" 对应 "assistant"
+                lc_role = "human" if role == "user" else "ai"
+                messages.append((lc_role, content))
+        return messages
+
+    def build_prompt(self, question: str, context: list[dict], history: list[dict] | None = None) -> ChatPromptTemplate:
+        """
+        构建含历史上下文的 prompt。
+
+        Args:
+            question: 当前问题
+            context: 检索结果（RetrievalResult 列表）
+            history: 历史对话列表，每项 {"role": "user"|"assistant", "content": str}
+
+        Returns:
+            ChatPromptTemplate
+        """
+        context_text = self._format_context(context)
+        messages = [("system", self.SYSTEM_PROMPT)]
+        if history:
+            messages.extend(self._format_history(history))
+        messages.append(("human", "## 参考笔记\n{context_text}\n\n## 问题\n{question}"))
+        return ChatPromptTemplate.from_messages(messages).partial(context_text=context_text)
+
+    def generate(self, question: str, context: list[dict], history: list[dict] | None = None) -> str:
+        """
+        非流式生成完整答案，支持历史对话。
 
         Args:
             question: 用户问题（可能已被 QueryRewriter 改写）
             context: 检索结果列表，每项包含 page_content 和 metadata
+            history: 历史对话列表
 
         Returns:
             完整回答文本
         """
-        agent = self.build_prompt(question, context) | self.llm | StrOutputParser()
+        agent = self.build_prompt(question, context, history) | self.llm | StrOutputParser()
         answer = agent.invoke({"question": question})
         return answer
 
-    async def generate_stream(self, question: str, context: list[dict]):
+    async def generate_stream(self, question: str, context: list[dict], history: list[dict] | None = None):
         """
-        流式生成答案，逐 token 返回。
+        流式生成答案，逐 token 返回。支持历史对话。
 
         Args:
             question: 用户问题
             context: 检索结果列表
+            history: 历史对话列表
 
         Yields:
             每个 token 的文本片段
         """
         context_text = self._format_context(context)
-        messages = [
-            ("system", self.SYSTEM_PROMPT),
-            ("user", f"## 参考笔记\n{context_text}\n\n## 问题\n{question}"),
-        ]
-        print("prompt: ", messages)
+        messages = [("system", self.SYSTEM_PROMPT)]
+        if history:
+            messages.extend(self._format_history(history))
+        messages.append(("human", f"## 参考笔记\n{context_text}\n\n## 问题\n{question}"))
 
         async for chunk in self.llm.astream(messages):
             if chunk.content:

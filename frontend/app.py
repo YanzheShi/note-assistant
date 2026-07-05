@@ -1,5 +1,5 @@
 # frontend/app.py
-"""Streamlit 主入口 —— Obsidian RAG 聊天界面。"""
+"""Streamlit 主入口 —— Obsidian RAG 聊天界面，支持多轮连续对话。"""
 
 import sys
 from pathlib import Path
@@ -34,7 +34,7 @@ with st.sidebar:
 
 # ─── 主标题 ───
 st.title("📚 个人知识库问答")
-st.caption("基于 Obsidian 笔记库的 RAG 系统，支持混合检索 + 双链扩展")
+st.caption("基于 Obsidian 笔记库的 RAG 系统，支持混合检索 + 双链扩展 + 多轮对话")
 st.markdown("---")
 
 # ─── 聊天历史 ───
@@ -61,6 +61,9 @@ with st.chat_message("assistant"):
     full_answer = ""
     result = {"sources": [], "timing": {}}
 
+    # 本轮之前的历史（排除刚添加的当前问题）
+    history = st.session_state.messages[:-1]
+
     if st.session_state.streaming:
         streaming_placeholder = st.empty()
         try:
@@ -77,7 +80,7 @@ with st.chat_message("assistant"):
                 trace_container = st.container()
                 trace_status = st.status("准备检索...", expanded=True)
 
-            for event in fn(API_URL, question):
+            for event in fn(API_URL, question, history=history):
                 if event["type"] == "char":
                     text += event["content"]
                     streaming_placeholder.markdown(text + "▌")
@@ -128,7 +131,7 @@ with st.chat_message("assistant"):
         with st.spinner("检索中..."):
             try:
                 from frontend.utils import ask_question
-                result = ask_question(API_URL, question)
+                result = ask_question(API_URL, question, history=history)
                 full_answer = result.get("answer", "")
             except (ImportError, NotImplementedError):
                 result = {"answer": "（非流式调用待实现）", "sources": [], "timing": {}, "graph_expansion": 0}

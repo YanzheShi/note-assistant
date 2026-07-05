@@ -17,13 +17,14 @@ import json
 import httpx
 
 
-def ask_question(api_url: str, question: str, timeout: float = 120.0) -> dict:
+def ask_question(api_url: str, question: str, history: list[dict] | None = None, timeout: float = 120.0) -> dict:
     """
-    非流式调用 /ask。
+    非流式调用 /ask，支持历史对话。
 
     Args:
         api_url: FastAPI 地址（如 "http://localhost:8000"）
         question: 用户问题
+        history: 历史对话列表
         timeout: 超时秒数
 
     Returns:
@@ -36,9 +37,12 @@ def ask_question(api_url: str, question: str, timeout: float = 120.0) -> dict:
     """
     import time
     t0 = time.time()
+    body = {"question": question}
+    if history:
+        body["history"] = history
     resp = httpx.post(
         f"{api_url}/ask",
-        json={"question": question},
+        json=body,
         timeout=timeout,
     )
 
@@ -51,15 +55,18 @@ def ask_question(api_url: str, question: str, timeout: float = 120.0) -> dict:
     return result
 
 
-def _sse_events(api_url: str, question: str, endpoint: str, timeout: float = 120.0):
+def _sse_events(api_url: str, question: str, endpoint: str, history: list[dict] | None = None, timeout: float = 120.0):
     """
     通用的 SSE 事件流解析器。
 
     向指定 endpoint 发起 POST 请求，逐行解析 "data: " 前缀的 SSE 事件。
     """
+    body = {"question": question}
+    if history:
+        body["history"] = history
     with httpx.stream(
         "POST", f"{api_url}/{endpoint}",
-        json={"question": question},
+        json=body,
         timeout=httpx.Timeout(connect=30.0, read=None, write=timeout, pool=30.0),
     ) as resp:
         for line in resp.iter_lines():
@@ -74,20 +81,20 @@ def _sse_events(api_url: str, question: str, endpoint: str, timeout: float = 120
                 yield json.loads(data_str)
 
 
-def ask_question_stream(api_url: str, question: str, timeout: float = 120.0):
+def ask_question_stream(api_url: str, question: str, history: list[dict] | None = None, timeout: float = 120.0):
     """
-    流式调用 /ask_stream（SSE 事件流）。
+    流式调用 /ask_stream（SSE 事件流），支持历史对话。
 
     事件类型: meta, char, sources
     """
-    yield from _sse_events(api_url, question, "ask_stream", timeout)
+    yield from _sse_events(api_url, question, "ask_stream", history, timeout)
 
 
-def ask_question_trace(api_url: str, question: str, timeout: float = 120.0):
+def ask_question_trace(api_url: str, question: str, history: list[dict] | None = None, timeout: float = 120.0):
     """
-    追踪式流式调用 /ask_trace（SSE 事件流）。
+    追踪式流式调用 /ask_trace（SSE 事件流），支持历史对话。
 
     在 ask_question_stream 的基础上，检索阶段额外输出 trace 事件：
         embedding → dense_retrieval → sparse_retrieval → hybrid_fusion → rerank → graph_expansion
     """
-    yield from _sse_events(api_url, question, "ask_trace", timeout)
+    yield from _sse_events(api_url, question, "ask_trace", history, timeout)

@@ -17,8 +17,12 @@ from pydantic import BaseModel, Field
 # ═══════════════════════════════════════════════════════════════
 
 class AskRequest(BaseModel):
-    """用户提问请求体。"""
+    """用户提问请求体，支持多轮对话历史。"""
     question: str = Field(..., min_length=1, max_length=500, description="用户问题")
+    history: list[dict] = Field(
+        default_factory=list,
+        description="历史对话，[{\"role\": \"user\"|\"assistant\", \"content\": str}, ...]，按时间顺序，最新的在最后",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════

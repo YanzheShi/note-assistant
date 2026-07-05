@@ -78,20 +78,21 @@ class RAGChain:
     # 主入口
     # ------------------------------------------------------------------
 
-    def ask(self, question: str, top_k: int | None = None) -> AskResponse:
+    def ask(self, question: str, top_k: int | None = None, history: list[dict] | None = None) -> AskResponse:
         """
-        【核心逻辑待实现】完整管线：检索 -> rerank -> 图扩展 -> 生成。
+        【核心逻辑待实现】完整管线：检索 -> rerank -> 图扩展 -> 生成，支持多轮历史。
 
         流程：
         1. 混合检索 top-20（dense + sparse 融合）
         2. Rerank -> top-5（交叉编码精排）
         3. 图扩展：从命中文档出发找关联（BFS 1-hop）
         4. 组装 context：直接命中 + 关联扩展
-        5. LLM 生成最终回答
+        5. LLM 生成最终回答（含历史对话）
 
         Args:
             question: 用户问题
             top_k: 最终返回几个结果（默认 config.top_k_rerank）
+            history: 历史对话列表
 
         Returns:
             AskResponse(answer=..., sources=[SourceInfo(...), ...], ...)
@@ -110,7 +111,7 @@ class RAGChain:
 
         answer = ""
         if self.generator:
-            answer = self.generator.generate(question, merge_chunks)
+            answer = self.generator.generate(question, merge_chunks, history=history)
 
         sources = []
         for r in rerank_result:
@@ -133,14 +134,14 @@ class RAGChain:
     # 流式入口
     # ------------------------------------------------------------------
 
-    async def ask_stream(self, question: str, top_k: int | None = None) -> AsyncIterator[dict]:
+    async def ask_stream(self, question: str, top_k: int | None = None, history: list[dict] | None = None) -> AsyncIterator[dict]:
         """
-        真流式问答：检索（同步）→ 流式生成（逐 token）→ 推送 sources。
+        真流式问答：检索（同步）→ 流式生成（逐 token）→ 推送 sources，支持多轮历史。
 
         流程：
         1. 同步检索 + rerank + 图扩展（和 ask() 一样）
         2. yield meta 事件（含检索耗时+图扩展数）
-        3. 流式生成，逐 token yield
+        3. 流式生成（含历史对话），逐 token yield
         4. 最后 yield sources 事件
 
         Yields:
@@ -191,11 +192,11 @@ class RAGChain:
             "graph_expansion": graph_exp_count,
         }
 
-        # ── 流式生成 ──
+        # ── 流式生成（含历史） ──
         answer_text = ""
         if self.generator:
             try:
-                async for token in self.generator.generate_stream(question, merge_chunks):
+                async for token in self.generator.generate_stream(question, merge_chunks, history=history):
                     answer_text += token
                     yield {"type": "char", "content": token}
             except Exception as e:
@@ -213,9 +214,9 @@ class RAGChain:
     # 跟踪检索入口（逐步骤输出）
     # ------------------------------------------------------------------
 
-    async def ask_with_trace(self, question: str, top_k: int | None = None) -> AsyncIterator[dict]:
+    async def ask_with_trace(self, question: str, top_k: int | None = None, history: list[dict] | None = None) -> AsyncIterator[dict]:
         """
-        真·逐步骤检索：每完成一步立即 yield，前端实时展示。
+        真·逐步骤检索：每完成一步立即 yield，前端实时展示，支持多轮历史。
 
         流程：
             1. Embedding       → yield trace + 得到向量
@@ -224,7 +225,7 @@ class RAGChain:
             4. 融合排序         → yield trace + 得到结果
             5. Rerank          → yield trace + 得到结果
             6. 图扩展           → yield trace + 得到结果
-            7. 流式生成         → yield char
+            7. 流式生成（含历史） → yield char
             8. 推送 sources
 
         Yields:
@@ -321,10 +322,10 @@ class RAGChain:
             "graph_expansion": graph_exp_count,
         }
 
-        # ── 流式生成 ──
+        # ── 流式生成（含历史） ──
         if self.generator:
             try:
-                async for token in self.generator.generate_stream(question, merge_chunks):
+                async for token in self.generator.generate_stream(question, merge_chunks, history=history):
                     yield {"type": "char", "content": token}
             except Exception as e:
                 logging.error(f"流式生成失败: {e}")
