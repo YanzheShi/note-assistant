@@ -3,6 +3,7 @@
 RAGChain 管线编排器测试。
 """
 import sys
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -115,11 +116,12 @@ class TestAsk:
         )
         result = r.ask("测试问题")
         assert result.graph_expansion == 0
-        assert result.answer == "无图测试答案"
+        # 路由判断为 false 时不走 generator，返回固定问候语
+        assert "你好" in result.answer
         pass
 
     def test_ask_without_generator(self):
-        """不传 generator 也能正常工作（只返回 context）"""
+        """不传 generator 也能正常工作（跳过生成）"""
         r = RAGChain(
             _make_mock_retriever(),
             _make_mock_reranker(),
@@ -127,7 +129,9 @@ class TestAsk:
             generator=None,
         )
         result = r.ask("无生成器测试")
+        # generator 为 None，answer 为空；但检索正常执行
         assert result.answer == ""
+        assert result.retrieved == 1
         pass
 
 
@@ -163,3 +167,97 @@ class TestFetchNeighborChunks:
         assert len(chunks) == 1
         assert isinstance(chunks[0], RetrievalResult)
         pass
+
+
+# ================================================================
+# 检索路由（_needs_retrieval_sync）
+# ================================================================
+
+class TestNeedsRetrieval:
+    def test_hello_returns_false(self):
+        """打招呼应返回 False（不需要检索）"""
+        with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": '{"need_retrieval": false}'}}]
+            }
+            r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+            assert r._needs_retrieval_sync("hi") is False
+
+    def test_中文打招呼_returns_false(self):
+        """中文打招呼也应返回 False"""
+        with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": '{"need_retrieval": false}'}}]
+            }
+            r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+            assert r._needs_retrieval_sync("你好") is False
+
+    def test_知识库问题_returns_true(self):
+        """需要查笔记的问题应返回 True"""
+        with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": '{"need_retrieval": true}'}}]
+            }
+            r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+            assert r._needs_retrieval_sync("RAG 怎么实现") is True
+
+    def test_markdown_code_block_stripped(self):
+        """LLM 返回 markdown 代码块包裹的 JSON 也能正确解析"""
+        with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": '```json\n{"need_retrieval": false}\n```'}}]
+            }
+            r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+            assert r._needs_retrieval_sync("hi") is False
+
+    def test_多种键名变体(self):
+        """needs_retrieval / needRetrieval 等变体也能正确解析"""
+        variants = [
+            {"need_retrieval": False},
+            {"needs_retrieval": False},
+            {"needRetrieval": False},
+            {"needsRetrieval": False},
+        ]
+        for variant in variants:
+            with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+                mock_post.return_value.json.return_value = {
+                    "choices": [{"message": {"content": json.dumps(variant)}}]
+                }
+                r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+                assert r._needs_retrieval_sync("hi") is False, f"Failed for {variant}"
+
+    def test_返回纯bool(self):
+        """LLM 直接返回 true/false 也能处理"""
+        with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": "false"}}]
+            }
+            r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+            assert r._needs_retrieval_sync("hi") is False
+
+    def test_返回中文否定(self):
+        """LLM 返回"不需要"/"否"也能处理"""
+        for text in ["不需要", "否", "no", "false"]:
+            with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+                mock_post.return_value.json.return_value = {
+                    "choices": [{"message": {"content": text}}]
+                }
+                r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+                assert r._needs_retrieval_sync("hi") is False, f"Failed for {text}"
+
+    def test_api_error_defaults_to_true(self):
+        """API 调用失败时保守默认：仍然检索"""
+        import httpx as _httpx
+        with patch("note_assistant.pipeline.rag_chain.httpx.post", side_effect=_httpx.HTTPError("network error")):
+            r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+            # API 不可用时默认不检索（避免浪费时间和 token）
+            assert r._needs_retrieval_sync("hi") is False
+
+    def test_json_parse_error_defaults_to_true(self):
+        """非 JSON 字符串（如"不需要"）被 _parse_routing_result 解析为 False（不需要检索）"""
+        with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": "不需要"}}]
+            }
+            r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
+            assert r._needs_retrieval_sync("hi") is False

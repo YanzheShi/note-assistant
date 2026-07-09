@@ -75,10 +75,10 @@ with st.chat_message("assistant"):
 
             trace_status = None
             trace_container = None
+            has_trace_steps = False
             if st.session_state.trace_mode:
-                st.markdown("### 🔍 检索过程")
                 trace_container = st.container()
-                trace_status = st.status("准备检索...", expanded=True)
+                trace_status = st.empty()
 
             for event in fn(API_URL, question, history=history):
                 if event["type"] == "char":
@@ -91,20 +91,24 @@ with st.chat_message("assistant"):
                     r["sources"] = event.get("content", [])
                 elif event["type"] == "trace":
                     step = event.get("step", "")
-                    ms = event.get("ms", 0)
-                    results = event.get("results")
-                    preview = event.get("preview", "")
-                    icons = {"embedding": "🧠", "dense_retrieval": "🔍", "sparse_retrieval": "📄",
-                             "hybrid_fusion": "🔗", "rerank": "⚖️", "graph_expansion": "🕸️"}
-                    labels = {"embedding": "向量化", "dense_retrieval": "稠密检索", "sparse_retrieval": "稀疏检索",
-                              "hybrid_fusion": "融合排序", "rerank": "重排序", "graph_expansion": "图扩展"}
-                    ico = icons.get(step, "➡️")
-                    lbl = labels.get(step, step)
-                    label = f"{ico} **{lbl}**  ✅ `{ms}ms`"
-                    if results is not None:
-                        label += f"  ({results} 条结果)"
+                    # 路由跳过不算检索步骤
+                    if step == "routing" and event.get("status") == "skipped":
+                        continue
+                    has_trace_steps = True
+                    if st.session_state.trace_mode:
+                        ms = event.get("ms", 0)
+                        results = event.get("results")
+                        preview = event.get("preview", "")
+                        icons = {"embedding": "🧠", "dense_retrieval": "🔍", "sparse_retrieval": "📄",
+                                 "hybrid_fusion": "🔗", "rerank": "⚖️", "graph_expansion": "🕸️"}
+                        labels = {"embedding": "向量化", "dense_retrieval": "稠密检索", "sparse_retrieval": "稀疏检索",
+                                  "hybrid_fusion": "融合排序", "rerank": "重排序", "graph_expansion": "图扩展"}
+                        ico = icons.get(step, "➡️")
+                        lbl = labels.get(step, step)
+                        label = f"{ico} **{lbl}**  ✅ `{ms}ms`"
+                        if results is not None:
+                            label += f"  ({results} 条结果)"
 
-                    if trace_container:
                         with trace_container:
                             with st.expander(label, expanded=True):
                                 if preview:
@@ -112,14 +116,22 @@ with st.chat_message("assistant"):
                                 else:
                                     st.caption("无检索结果")
 
-                    if trace_status:
-                        trace_status.update(label=label, state="running")
+                elif event["type"] == "meta":
+                    if event.get("routed") is False:
+                        # 路由跳过，不显示检索过程
+                        pass
+                    elif has_trace_steps and trace_container is not None:
+                        # 有检索步骤，显示完成状态
+                        with trace_container:
+                            st.markdown("✅ 检索完成")
 
                 elif event["type"] == "done":
                     break
 
-            if trace_status:
-                trace_status.update(label="✅ 检索完成", state="complete")
+            # 如果有检索步骤，显示完成状态
+            if has_trace_steps and trace_container is not None:
+                with trace_container:
+                    st.markdown("✅ 检索完成")
             full_answer, result = text, r
 
         except (ImportError, NotImplementedError) as e:
