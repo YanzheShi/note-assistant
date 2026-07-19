@@ -17,11 +17,19 @@ from pydantic import BaseModel, Field
 # ═══════════════════════════════════════════════════════════════
 
 class AskRequest(BaseModel):
-    """用户提问请求体，支持多轮对话历史。"""
+    """用户提问请求体，支持多轮对话历史与持久化上下文。"""
     question: str = Field(..., min_length=1, max_length=500, description="用户问题")
     history: list[dict] = Field(
         default_factory=list,
         description="历史对话，[{\"role\": \"user\"|\"assistant\", \"content\": str}, ...]，按时间顺序，最新的在最后",
+    )
+    session_id: str = Field(
+        default="",
+        description="跨会话记忆的会话 id；提供后服务端按 id 维护历史，前端不必每轮带 history",
+    )
+    run_id: str = Field(
+        default="",
+        description="运行快照 id；提供已存在的 run_id 可断流续传（轮询或重订阅）",
     )
 
 
@@ -99,3 +107,53 @@ class ConfigResponse(BaseModel):
     graph_hop: int
     embed_model: str
     llm_model: str
+
+
+# ═══════════════════════════════════════════════════
+# Agentic RAG 响应（/agent/* 端点）
+# ═══════════════════════════════════════════════════
+
+class AgentSource(BaseModel):
+    """Agent 去重后的单个来源（来自 Context Accumulator）。"""
+    filepath: str = ""
+    title: str = ""
+    heading: str = ""
+    score: Optional[float] = None
+
+
+class AgentTrajectoryItem(BaseModel):
+    """Agent 轨迹中的一个事件。"""
+    type: str                                       # thought | tool_call | observation | answer | judge
+    content: Optional[str] = None
+    tool: Optional[str] = None
+    args: Optional[dict] = None
+    verdict: Optional[str] = None                  # judge 节点的判定（sufficient/need_rewrite/need_more/give_up）
+    reason: Optional[str] = None
+    iteration: Optional[int] = None
+
+
+class AgentAskResponse(BaseModel):
+    """/agent/ask 的完整响应。"""
+    answer: str
+    sources: list[AgentSource] = Field(default_factory=list)
+    trajectory: list[AgentTrajectoryItem] = Field(default_factory=list)
+    cached: bool = False
+    run_id: str = ""
+    session_id: str = ""
+    timing: Optional[dict] = None
+
+
+class AgentRunStatus(BaseModel):
+    """GET /agent/runs/{run_id} 的快照响应（流式中断后轮询取回）。"""
+    run_id: str
+    question: str
+    status: str                                       # running | finished | interrupted
+    answer: str
+    sources: list[AgentSource] = Field(default_factory=list)
+    trajectory: list[AgentTrajectoryItem] = Field(default_factory=list)
+
+
+class AgentSessionHistory(BaseModel):
+    """GET /agent/sessions/{session_id} 的会话记忆响应。"""
+    session_id: str
+    history: list[dict] = Field(default_factory=list)

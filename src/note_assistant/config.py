@@ -54,5 +54,19 @@ class Settings(BaseSettings):
     top_k_retrieve: int = 20
     top_k_rerank: int = 5
 
+    # === Agentic RAG ===
+    agent_max_iter: int = 3                     # 检索循环最大轮次（硬性降级上限）
+    agent_max_tool_retry: int = 2               # 单次工具调用失败重试次数
+    agent_cache_enabled: bool = True            # 是否开启语义缓存
+    agent_cache_ttl: int = 3600                 # 缓存 TTL（秒）
+    agent_cache_max_size: int = 1000            # 缓存最大条数（FIFO 淘汰）
+    agent_cache_semantic: bool = True           # 是否启用 embedding 近邻命中
+    agent_cache_semantic_threshold: float = 0.92  # 近邻命中相似度阈值
+
+    # === Agentic RAG 持久化（轻量 SQLite）===
+    agent_session_enabled: bool = True           # 跨会话记忆 + 运行快照（session_turns / runs 表）
+    agent_db_path: str = "data/agent.sqlite"     # SQLite 文件路径（相对 PROJECT_ROOT 或绝对路径）
+    agent_run_orphan_ttl: int = 600              # run 未完成超过该秒数判定为 interrupted（孤儿检测）
+
 
 settings = Settings()

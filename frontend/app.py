@@ -1,20 +1,28 @@
 # frontend/app.py
-"""Streamlit 主入口 —— Obsidian RAG 聊天界面，支持多轮连续对话。"""
+"""Streamlit 主入口 —— Obsidian RAG 聊天界面，支持多轮连续对话（Agentic RAG）。"""
 
 import sys
+import time
+import uuid
+
 from pathlib import Path
+
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-import streamlit as st
-from frontend.components import render_sources, render_retrieval_debug
+import streamlit as st  # noqa: E402
+import httpx  # noqa: E402
+from frontend.components import render_sources, render_retrieval_debug  # noqa: E402
 
 # ─── 页面配置 ───
 st.set_page_config(page_title="Obsidian RAG", layout="wide", page_icon="📚")
 
 # ─── 状态 ───
-for key, default in [("messages", []), ("debug", False), ("streaming", False), ("trace_mode", False)]:
+for key, default in [
+    ("messages", []), ("debug", False), ("streaming", False),
+    ("trace_mode", False), ("session_id", str(uuid.uuid4())),
+]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -25,8 +33,8 @@ with st.sidebar:
     st.session_state.debug = st.checkbox("调试模式", value=False)
     st.session_state.streaming = st.checkbox("流式输出（SSE）", value=True)
     st.session_state.trace_mode = st.checkbox(
-        "追踪模式（显示检索过程）", value=False,
-        help="实时展示：Embedding → 稠密检索 → 稀疏检索 → 融合 → Rerank → 图扩展")
+        "追踪模式（显示推理过程）", value=False,
+        help="实时展示：路由判定 → 工具调用 → 观察结果 → 反思判定 → 答案")
     st.markdown("---")
     if st.button("🗑️ 清空对话"):
         st.session_state.messages = []
@@ -34,8 +42,30 @@ with st.sidebar:
 
 # ─── 主标题 ───
 st.title("📚 个人知识库问答")
-st.caption("基于 Obsidian 笔记库的 RAG 系统，支持混合检索 + 双链扩展 + 多轮对话")
+st.caption("基于 Obsidian 笔记库的 Agentic RAG：Router 路由 + 多轮检索反思 + 带引用生成")
 st.markdown("---")
+
+
+# ─── 追踪步骤渲染 helper ───
+def _render_trace_step(container, icon: str, label: str, detail: str):
+    """把一条推理事件渲染为可折叠步骤（仅在 trace_mode 下调用）。"""
+    if container is None:
+        return
+    with container:
+        with st.expander(f"{icon} {label}", expanded=True):
+            if detail:
+                st.markdown(detail)
+
+
+def _typewriter(placeholder, text: str, chunk: int = 4, delay: float = 0.008):
+    """把整段答案做轻量打字机效果（后端一次性给出 answer，前端逐块揭示）。"""
+    shown = ""
+    for i in range(0, len(text), chunk):
+        shown = text[: i + chunk]
+        placeholder.markdown(shown + "▌")
+        time.sleep(delay)
+    placeholder.markdown(shown or text)
+
 
 # ─── 聊天历史 ───
 for msg in st.session_state.messages:
@@ -59,94 +89,124 @@ with st.chat_message("user"):
 # ─── 助手回复 ───
 with st.chat_message("assistant"):
     full_answer = ""
-    result = {"sources": [], "timing": {}}
+    result = {"sources": [], "timing": {}, "trajectory": [], "run_id": ""}
+    session_id = st.session_state.session_id
 
     # 本轮之前的历史（排除刚添加的当前问题）
     history = st.session_state.messages[:-1]
 
     if st.session_state.streaming:
         streaming_placeholder = st.empty()
+        streaming_placeholder.markdown("🤔 思考中…")
+
+        trace_container = None
+        if st.session_state.trace_mode:
+            trace_container = st.container()
+
         try:
             from frontend.utils import ask_question_stream, ask_question_trace
 
             fn = ask_question_trace if st.session_state.trace_mode else ask_question_stream
-            text = ""
-            r = {"sources": [], "timing": {}}
+            answer_text = ""
+            sources_list = []
+            run_id = ""
+            thinking_cleared = False
 
-            trace_status = None
-            trace_container = None
-            has_trace_steps = False
-            if st.session_state.trace_mode:
-                trace_container = st.container()
-                trace_status = st.empty()
+            for event in fn(API_URL, question, history=history, session_id=session_id):
+                etype = event.get("type")
 
-            for event in fn(API_URL, question, history=history):
-                if event["type"] == "char":
-                    text += event["content"]
-                    streaming_placeholder.markdown(text + "▌")
-                elif event["type"] == "sources":
-                    streaming_placeholder.markdown(text)
-                    if event.get("content"):
-                        render_sources(event["content"])
-                    r["sources"] = event.get("content", [])
-                elif event["type"] == "trace":
-                    step = event.get("step", "")
-                    # 路由跳过不算检索步骤
-                    if step == "routing" and event.get("status") == "skipped":
-                        continue
-                    has_trace_steps = True
-                    if st.session_state.trace_mode:
-                        ms = event.get("ms", 0)
-                        results = event.get("results")
-                        preview = event.get("preview", "")
-                        icons = {"embedding": "🧠", "dense_retrieval": "🔍", "sparse_retrieval": "📄",
-                                 "hybrid_fusion": "🔗", "rerank": "⚖️", "graph_expansion": "🕸️"}
-                        labels = {"embedding": "向量化", "dense_retrieval": "稠密检索", "sparse_retrieval": "稀疏检索",
-                                  "hybrid_fusion": "融合排序", "rerank": "重排序", "graph_expansion": "图扩展"}
-                        ico = icons.get(step, "➡️")
-                        lbl = labels.get(step, step)
-                        label = f"{ico} **{lbl}**  ✅ `{ms}ms`"
-                        if results is not None:
-                            label += f"  ({results} 条结果)"
+                # 收到首个实质事件后清掉顶部「思考中…」占位
+                if not thinking_cleared and etype not in ("run", "status", "done"):
+                    streaming_placeholder.empty()
+                    thinking_cleared = True
 
+                if etype == "run":
+                    run_id = event.get("run_id", "")
+
+                elif etype == "thought":
+                    _render_trace_step(trace_container, "🧠", "推理", event.get("content", ""))
+
+                elif etype == "tool_call":
+                    tool = event.get("tool", "")
+                    args = event.get("args", {}) or {}
+                    q = args.get("query") or args.get("question") or ""
+                    _render_trace_step(trace_container, "🔧", f"工具调用：{tool}", q)
+
+                elif etype == "observation":
+                    _render_trace_step(trace_container, "👀", "观察结果", event.get("content", ""))
+
+                elif etype == "judge":
+                    verdict = event.get("verdict", "")
+                    reason = event.get("reason", "")
+                    vmap = {
+                        "sufficient": ("✅", "信息充足，生成答案"),
+                        "need_rewrite": ("🔄", "信息不足，改写法检索"),
+                        "need_more": ("🔍", "信息不足，换策略检索"),
+                        "give_up": ("⚠️", "多次无果，生成受限答案"),
+                    }
+                    icon, label = vmap.get(verdict, ("➡️", verdict))
+                    detail = label
+                    if reason:
+                        detail += f"\n> {reason}"
+                    _render_trace_step(trace_container, icon, "反思判定", detail)
+
+                elif etype == "answer":
+                    answer_text = event.get("content", "")
+                    if trace_container is not None:
+                        # 答案嵌进流程：显示在「信息充足，生成答案」之后、「✅ 完成」之前
                         with trace_container:
-                            with st.expander(label, expanded=True):
-                                if preview:
-                                    st.markdown(f"**第一条结果预览：**\n> {preview}")
-                                else:
-                                    st.caption("无检索结果")
+                            with st.expander("📝 答案", expanded=True):
+                                _aw = st.empty()
+                                _typewriter(_aw, answer_text)
+                    else:
+                        _typewriter(streaming_placeholder, answer_text)
 
-                elif event["type"] == "meta":
-                    if event.get("routed") is False:
-                        # 路由跳过，不显示检索过程
-                        pass
-                    elif has_trace_steps and trace_container is not None:
-                        # 有检索步骤，显示完成状态
+                elif etype == "sources":
+                    sources_list = event.get("sources", []) or []
+                    result["sources"] = sources_list
+
+                elif etype == "cached":
+                    if trace_container is not None:
                         with trace_container:
-                            st.markdown("✅ 检索完成")
+                            st.caption("⚡ 命中语义缓存，直接返回")
 
-                elif event["type"] == "done":
+                elif etype == "status":
+                    if event.get("status") != "finished":
+                        st.warning(event.get("content", ""))
+
+                elif etype == "error":
+                    st.error(event.get("content", "未知错误"))
+
+                elif etype == "done":
                     break
 
-            # 如果有检索步骤，显示完成状态
-            if has_trace_steps and trace_container is not None:
+            if trace_container is not None:
                 with trace_container:
-                    st.markdown("✅ 检索完成")
-            full_answer, result = text, r
+                    st.markdown("✅ 完成")
 
-        except (ImportError, NotImplementedError) as e:
-            st.warning(f"流式调用未实现: {e}")
-            full_answer = "（流式输出待实现）"
+            if sources_list:
+                render_sources(sources_list)
+
+            full_answer = answer_text
+            result["run_id"] = run_id
+
+        except (ImportError, NotImplementedError, httpx.HTTPError) as e:
+            st.warning(f"流式调用失败: {e}")
+            full_answer = "（流式输出失败，请检查后端）"
             streaming_placeholder.markdown(full_answer)
 
     else:
         with st.spinner("检索中..."):
             try:
                 from frontend.utils import ask_question
-                result = ask_question(API_URL, question, history=history)
+
+                result = ask_question(API_URL, question, history=history, session_id=session_id)
                 full_answer = result.get("answer", "")
-            except (ImportError, NotImplementedError):
-                result = {"answer": "（非流式调用待实现）", "sources": [], "timing": {}, "graph_expansion": 0}
+                result.setdefault("trajectory", [])
+                result.setdefault("run_id", "")
+            except (ImportError, NotImplementedError, httpx.HTTPError) as e:
+                st.warning(f"非流式调用失败: {e}")
+                result = {"answer": "（非流式调用失败）", "sources": [], "timing": {}, "trajectory": [], "run_id": ""}
                 full_answer = result["answer"]
 
         st.markdown(full_answer)
@@ -162,4 +222,6 @@ with st.chat_message("assistant"):
         "content": full_answer,
         "sources": result.get("sources", []),
         "timing": result.get("timing", {}),
+        "trajectory": result.get("trajectory", []),
+        "run_id": result.get("run_id", ""),
     })

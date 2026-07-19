@@ -74,31 +74,34 @@ def render_sources(sources: list[dict]):
             preview = src.get("preview", "")
             if preview:
                 st.markdown(preview)
+            elif src.get("title"):
+                # Agentic RAG 来源可能只有 title 没有 preview
+                st.markdown(f"**标题：** {src['title']}")
 
-            # ── 按类型额外渲染 ──
-            if src_type == "table" and src.get("raw_table"):
-                st.markdown("**表格内容：**")
-                st.markdown(src["raw_table"])
+                # ── 按类型额外渲染 ──
+                if src_type == "table" and src.get("raw_table"):
+                    st.markdown("**表格内容：**")
+                    st.markdown(src["raw_table"])
 
-            elif src_type == "mermaid" and src.get("raw_mermaid"):
-                st.markdown("**Mermaid 图：**")
-                # 尝试用 streamlit-mermaid 渲染
-                raw = src["raw_mermaid"]
-                match = re.search(r"```mermaid\s*\n(.*?)```", raw, re.DOTALL)
-                if match:
-                    try:
-                        from streamlit_mermaid import st_mermaid
-                        st_mermaid(match.group(1))
-                    except ImportError:
-                        st.code(match.group(1), language="mermaid")
-                else:
-                    st.code(raw, language="markdown")
+                elif src_type == "mermaid" and src.get("raw_mermaid"):
+                    st.markdown("**Mermaid 图：**")
+                    # 尝试用 streamlit-mermaid 渲染
+                    raw = src["raw_mermaid"]
+                    match = re.search(r"```mermaid\s*\n(.*?)```", raw, re.DOTALL)
+                    if match:
+                        try:
+                            from streamlit_mermaid import st_mermaid
+                            st_mermaid(match.group(1))
+                        except ImportError:
+                            st.code(match.group(1), language="mermaid")
+                    else:
+                        st.code(raw, language="markdown")
 
-            elif src_type == "image" and src.get("img_path"):
-                img_path = src["img_path"]
-                st.markdown(f"**图片路径：** `{img_path}`")
-                import os
-                if os.path.exists(img_path):
-                    st.image(img_path, caption=preview or "参考图片")
-                else:
-                    st.caption("图片文件不可见（路径不存在或未挂载）")
+                elif src_type == "image" and src.get("img_path"):
+                    img_path = src["img_path"]
+                    st.markdown(f"**图片路径：** `{img_path}`")
+                    import os
+                    if os.path.exists(img_path):
+                        st.image(img_path, caption=preview or "参考图片")
+                    else:
+                        st.caption("图片文件不可见（路径不存在或未挂载）")

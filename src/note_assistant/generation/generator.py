@@ -43,10 +43,10 @@ class Generator:
         )
 
         self.stream_llm = llm or init_chat_model(
-            model=settings.longcat_model,
+            model=settings.agnes_model,
             model_provider="openai",
-            api_key=settings.longcat_api_key,
-            openai_api_base=settings.longcat_base_url,
+            api_key=settings.agnes_api_key,
+            openai_api_base=settings.agnes_base_url,
             temperature=0.6,       # 比 rewrite 高，允许一定创造力
             max_tokens=2048,       # 回答可以长一些
             streaming=True

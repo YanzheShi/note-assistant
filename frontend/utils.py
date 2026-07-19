@@ -2,68 +2,81 @@
 """
 API 调用封装 —— 将前端与后端的网络通信抽象为纯函数。
 
+默认全部指向 Agentic RAG 端点（/agent/*）。后端旧的 /ask* 端点（传统 RAGChain）
+仍保留可作对比通道，但前端不再使用。
+
 对外暴露三个函数：
-    ask_question(api_url, question, timeout) -> dict
-        非流式调用 /ask，返回完整响应 dict
+    ask_question(api_url, question, history, session_id) -> dict
+        非流式调用 /agent/ask，返回完整响应 dict
 
-    ask_question_stream(api_url, question)
-        流式调用 /ask_stream，返回 event generator
+    ask_question_stream(api_url, question, history, session_id)
+        流式调用 /agent/ask_stream，返回 event generator
 
-    ask_question_trace(api_url, question)
-        追踪式流式调用 /ask_trace，额外输出检索过程 trace 事件
+    ask_question_trace(api_url, question, history, session_id)
+        追踪式流式调用 /agent/ask_stream（同一端点）；
+        后端以事件形式实时输出推理过程（thought / tool_call / observation / judge），
+        由 app.py 在 trace_mode 下渲染为步骤面板
 """
 
 import json
 import httpx
 
 
-def ask_question(api_url: str, question: str, history: list[dict] | None = None, timeout: float = 120.0) -> dict:
-    """
-    非流式调用 /ask，支持历史对话。
+def _post_json(api_url: str, endpoint: str, body: dict, timeout: float) -> dict:
+    resp = httpx.post(f"{api_url}/{endpoint}", json=body, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
 
-    Args:
-        api_url: FastAPI 地址（如 "http://localhost:8000"）
-        question: 用户问题
-        history: 历史对话列表
-        timeout: 超时秒数
+
+def ask_question(
+    api_url: str,
+    question: str,
+    history: list[dict] | None = None,
+    session_id: str = "",
+    timeout: float = 120.0,
+) -> dict:
+    """
+    非流式调用 /agent/ask，支持历史对话与跨会话记忆（session_id）。
 
     Returns:
-        完整响应 dict，含 answer, sources, timing 等
-
-    Raises:
-        httpx.ConnectError: 后端未启动
-        httpx.TimeoutException: 请求超时
-        httpx.HTTPStatusError: 后端返回 4xx/5xx
+        完整响应 dict，含 answer / sources / trajectory / cached / run_id / timing
     """
     import time
+
     t0 = time.time()
     body = {"question": question}
     if history:
         body["history"] = history
-    resp = httpx.post(
-        f"{api_url}/ask",
-        json=body,
-        timeout=timeout,
-    )
+    if session_id:
+        body["session_id"] = session_id
 
-    resp.raise_for_status()
-    result = resp.json()
+    result = _post_json(api_url, "agent/ask", body, timeout)
 
-    if "timing" not in result or not result["timing"]:
+    if "timing" not in result or not result.get("timing"):
         result["timing"] = {"total_ms": int((time.time() - t0) * 1000)}
-
     return result
 
 
-def _sse_events(api_url: str, question: str, endpoint: str, history: list[dict] | None = None, timeout: float = 120.0):
+def _sse_events(
+    api_url: str,
+    question: str,
+    endpoint: str,
+    history: list[dict] | None = None,
+    session_id: str = "",
+    timeout: float = 120.0,
+):
     """
-    通用的 SSE 事件流解析器。
+    通用 SSE 事件流解析器。
 
-    向指定 endpoint 发起 POST 请求，逐行解析 "data: " 前缀的 SSE 事件。
+    逐行解析 "data: " 前缀事件；遇到 "data: [DONE]" 结束。
+    事件类型：run / thought / tool_call / observation / judge / answer / sources / cached / status / error
     """
     body = {"question": question}
     if history:
         body["history"] = history
+    if session_id:
+        body["session_id"] = session_id
+
     with httpx.stream(
         "POST", f"{api_url}/{endpoint}",
         json=body,
@@ -71,30 +84,46 @@ def _sse_events(api_url: str, question: str, endpoint: str, history: list[dict] 
     ) as resp:
         for line in resp.iter_lines():
             line = line.strip()
-            if not line:
+            if not line or not line.startswith("data: "):
                 continue
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    yield {"type": "done"}
-                    return
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                yield {"type": "done"}
+                return
+            try:
                 yield json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
 
 
-def ask_question_stream(api_url: str, question: str, history: list[dict] | None = None, timeout: float = 120.0):
+def ask_question_stream(
+    api_url: str,
+    question: str,
+    history: list[dict] | None = None,
+    session_id: str = "",
+    timeout: float = 120.0,
+):
+    """流式调用 /agent/ask_stream（SSE 事件流），支持历史对话与跨会话记忆。"""
+    yield from _sse_events(api_url, question, "agent/ask_stream", history, session_id, timeout)
+
+
+def ask_question_trace(
+    api_url: str,
+    question: str,
+    history: list[dict] | None = None,
+    session_id: str = "",
+    timeout: float = 120.0,
+):
     """
-    流式调用 /ask_stream（SSE 事件流），支持历史对话。
+    追踪式流式调用同一端点 /agent/ask_stream。
 
-    事件类型: meta, char, sources
+    后端以事件形式实时输出推理过程：
+        thought     — 路由判定 / 推理
+        tool_call   — 调用的检索工具与参数
+        observation — 工具返回摘要
+        judge       — 反思判定（sufficient / need_rewrite / need_more / give_up）
+        answer      — 最终答案
+        sources     — 去重后的来源列表
+    app.py 在 trace_mode 下把 thought / tool_call / observation / judge 渲染为步骤面板。
     """
-    yield from _sse_events(api_url, question, "ask_stream", history, timeout)
-
-
-def ask_question_trace(api_url: str, question: str, history: list[dict] | None = None, timeout: float = 120.0):
-    """
-    追踪式流式调用 /ask_trace（SSE 事件流），支持历史对话。
-
-    在 ask_question_stream 的基础上，检索阶段额外输出 trace 事件：
-        embedding → dense_retrieval → sparse_retrieval → hybrid_fusion → rerank → graph_expansion
-    """
-    yield from _sse_events(api_url, question, "ask_trace", history, timeout)
+    yield from _sse_events(api_url, question, "agent/ask_stream", history, session_id, timeout)

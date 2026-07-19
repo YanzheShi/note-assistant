@@ -4,7 +4,7 @@
 """
 
 import time
-from typing import List, AsyncIterator
+from typing import List
 
 from note_assistant.config import settings
 from note_assistant.indexing.embedder import OllamaEmbedder
@@ -62,23 +62,94 @@ class HybridRetriever:
             n_results=n_results,
             include=["documents", "metadatas", "distances"],
         )
+        return self._results_from_chroma(query_results)
 
-        # cosine distance → similarity（越大越好）
+    def _results_from_chroma(self, query_results: dict) -> List[RetrievalResult]:
+        """把 ChromaDB query 输出（含 distances）转为归一化 similarity 的 RetrievalResult 列表。"""
+        if not query_results.get("distances"):
+            return []
         distances = query_results["distances"][0]
+        docs = query_results["documents"][0]
+        metas = query_results["metadatas"][0]
         min_d, max_d = min(distances), max(distances)
         rng = max_d - min_d if max_d != min_d else 1.0
-
         results = []
         for i in range(len(distances)):
             sim = 1 - (distances[i] - min_d) / rng
             results.append(RetrievalResult(
                 score=sim,
-                page_content=query_results["documents"][0][i],
-                metadata=query_results["metadatas"][0][i],
+                page_content=docs[i],
+                metadata=metas[i] or {},
                 dense_score=sim,
             ))
-
         return results
+
+    # ──────────────────────────────────────────────
+    # 公开子检索方法（供 agent 工具集单独调用）
+    # ──────────────────────────────────────────────
+
+    def _safe_n(self, top_k: int) -> int:
+        """clamp n_results 不超过集合规模，避免 ChromaDB 报错。"""
+        try:
+            count = self.ingestor.collection.count()
+        except Exception:
+            count = 1
+        return max(1, min(top_k, max(1, count)))
+
+    @staticmethod
+    def _build_where(
+        filepath: str | None = None,
+        heading: str | None = None,
+        tag: str | None = None,
+    ) -> dict | None:
+        """构造 ChromaDB `where` 过滤条件（按元数据过滤）。"""
+        conds = []
+        if filepath:
+            conds.append({"filepath": filepath})
+        if heading:
+            conds.append({"heading_path": {"$contains": heading}})
+        if tag:
+            conds.append({"tags": {"$contains": tag}})
+        if not conds:
+            return None
+        if len(conds) == 1:
+            return conds[0]
+        return {"$and": conds}
+
+    def vector_search(self, query: str, top_k: int | None = None) -> List[RetrievalResult]:
+        """仅语义向量检索（ChromaDB dense）。"""
+        top_k = top_k or self.top_k
+        qe = self.embedder.embed_one(query)
+        qr = self.ingestor.collection.query(
+            query_embeddings=[qe],
+            n_results=self._safe_n(top_k),
+            include=["documents", "metadatas", "distances"],
+        )
+        return self._results_from_chroma(qr)
+
+    def bm25_search(self, query: str, top_k: int | None = None) -> List[RetrievalResult]:
+        """仅关键词（BM25 稀疏）检索。"""
+        return self.bm25.search(query, top_k=top_k or self.top_k)
+
+    def filtered_search(
+        self,
+        query: str,
+        filepath: str | None = None,
+        heading: str | None = None,
+        tag: str | None = None,
+        top_k: int | None = None,
+    ) -> List[RetrievalResult]:
+        """按元数据过滤（filepath / heading / tag）后再做向量检索。"""
+        top_k = top_k or self.top_k
+        where = self._build_where(filepath, heading, tag)
+        qe = self.embedder.embed_one(query)
+        qr = self.ingestor.collection.query(
+            query_embeddings=[qe],
+            n_results=self._safe_n(top_k),
+            where=where,
+            include=["documents", "metadatas", "distances"],
+        )
+        return self._results_from_chroma(qr)
 
     # ──────────────────────────────────────────────
     # Sparse 检索（BM25）

@@ -18,6 +18,7 @@ FastAPI 入口 —— RAG 对外接口。
 """
 
 import time
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -27,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from note_assistant.config import settings
+from note_assistant.agent import runner as agent_runner
 from note_assistant.api.schemas import (
     AskRequest,
     AskResponse,
@@ -34,7 +36,13 @@ from note_assistant.api.schemas import (
     HealthResponse,
     ReindexResponse,
     ConfigResponse,
+    AgentAskResponse,
+    AgentSource,
+    AgentTrajectoryItem,
+    AgentRunStatus,
+    AgentSessionHistory,
 )
+from note_assistant.agent.runner import get_store
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +274,120 @@ async def ask_trace(req: AskRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# ═══════════════════════════════════════════════════════════════
+# /agent/ask — Agentic RAG 非流式问答
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/agent/ask", response_model=AgentAskResponse)
+async def agent_ask(req: AskRequest):
+    """
+    Agentic RAG 非流式问答：Router → 检索循环 → 反思 → 生成。
+
+    与 /ask（传统 RAGChain）并存，作为对比/升级通道。返回答案 + 去重来源 + 完整轨迹。
+    """
+    t0 = time.time()
+    result = await agent_runner.ainvoke(
+        req.question, history=req.history,
+        session_id=req.session_id, run_id=req.run_id,
+    )
+    t1 = time.time()
+
+    sources = [AgentSource(**s) for s in result.sources]
+    trajectory = [AgentTrajectoryItem(**t) for t in result.trajectory]
+
+    return AgentAskResponse(
+        answer=result.answer,
+        sources=sources,
+        trajectory=trajectory,
+        cached=result.cached,
+        run_id=result.run_id,
+        session_id=req.session_id,
+        timing={"total_ms": (t1 - t0) * 1000},
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# /agent/ask_stream — Agentic RAG 流式问答（SSE，带轨迹）
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/agent/ask_stream")
+async def agent_ask_stream(req: AskRequest):
+    """
+    Agentic RAG 流式问答（Server-Sent Events）。
+
+    输出事件类型：
+        data: {"type": "thought", "content": "..."}          # 路由判定 / 推理
+        data: {"type": "tool_call", "tool": "hybrid_search", "args": {...}}
+        data: {"type": "observation", "content": "..."}      # 工具返回摘要
+        data: {"type": "answer", "content": "..."}           # 最终答案
+        data: {"type": "sources", "sources": [...]}          # 去重后的来源列表
+        data: [DONE]
+    """
+    import json as _json
+
+    async def generate():
+        try:
+            async for event in agent_runner.astream(
+                req.question, history=req.history,
+                session_id=req.session_id, run_id=req.run_id,
+            ):
+                if event.get("type") == "sources":
+                    yield f"data: {_json.dumps({'type': 'sources', 'sources': event.get('sources', [])})}\n\n"
+                else:
+                    yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(f"agent_ask_stream 异常: {e}")
+            yield f"data: {_json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# ═══════════════════════════════════════════════════════════════
+# /agent/runs/{run_id} — 运行快照（流式中断后轮询取回完整结果）
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/agent/runs/{run_id}", response_model=AgentRunStatus)
+async def agent_run_status(run_id: str):
+    """
+    取回一次运行的完整快照。客户端在 SSE 断流后，用首事件里的 run_id 轮询本端点，
+    直到 ``status == 'finished'`` 即可拿到完整 answer + trajectory + sources。
+
+    status 取值：``running``（进行中）/ ``finished``（已完成）/ ``interrupted``（超时孤儿）。
+    """
+    store = get_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="持久化未启用（agent_session_enabled=False）")
+    run = await asyncio.to_thread(store.get_run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run_id 不存在")
+    return AgentRunStatus(
+        run_id=run["run_id"],
+        question=run["question"],
+        status=run["status"],
+        answer=run["answer"],
+        sources=[AgentSource(**s) for s in run["sources"]],
+        trajectory=[AgentTrajectoryItem(**t) for t in run["trajectory"]],
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# /agent/sessions/{session_id} — 跨会话对话记忆
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/agent/sessions/{session_id}", response_model=AgentSessionHistory)
+async def agent_session_history(session_id: str):
+    """
+    取回某会话的历史对话（跨会话记忆）。前端可在重开会话时拉取，或用于调试。
+    """
+    store = get_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="持久化未启用（agent_session_enabled=False）")
+    history = await asyncio.to_thread(store.get_history, session_id)
+    return AgentSessionHistory(session_id=session_id, history=history)
 
 
 # ═══════════════════════════════════════════════════════════════
