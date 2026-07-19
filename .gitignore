@@ -23,13 +23,24 @@ build/
 .pytest_cache/
 
 # === 项目运行时产物 ===
-chroma_db/              # 向量库（代码默认路径）
+# 向量库（代码默认路径）
+chroma_db/
 data/chroma_db/
 data/chroma/
-data/vault/             # 个人笔记，不进 git
+# 个人笔记，不进 git
+data/vault/
 data/*.db
-models/                 # reranker 模型 ~1.1GB
-eval/results/           # 评测结果
+data/*.pkl
+data/*.graph
+data/eval_report*.json
+data/logs/
+# reranker 模型 ~2GB，不进 git
+models/
+# 评测结果
+eval/results/
+
+# === 数据库文件 ===
+*.sqlite3
 
 # === Notebook 检查点 ===
 notebooks/.ipynb_checkpoints/
