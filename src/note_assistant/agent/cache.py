@@ -49,6 +49,7 @@ class CacheEntry:
     ts: float = 0.0
     embedding: Optional[List[float]] = None
     cached: bool = True
+    ctx_key: Optional[str] = None       # 上下文指纹（session + 凝练问题等），用于隔离防串台
 
 
 class SemanticCache:
@@ -75,8 +76,12 @@ class SemanticCache:
 
     # ── 内部工具 ──
 
-    def _exact_key(self, q: str) -> str:
-        return hashlib.sha256(_normalize(q).encode("utf-8")).hexdigest()
+    def _exact_key(self, q: str, ctx_key: Optional[str] = None) -> str:
+        base = _normalize(q)
+        # 掺入上下文指纹：不同 ctx_key（不同 session / 凝练问题）→ 不同精确 key，防串台
+        if ctx_key:
+            base = f"{base}::{ctx_key}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     def _safe_embed(self, q: str) -> Optional[List[float]]:
         if self.embed_fn is None:
@@ -88,11 +93,11 @@ class SemanticCache:
 
     # ── 公共 API ──
 
-    def get(self, q: str) -> Optional[CacheEntry]:
+    def get(self, q: str, ctx_key: Optional[str] = None) -> Optional[CacheEntry]:
         if not self.enabled:
             return None
         now = time.time()
-        k = self._exact_key(q)
+        k = self._exact_key(q, ctx_key)
 
         # 精确命中
         e = self._exact.get(k)
@@ -104,7 +109,7 @@ class SemanticCache:
                 self._hits += 1
                 return e
 
-        # 语义近邻命中
+        # 语义近邻命中（按 ctx_key 隔离：只匹配同上下文的条目）
         if self.semantic:
             emb = self._safe_embed(q)
             if emb is not None:
@@ -112,6 +117,8 @@ class SemanticCache:
                 best_sim = self.semantic_threshold
                 for e2 in self._exact.values():
                     if e2.embedding is None:
+                        continue
+                    if e2.ctx_key != ctx_key:
                         continue
                     sim = _cosine(emb, e2.embedding)
                     if sim >= best_sim:
@@ -124,17 +131,25 @@ class SemanticCache:
         self._misses += 1
         return None
 
-    def put(self, q: str, answer: str, sources: List[dict], trajectory: List[dict]) -> None:
+    def put(
+        self,
+        q: str,
+        answer: str,
+        sources: List[dict],
+        trajectory: List[dict],
+        ctx_key: Optional[str] = None,
+    ) -> None:
         if not self.enabled:
             return
         emb = self._safe_embed(q) if self.semantic else None
-        k = self._exact_key(q)
+        k = self._exact_key(q, ctx_key)
         self._exact[k] = CacheEntry(
             answer=answer,
             sources=sources,
             trajectory=trajectory,
             ts=time.time(),
             embedding=emb,
+            ctx_key=ctx_key,
         )
         # FIFO 淘汰
         while len(self._exact) > self.max_size:

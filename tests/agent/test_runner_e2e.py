@@ -13,6 +13,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
+from note_assistant.agent.context import set_context_manager_for_test
 from note_assistant.agent.runner import ainvoke, astream, reset_cache
 from note_assistant.retrieval.types import RetrievalResult
 
@@ -27,7 +28,7 @@ class FakeAgentLLM(BaseChatModel):
     @staticmethod
     def _role(messages):
         for m in messages:
-            if isinstance(m, SystemMessage):
+            if isinstance(m, (SystemMessage, HumanMessage)):
                 c = m.content
                 if "意图分类器" in c:
                     return "router"
@@ -39,6 +40,8 @@ class FakeAgentLLM(BaseChatModel):
                     return "generate"
                 if "可用工具" in c:
                     return "agent"
+                if "对话改写器" in c:
+                    return "condense"
         return "unknown"
 
     def _respond(self, role, messages):
@@ -63,6 +66,9 @@ class FakeAgentLLM(BaseChatModel):
                     "id": "call_1",
                 }])
             return AIMessage(content="基于检索结果：FlashAttention 改进了显存。")
+        if role == "condense":
+            # 返回空 → context.py 降级用原问题，保持 e2e 行为稳定
+            return AIMessage(content="")
         return AIMessage(content="fallback")
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -92,7 +98,12 @@ def patched(monkeypatch):
     from note_assistant.config import settings
     # 关掉持久化，避免 e2e 测试触碰真实 SQLite 文件（保持无副作用、快速）
     monkeypatch.setattr(settings, "agent_session_enabled", False)
+    # 关掉相关性裁剪，避免 e2e 触碰 Ollama embedder（离线、确定性）
+    monkeypatch.setattr(settings, "agent_history_relevance_enabled", False)
     reset_store()
+    set_context_manager_for_test(None)  # 每次按当前 settings 懒重建 ContextManager
+    # context.py 的凝练走 note_assistant.llm.client.get_llm，需一并 mock 才离线
+    monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: FakeAgentLLM())
     monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: FakeAgentLLM())
     monkeypatch.setattr(agent_mod, "run_tool_call", _fake_tool)
     reset_cache()

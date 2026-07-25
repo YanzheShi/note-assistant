@@ -48,3 +48,8 @@ notebooks/.ipynb_checkpoints/
 # === OS ===
 .DS_Store
 Thumbs.db
+# === SQLite 数据库 ===
+data/*.sqlite
+
+# === AI 工作记忆 ===
+.workbuddy/
