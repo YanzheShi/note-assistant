@@ -51,8 +51,10 @@ class AgentState(TypedDict):
     accumulated: List[RetrievalResult]          # Context Accumulator（去重后累积）
     iteration: int                               # 已执行的检索轮次
     route: str                                   # "search" | "chat"，由 router 写入
-    question: str
-    history: list
+    question: str                                # 原始本轮问题（落库 / 展示用）
+    condensed_question: str                      # 凝练后的独立完整问题（路由/检索/生成同源）
+    history: list                                # 预算裁剪后的历史 dicts（generate_node）
+    history_messages: list                       # 预算裁剪后的历史 BaseMessage（agent/direct_chat）
     answer: str
     judge_verdict: str                           # 最新 Judge 判定：sufficient/need_rewrite/need_more/give_up
     rewritten_query: str                         # Judge 建议的改写查询
@@ -177,12 +179,22 @@ def _fmt_history(history: list) -> List[BaseMessage]:
 # ──────────────────────────────────────────────
 
 async def router(state: AgentState) -> dict:
-    """意图识别节点：决定走检索循环还是直接对话。默认检索更稳妥。"""
+    """意图识别节点：决定走检索循环还是直接对话。默认检索更稳妥。
+
+    路由依据用户「原始问题」判意图——原始表述里的「笔记 / 我的 / 知识库」等词是判断
+    是否要检索个人知识库的关键信号；若用凝练（消指代）后的问题，这些词会被改写步骤抹掉，
+    导致明明问笔记却被误判为闲聊 / 常识。凝练问题仅在原问题疑似纯指代、需要消歧时作为
+    参考附上（兼顾「它有什么缺点？」这类追问的消歧）。
+    """
     llm = get_llm(temperature=0.0)
+    q = state["question"]
+    condensed = state.get("condensed_question") or ""
+    if condensed and condensed != q:
+        q = f"{q}\n（若原问题含指代或不完整，可参考已消歧的改写：{condensed}）"
     try:
         resp = await llm.ainvoke([
             SystemMessage(ROUTER_SYSTEM),
-            HumanMessage(state["question"]),
+            HumanMessage(q),
         ])
         data = json.loads(_extract_json(str(resp.content)))
         needs = bool(data.get("needs_search", True))
@@ -192,21 +204,39 @@ async def router(state: AgentState) -> dict:
 
 
 async def agent_node(state: AgentState) -> dict:
-    """决策节点：LLM 看上下文，决定调工具还是直接回答。"""
+    """决策节点：LLM 看上下文，决定调工具还是直接回答。
+
+    用户当前问题用凝练后的独立完整问题（消指代），与 router/reflect/generate 同源，
+    避免「它/那」类指代导致检索 query 错误；本轮内已有的工具调用 / 观察 / 改写提示
+    保留，供 LLM 连贯决策。
+    """
     llm = get_llm(temperature=0.3).bind_tools(AGENT_TOOLS)
     msgs: list[BaseMessage] = [SystemMessage(AGENT_SYSTEM_PROMPT)]
-    msgs.extend(state["messages"])
+    # 接入预算裁剪后的历史，避免失忆
+    msgs.extend(state.get("history_messages") or [])
+    # 当前问题用凝练版（消指代），替换原始未消解问题
+    q = state.get("condensed_question") or state["question"]
+    msgs.append(HumanMessage(q))
+    # 保留本轮内已有的工具调用 / 观察 / 改写提示（messages[0] 为原始问题，跳过）
+    rest = state["messages"][1:] if state["messages"] else []
+    msgs.extend(rest)
     resp = await llm.ainvoke(msgs)
     return {"messages": [resp]}
 
 
 async def tools_node(state: AgentState) -> dict:
-    """工具节点：执行工具，把结构化结果去重后写入 Accumulator（含 retry/fallback）。"""
+    """工具节点：执行工具，把结构化结果去重后写入 Accumulator（含 retry/fallback）。
+
+    观察文本回喂 LLM 前按 token 预算截断，避免撑爆窗口。
+    """
     import asyncio
+
+    from note_assistant.agent.context import get_context_manager
 
     last = state["messages"][-1]
     if not isinstance(last, AIMessage) or not last.tool_calls:
         return {}
+    cm = get_context_manager()
     new_messages: list[BaseMessage] = []
     accumulated = list(state["accumulated"])
     # 确定性去重：用 (filepath, heading) 作 key
@@ -216,6 +246,7 @@ async def tools_node(state: AgentState) -> dict:
         obs_text, results = await asyncio.to_thread(
             run_tool_call, tc["name"], tc.get("args", {})
         )
+        obs_text = cm.truncate_observation(obs_text, settings.agent_obs_token_budget)
         for r in results:
             key = (r.filepath, r.metadata.get("heading_path", ""))
             if key not in seen:
@@ -240,11 +271,12 @@ async def reflect(state: AgentState) -> dict:
     """
     llm = get_llm(temperature=0.0)
     label = "达上限（强制生成）" if state["iteration"] >= MAX_ITER else "未达上限"
+    q = state.get("condensed_question") or state["question"]
     try:
         msgs: list[BaseMessage] = [
             SystemMessage(JUDGE_SYSTEM),
             HumanMessage(
-                f"用户问题：{state['question']}\n\n"
+                f"用户问题：{q}\n\n"
                 f"当前已收集片段数：{len(state['accumulated'])}\n"
                 f"已检索轮次：{state['iteration']}/{MAX_ITER}（{label}）\n\n"
                 "请判断信息是否足够回答（输出 JSON）。"
@@ -297,9 +329,12 @@ async def generate_node(state: AgentState) -> dict:
     else:
         note = ""
     msgs: list[BaseMessage] = [SystemMessage(GENERATE_SYSTEM)]
-    msgs.extend(_fmt_history(state["history"]))
+    # 预算裁剪后的历史（含长程摘要），与 agent/direct_chat 同源，避免重复
+    history_msgs = state.get("history_messages") or _fmt_history(state["history"])
+    msgs.extend(history_msgs)
+    q = state.get("condensed_question") or state["question"]
     msgs.append(
-        HumanMessage(f"## 参考笔记\n{context}\n\n## 问题\n{state['question']}{note}")
+        HumanMessage(f"## 参考笔记\n{context}\n\n## 问题\n{q}{note}")
     )
     resp = await llm.ainvoke(msgs)
     answer = str(resp.content)
@@ -307,12 +342,13 @@ async def generate_node(state: AgentState) -> dict:
 
 
 async def direct_chat(state: AgentState) -> dict:
-    """直接对话节点：闲聊/人设类问题，不检索，友好回复。"""
+    """直接对话节点：闲聊/人设类问题，不检索，友好回复。接入历史不再失忆。"""
     llm = get_llm(temperature=0.6, max_tokens=1024)
-    resp = await llm.ainvoke([
-        SystemMessage(CHAT_SYSTEM),
-        HumanMessage(state["question"]),
-    ])
+    msgs: list[BaseMessage] = [SystemMessage(CHAT_SYSTEM)]
+    msgs.extend(state.get("history_messages") or [])
+    q = state.get("condensed_question") or state["question"]
+    msgs.append(HumanMessage(q))
+    resp = await llm.ainvoke(msgs)
     answer = str(resp.content)
     return {"answer": answer, "messages": [AIMessage(answer)]}
 

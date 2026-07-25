@@ -1,6 +1,13 @@
 """Agentic RAG 测试（不依赖外部服务 Ollama/DeepSeek/ChromaDB 的纯逻辑）。"""
-import pytest
+import asyncio
+import logging
 
+import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+
+from note_assistant.agent import agent as agent_mod
 from note_assistant.agent.agent import (
     _agent_branch,
     _extract_json,
@@ -8,9 +15,10 @@ from note_assistant.agent.agent import (
     _reflect_branch,
     _route_branch,
     _top_k_context,
+    agent_node,
     tools_node,
 )
-from note_assistant.agent.runner import _initial_state
+from note_assistant.agent.runner import _initial_state, _log_task_exception
 from note_assistant.agent.tools import _format_results
 from note_assistant.config import settings
 from note_assistant.retrieval.types import RetrievalResult
@@ -170,3 +178,110 @@ async def test_tools_node_no_tool_calls_returns_empty(monkeypatch):
     from langchain_core.messages import AIMessage
     out = await tools_node({"messages": [AIMessage(content="no tools")], "accumulated": [], "iteration": 0})
     assert out == {}
+
+
+# ──────────────────────────────────────────────
+# agent_node：当前问题使用凝练版（消指代），与 router/reflect/generate 同源
+# ──────────────────────────────────────────────
+
+class _CaptureLLM(BaseChatModel):
+    """记录最后一次 ainvoke 收到的 messages，返回无工具调用的空 AIMessage。"""
+    captured: list = []
+
+    @property
+    def _llm_type(self):
+        return "capture"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        _CaptureLLM.captured = list(messages)
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        _CaptureLLM.captured = list(messages)
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+@pytest.mark.asyncio
+async def test_agent_node_uses_condensed_question(monkeypatch):
+    """agent_node 应向 LLM 发送凝练后的独立问题，而非原始未消解问题。"""
+    _CaptureLLM.captured = []
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
+    state = {
+        "messages": [HumanMessage("它有什么缺点？")],
+        "history_messages": [],
+        "question": "它有什么缺点？",
+        "condensed_question": "FlashAttention 有什么缺点？",
+    }
+    await agent_node(state)
+    msgs = _CaptureLLM.captured
+    user_msgs = [m for m in msgs if isinstance(m, HumanMessage)]
+    assert user_msgs, "agent_node 必须向 LLM 发送用户问题"
+    # 用户问题应为凝练版，而非原始未消解的「它有什么缺点？」
+    assert user_msgs[0].content == "FlashAttention 有什么缺点？"
+    assert HumanMessage("它有什么缺点？") not in msgs
+
+
+@pytest.mark.asyncio
+async def test_agent_node_keeps_in_run_messages(monkeypatch):
+    """改写循环后再进 agent_node：保留本轮工具调用 / 观察，仅替换首条原始问题。"""
+    _CaptureLLM.captured = []
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
+    state = {
+        "messages": [
+            HumanMessage("它有什么缺点？"),
+            _ai_with_tools({"name": "hybrid_search", "args": {"query": "x"}, "id": "c1"}),
+            ToolMessage(content="obs", tool_call_id="c1"),
+            AIMessage(content="（反思改写）重新检索"),
+        ],
+        "history_messages": [],
+        "question": "它有什么缺点？",
+        "condensed_question": "FlashAttention 有什么缺点？",
+    }
+    await agent_node(state)
+    msgs = _CaptureLLM.captured
+    # 凝练问题注入，且本轮内的工具调用 / 观察顺序保留
+    assert HumanMessage("FlashAttention 有什么缺点？") in msgs
+    assert any(isinstance(m, ToolMessage) and m.content == "obs" for m in msgs)
+    # 原始未消解问题不应再出现
+    assert HumanMessage("它有什么缺点？") not in msgs
+
+
+@pytest.mark.asyncio
+async def test_router_uses_original_question_not_condensed(monkeypatch):
+    """回归：路由必须基于用户原始问题判意图，不能因凝练抹掉「笔记」信号而误判闲聊。
+
+    当凝练版把「你看看我之前的笔记，…」改写成不含「笔记」的独立问题时，router 仍应收到
+    原始问题（含「笔记」），而非被改写后的纯常识问法；凝练版仅作为消歧参考附上。
+    """
+    _CaptureLLM.captured = []
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
+    state = {
+        "question": "你看看我之前的笔记，上下文工程的五大策略有哪些？",
+        "condensed_question": "上下文工程的五大策略有哪些？",  # 凝练抹掉了「笔记」
+    }
+    await agent_mod.router(state)
+    user_msgs = [m for m in _CaptureLLM.captured if isinstance(m, HumanMessage)]
+    assert user_msgs, "router 必须向 LLM 发送用户问题"
+    assert "笔记" in user_msgs[0].content                       # 原始「笔记」信号保留
+    assert "上下文工程的五大策略有哪些？" in user_msgs[0].content  # 凝练版作为消歧参考
+
+
+# ──────────────────────────────────────────────
+# 后台任务异常兜底
+# ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_log_task_exception_logs_and_does_not_propagate(caplog):
+    """后台任务抛异常时，_log_task_exception 兜底记日志而不向外抛。"""
+    caplog.set_level(logging.WARNING)
+
+    async def boom():
+        raise RuntimeError("kaboom")
+
+    task = asyncio.create_task(boom())
+    task.add_done_callback(_log_task_exception)
+    await asyncio.gather(task, return_exceptions=True)
+    assert any("kaboom" in r.message for r in caplog.records)

@@ -83,8 +83,23 @@ class AgentStore:
                 )
                 """
             )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_summaries (
+                    session_id TEXT NOT NULL,
+                    idx_from   INTEGER NOT NULL,
+                    idx_to     INTEGER NOT NULL,
+                    summary    TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, idx_to)
+                )
+                """
+            )
             c.execute("CREATE INDEX IF NOT EXISTS ix_run_events ON run_events(run_id)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_session ON session_turns(session_id)")
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS ix_summary ON session_summaries(session_id, idx_to)"
+            )
 
     # ──────────────────────────────────────────
     # runs：流式续传快照
@@ -191,6 +206,94 @@ class AgentStore:
         # 倒序取回，翻转回正序
         return [{"role": r, "content": c_} for r, c_ in reversed(rows)]
 
+    def get_recent_turns(self, session_id: str, n: int) -> List[dict]:
+        """取回最近 n 轮对话（按时间正序），供 agent 路径上下文组装。"""
+        return self.get_history(session_id, limit=n)
+
+    def count_turns(self, session_id: str) -> int:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT COUNT(*) FROM session_turns WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+
+    def get_turns_in_range(self, session_id: str, from_idx: int, to_idx: int) -> List[dict]:
+        """取回 idx ∈ [from_idx, to_idx] 的轮次（按 idx 正序），供滚动摘要。"""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT idx, role, content FROM session_turns WHERE session_id=? "
+                "AND idx >= ? AND idx <= ? ORDER BY idx",
+                (session_id, from_idx, to_idx),
+            ).fetchall()
+        return [{"idx": i, "role": r, "content": c_} for i, r, c_ in rows]
+
+    def get_all_turns(self, session_id: str) -> List[dict]:
+        """取回全部轮次（按 idx 正序），供 token 阈值统计。"""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT idx, role, content FROM session_turns WHERE session_id=? ORDER BY idx",
+                (session_id,),
+            ).fetchall()
+        return [{"idx": i, "role": r, "content": c_} for i, r, c_ in rows]
+
+    def delete_turns_up_to(self, session_id: str, idx_to: int) -> None:
+        """删除 idx <= idx_to 的轮次（已被摘要后清理原文）。"""
+        with self._conn() as c:
+            c.execute(
+                "DELETE FROM session_turns WHERE session_id=? AND idx <= ?",
+                (session_id, idx_to),
+            )
+
+    def enforce_session_cap(self, session_id: str, max_turns: int) -> None:
+        """超过 max_turns 时删除最旧轮次，防无限增长。"""
+        with self._conn() as c:
+            cur = c.execute(
+                "SELECT COUNT(*) FROM session_turns WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+            if cur > max_turns:
+                excess = cur - max_turns
+                c.execute(
+                    "DELETE FROM session_turns WHERE session_id=? AND idx IN ("
+                    "SELECT idx FROM session_turns WHERE session_id=? ORDER BY idx LIMIT ?)",
+                    (session_id, session_id, excess),
+                )
+
+    # ──────────────────────────────────────────
+    # session_summaries：长程记忆滚动摘要
+    # ──────────────────────────────────────────
+
+    def save_summary(self, session_id: str, idx_from: int, idx_to: int, summary: str) -> None:
+        """保存一段滚动摘要（覆盖同名 idx_to，幂等）。"""
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO session_summaries"
+                "(session_id, idx_from, idx_to, summary, created_at) VALUES (?,?,?,?,?)",
+                (session_id, idx_from, idx_to, summary, time.time()),
+            )
+
+    def get_latest_summary(self, session_id: str) -> Optional[dict]:
+        """取回最近一段摘要（idx_to 最大），无则返回 None。"""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT idx_from, idx_to, summary, created_at FROM session_summaries "
+                "WHERE session_id=? ORDER BY idx_to DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return None
+        idx_from, idx_to, summary, created_at = row
+        return {
+            "idx_from": idx_from,
+            "idx_to": idx_to,
+            "summary": summary,
+            "created_at": created_at,
+        }
+
+    def get_history_with_summary(
+        self, session_id: str, recent_n: int = 6, limit: int = 20
+    ) -> tuple[Optional[dict], List[dict]]:
+        """API 用：返回 (最近摘要 | None, 最近 N 轮原文)。"""
+        return self.get_latest_summary(session_id), self.get_recent_turns(session_id, recent_n)
+
     # ──────────────────────────────────────────
     # 测试辅助
     # ──────────────────────────────────────────
@@ -201,3 +304,4 @@ class AgentStore:
             c.execute("DELETE FROM runs")
             c.execute("DELETE FROM run_events")
             c.execute("DELETE FROM session_turns")
+            c.execute("DELETE FROM session_summaries")

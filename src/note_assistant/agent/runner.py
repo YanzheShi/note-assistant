@@ -6,6 +6,7 @@
 - 缓存：精确 + 近邻（注入式 embedder），外部异常自动降级，绝不拖垮主链路。
 """
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -13,11 +14,14 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from note_assistant.agent import agent as agent_mod
 from note_assistant.agent.cache import SemanticCache
+from note_assistant.agent.context import get_context_manager
 from note_assistant.agent.store import AgentStore
 from note_assistant.config import settings
 from note_assistant.retrieval.types import RetrievalResult
 
 OBS_TRUNCATE = 500  # observation 文本截断长度，避免轨迹过大
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -170,19 +174,63 @@ def _trajectory_from_state(final: dict) -> List[dict]:
 # 入口
 # ──────────────────────────────────────────────
 
-def _initial_state(question: str, history: Optional[list]) -> dict:
+def _initial_state(
+    question: str,
+    history: Optional[list],
+    condensed: str = "",
+    history_messages: Optional[list] = None,
+    accumulated: Optional[list] = None,
+) -> dict:
     return {
         "messages": [HumanMessage(question)],
-        "accumulated": [],
+        "accumulated": accumulated or [],
         "iteration": 0,
         "route": "",
         "question": question,
+        "condensed_question": condensed,
         "history": history or [],
+        "history_messages": history_messages or [],
         "answer": "",
         "judge_verdict": "",
         "rewritten_query": "",
         "judge_log": [],
     }
+
+
+async def _prepare_agent_context(
+    question: str,
+    session_id: str,
+    store: Optional[AgentStore],
+    effective_history: list,
+) -> tuple[str, List[BaseMessage], List[RetrievalResult], str]:
+    """入口上下文装配：凝练问题 → 取长程摘要 → 预算裁剪历史 → 跨轮累积 seed → 缓存指纹。
+
+    返回 ``(condensed, history_messages, seed_accumulated, ctx_key)``。
+    """
+    cm = get_context_manager()
+    # 1) 问题凝练（消指代），供路由/检索/缓存指纹使用
+    condensed = await cm.condense_question(question, effective_history)
+
+    # 2) 长程摘要（若有），作为 SystemMessage 前置 + 掺入缓存指纹
+    summary_text = ""
+    if store is not None and session_id:
+        latest = await asyncio.to_thread(store.get_latest_summary, session_id)
+        summary_text = latest["summary"] if latest else ""
+
+    # 3) 预算裁剪后的历史消息（相关性 + token 预算），与 agent/direct_chat/generate 同源
+    history_messages = cm.budget_history_messages(
+        effective_history, condensed, settings.agent_history_token_budget, summary=summary_text
+    )
+
+    # 4) 跨轮累积 seed（上一轮检索片段，带一轮衰减）
+    seed = cm.seed_accumulated(session_id) if session_id else []
+
+    # 5) 总预算兜底（history + accumulated 之和不可超上限）
+    history_messages, seed = cm.fit_total_budget(history_messages, seed)
+
+    # 6) 缓存指纹：凝练问题 + 摘要 hash，不同上下文 → 不同 key，防串台
+    ctx_key = cm.context_key(condensed, summary_text)
+    return condensed, history_messages, seed, ctx_key
 
 
 async def ainvoke(
@@ -200,9 +248,14 @@ async def ainvoke(
     else:
         effective_history = history or []
 
+    # 上下文装配：凝练问题 + 预算历史 + 跨轮累积 + 缓存指纹
+    condensed, history_messages, seed, ctx_key = await _prepare_agent_context(
+        question, session_id, store, effective_history
+    )
+
     cache = _get_cache()
     if cache.enabled:
-        hit = cache.get(question)
+        hit = cache.get(question, ctx_key=ctx_key)
         if hit is not None:
             result = AgentRunResult(
                 answer=hit.answer,
@@ -211,12 +264,21 @@ async def ainvoke(
                 cached=True,
             )
             await _record_run(store, session_id, run_id, question, result, effective_history)
+            _post_run_context(store, session_id, get_context_manager(), seed, question, result.answer)
             return result
 
     graph = agent_mod.build_graph()
-    final = await graph.ainvoke(_initial_state(question, effective_history))
+    final = await graph.ainvoke(
+        _initial_state(
+            question,
+            effective_history,
+            condensed=condensed,
+            history_messages=history_messages,
+            accumulated=seed,
+        )
+    )
     traj = _trajectory_from_state(final)
-    sources = _sources_from_results(final.get("accumulated", []))
+    sources = _sources_from_results(final.get("accumulated", seed))
     traj.append({"type": "sources", "sources": sources})
     result = AgentRunResult(
         answer=final.get("answer", ""),
@@ -224,9 +286,49 @@ async def ainvoke(
         trajectory=traj,
     )
     if cache.enabled:
-        cache.put(question, result.answer, result.sources, result.trajectory)
+        cache.put(question, result.answer, result.sources, result.trajectory, ctx_key=ctx_key)
     await _record_run(store, session_id, run_id, question, result, effective_history)
+    _post_run_context(store, session_id, get_context_manager(), final.get("accumulated", seed), question, result.answer)
     return result
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """后台任务异常兜底：避免 asyncio『Task exception was never retrieved』被静默吞掉。
+
+    ``maybe_summarize`` 内部已逐层 try/except 降级，正常不会抛到此处；这里仅作最后一道
+    防线，把任何漏网的异常记成日志，便于排查而非无声消失。
+    """
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass  # 取消不视为异常
+    except Exception as e:  # noqa: BLE001
+        logger.warning("后台 maybe_summarize 抛异常（已吞掉，不影响主链路）: %s", e)
+
+
+def _post_run_context(
+    store: Optional[AgentStore],
+    session_id: str,
+    cm,
+    accumulated: list,
+    question: str,
+    answer: str,
+) -> None:
+    """运行后上下文收尾：更新跨轮累积，并在达到 token 阈值时后台触发长程摘要。
+
+    摘要在后台任务里执行（不计入用户延迟）；无 session_id 时跨轮累积无意义，跳过。
+    """
+    if not session_id:
+        return
+    cm.record_turn(session_id, accumulated, question, answer)
+    if settings.agent_summary_enabled and store is not None:
+        try:
+            # 后台任务：回答已返回，摘要不阻塞主链路
+            task = asyncio.create_task(cm.maybe_summarize(session_id, store))
+            task.add_done_callback(_log_task_exception)
+        except RuntimeError:
+            # 极端情况下无运行中的事件循环，静默降级跳过
+            pass
 
 
 async def _record_run(
@@ -274,6 +376,11 @@ async def astream(
         effective_history = history or []
     cache = _get_cache()
 
+    # 上下文装配（与 ainvoke 同源）：凝练 / 预算历史 / 跨轮累积 / 缓存指纹
+    condensed, history_messages, seed, ctx_key = await _prepare_agent_context(
+        question, session_id, store, effective_history
+    )
+
     # ── 续传：给定已存在的 run_id ──
     if run_id and store is not None:
         run = await asyncio.to_thread(store.get_run, run_id)
@@ -289,7 +396,7 @@ async def astream(
 
     # ── 缓存命中：直接回放（并登记 run 以便后续轮询）──
     if cache.enabled:
-        hit = cache.get(question)
+        hit = cache.get(question, ctx_key=ctx_key)
         if hit is not None:
             rid = run_id or (await asyncio.to_thread(store.create_run, question) if store is not None else "")
             if store is not None:
@@ -299,6 +406,7 @@ async def astream(
                                    trajectory=hit.trajectory, cached=True),
                     effective_history,
                 )
+                _post_run_context(store, session_id, get_context_manager(), seed, question, hit.answer)
             yield {"type": "run", "run_id": rid}
             for t in hit.trajectory:
                 yield t
@@ -314,7 +422,10 @@ async def astream(
     yield {"type": "run", "run_id": rid}
 
     graph = agent_mod.build_graph()
-    state = _initial_state(question, effective_history)
+    state = _initial_state(
+        question, effective_history,
+        condensed=condensed, history_messages=history_messages, accumulated=seed,
+    )
     seq = 0
     traj: List[dict] = []
     accumulated: List[RetrievalResult] = []
@@ -386,4 +497,5 @@ async def astream(
             await asyncio.to_thread(store.append_turn, session_id, "user", question)
             await asyncio.to_thread(store.append_turn, session_id, "assistant", final_answer)
     if cache.enabled:
-        cache.put(question, final_answer, sources, traj)
+        cache.put(question, final_answer, sources, traj, ctx_key=ctx_key)
+    _post_run_context(store, session_id, get_context_manager(), accumulated, question, final_answer)

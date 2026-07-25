@@ -68,5 +68,39 @@ class Settings(BaseSettings):
     agent_db_path: str = "data/agent.sqlite"     # SQLite 文件路径（相对 PROJECT_ROOT 或绝对路径）
     agent_run_orphan_ttl: int = 600              # run 未完成超过该秒数判定为 interrupted（孤儿检测）
 
+    # === 上下文管理（ContextManager）===
+    # 总预算硬上限：历史 + 累积 + 工具观察三段之和不可超过此值（模型窗口 - 输出预留）。
+    # ⚠️ 不变式：本值须 ≥ 三个子预算之和（2000+1500+800=4300）。
+    #   obs 由 tools_node 按 agent_obs_token_budget 独立截断；history / accumulated 各自独立封顶，
+    #   因此本值作为全局安全网存在（正常路径三段之和已 ≤ 本值）。调整任一段子预算时须同步上调本值。
+    agent_total_context_token_budget: int = 4500
+    # 各段默认子预算；超总预算时按 obs → accumulated → history 优先级压缩
+    agent_history_token_budget: int = 2000
+    agent_accumulated_token_budget: int = 1500
+    agent_obs_token_budget: int = 800
+
+    # 问题凝练（消指代）开关
+    agent_condense_enabled: bool = True
+    # 长程记忆（滚动摘要）开关
+    agent_summary_enabled: bool = True
+    # 触发滚动摘要的“原文 user/assistant 轮次 token 总和”阈值（非轮次数）
+    agent_session_summary_threshold: int = 3000
+    # 滚动摘要后保留的最近原文轮次数（不摘要，供 get_history 直接返回）
+    agent_session_recent_keep: int = 6
+    # session_turns 硬上限，超过删最旧轮次防无限增长
+    agent_session_max_turns: int = 200
+    # 相关性裁剪开关
+    agent_history_relevance_enabled: bool = True
+    # 相关性裁剪只看最近 N 轮时间窗口（窗口外不进候选，避免“全高分=没裁剪”）
+    agent_history_relevance_window: int = 20
+    # 与凝练问题的 embedding 相似度阈值，>= 该值才保留。
+    # 注意：bge-m3 余弦分布下 0.3 偏松，易使「时间窗口内几乎全过=裁剪近乎失效」。
+    # 建议跑真实对话数据后调到 0.5~0.6 区间，并按实际召回质量微调。
+    agent_history_relevance_threshold: float = 0.3
+    # 跨轮累积每跨一轮的 score 衰减系数（双重保险之一）
+    agent_accumulated_decay: float = 0.9
+    # 跨轮累积按 token 预算硬截断时保留的最大片段数（辅助上限）
+    agent_accumulated_max_items: int = 30
+
 
 settings = Settings()
