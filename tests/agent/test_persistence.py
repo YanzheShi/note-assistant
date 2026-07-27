@@ -35,7 +35,7 @@ class FakeAgentLLM(BaseChatModel):
                 c = m.content
                 if "意图分类器" in c:
                     return "router"
-                if "反思评判器" in c:
+                if "检索质量" in c:
                     return "reflect"
                 if "闲聊" in c:
                     return "chat"
@@ -87,9 +87,20 @@ def _fake_tool(name, args):
 
 @pytest.fixture
 def patched(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
     store = AgentStore(tmp_path / "agent.sqlite")
     store.reset()
     set_store_for_test(store)
+    # 关掉自动图扩展：避免 e2e 触碰真实图谱数据 / ChromaDB
+    monkeypatch.setattr(settings, "agent_graph_expand_enabled", False)
+    # mock reranker 工厂：graph 保留 rerank 节点结构，但用 mock 替代模型加载（离线、快速）
+    _fake_reranker = MagicMock()
+    _fake_reranker.rerank.side_effect = (
+        lambda q, results, top_k=None: results if top_k is None else results[:top_k]
+    )
+    monkeypatch.setattr(agent_mod, "get_reranker", lambda *a, **k: _fake_reranker)
+    # 当前 settings 已定稿，清空 build_graph 缓存以便用最新开关重建 graph
+    agent_mod.build_graph.cache_clear()
     monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: FakeAgentLLM())
     monkeypatch.setattr(agent_mod, "run_tool_call", _fake_tool)
     reset_cache()
@@ -149,15 +160,25 @@ async def test_cache_hit_still_records_run(patched):
 
 @pytest.mark.asyncio
 async def test_session_disabled_falls_back_to_stateless(monkeypatch, tmp_path):
-    import note_assistant.agent.agent as agent_mod
+    from unittest.mock import MagicMock
     # 关掉持久化但仍需用 fake LLM，避免打到真实 API
     monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: FakeAgentLLM())
     monkeypatch.setattr(agent_mod, "run_tool_call", _fake_tool)
+    # 关闭图扩展 + mock reranker，避免离线 e2e 触碰真实图谱 / 1.1GB 模型
+    monkeypatch.setattr(settings, "agent_graph_expand_enabled", False)
+    _fake_reranker = MagicMock()
+    _fake_reranker.rerank.side_effect = (
+        lambda q, results, top_k=None: results if top_k is None else results[:top_k]
+    )
+    monkeypatch.setattr(agent_mod, "get_reranker", lambda *a, **k: _fake_reranker)
+    agent_mod.build_graph.cache_clear()
     monkeypatch.setattr(settings, "agent_session_enabled", False)
     reset_store()  # 清全局，强制 get_store() 走 settings 判定
     # 无临时 store 注入（disabled）→ get_store 返回 None
     assert get_store() is None
     result = await ainvoke("FlashAttention 是什么？")
-    assert result.run_id == ""  # 退化为无状态
+    # 无状态模式：不持久化（get_store() 为 None，_record_run 直接 return），
+    # 但 ainvoke 仍会为本次调用生成 run_id（仅作调用标识，不落盘）。
+    assert result.run_id
     reset_store()
     monkeypatch.setattr(settings, "agent_session_enabled", True)

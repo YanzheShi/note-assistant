@@ -18,7 +18,8 @@ def test_env_override(monkeypatch):
     s = Settings(_env_file=None)  # 忽略真实 .env，纯测 env
     assert s.vault_path == Path("/tmp/test_vault")
     assert s.embed_dim == 768          # str->int 自动转
-    assert s.deepseek_api_key.get_secret_value() == "sk-dummy"
+    # deepseek_api_key 在 config 中定义为普通 str 字段（非 SecretStr）
+    assert s.deepseek_api_key == "sk-dummy"
 
 
 def test_defaults_without_env():

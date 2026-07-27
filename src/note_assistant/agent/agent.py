@@ -36,7 +36,7 @@ from langchain_core.messages import (
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from note_assistant.agent.tools import AGENT_TOOLS, run_tool_call
+from note_assistant.agent.tools import AGENT_TOOLS, graph_expand_impl, run_tool_call
 from note_assistant.retrieval.reranker import get_reranker
 from note_assistant.config import settings
 from note_assistant.llm.client import get_llm
@@ -103,6 +103,8 @@ ROUTER_SYSTEM = (
     "- 与知识库主题完全无关的通用问题（'今天天气'、'现在几点'）\n"
     "\n"
     "犹豫不决时，宁可检索，不要跳过。\n"
+    "\n"
+    "不要做可能判定，宁可检索，不要因为可能没有就不检索。\n"
     "\n"
     "只输出一个 JSON 对象，不要有任何其他文字：\n"
     "{\"needs_search\": true 或 false, \"reason\": \"简短理由\", \"confidence\": 0.0到1.0之间}\n"
@@ -387,6 +389,39 @@ async def rewrite_node(state: AgentState) -> dict:
     return {"messages": [HumanMessage(hint)]}
 
 
+async def graph_expand_node(state: AgentState) -> dict:
+    """自动图扩展节点：每轮检索后，从 accumulated 的 filepath 出发沿 [[wikilinks]] 扩展关联笔记。
+
+    关闭时直接透传，不加载图。
+    """
+    if not settings.agent_graph_expand_enabled:
+        return {}
+    if not state["accumulated"]:
+        return {}
+    filepaths = list({
+        r.filepath for r in state["accumulated"]
+        if r.filepath and not r.filepath.startswith("[[")
+    })
+    if not filepaths:
+        return {}
+    new_chunks = graph_expand_impl(filepaths, hop=settings.agent_graph_expand_hop)
+    if not new_chunks:
+        return {}
+    # 去重合并：按 (filepath, heading) 去重
+    accumulated = list(state["accumulated"])
+    seen = {(r.filepath, r.metadata.get("heading_path", "")) for r in accumulated}
+    added = 0
+    for r in new_chunks:
+        key = (r.filepath, r.metadata.get("heading_path", ""))
+        if key not in seen:
+            seen.add(key)
+            accumulated.append(r)
+            added += 1
+    if added == 0:
+        return {}
+    return {"accumulated": accumulated}
+
+
 async def rerank_loop(state: AgentState) -> dict:
     """Rerank ①：循环内闸门。每轮工具调用后，对 accumulated 做精排，保留 top-k。
 
@@ -496,6 +531,7 @@ def build_graph():
     g.add_node("router", router)
     g.add_node("agent", agent_node)
     g.add_node("tools", tools_node)
+    g.add_node("graph_expand_node", graph_expand_node)
     g.add_node("rerank_loop", rerank_loop)
     g.add_node("reflect", reflect)
     g.add_node("rerank_exit", rerank_exit)
@@ -510,7 +546,8 @@ def build_graph():
     g.add_conditional_edges(
         "agent", _agent_branch, {"tools": "tools", "generate": "generate"}
     )
-    g.add_edge("tools", "rerank_loop" if settings.agent_reranker_loop_enabled else "reflect")
+    g.add_edge("tools", "graph_expand_node" if settings.agent_graph_expand_enabled else               ("rerank_loop" if settings.agent_reranker_loop_enabled else "reflect"))
+    g.add_edge("graph_expand_node", "rerank_loop" if settings.agent_reranker_loop_enabled else "reflect")
     g.add_edge("rerank_loop", "reflect")
     g.add_conditional_edges(
         "reflect", _reflect_branch, {"generate": "generate", "rerank_exit": "rerank_exit", "rewrite": "rewrite"}

@@ -1,4 +1,5 @@
 import sys
+import importlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -7,7 +8,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Mock FlagEmbedding before importing reranker
 _flag_mock = MagicMock()
 _flag_mock.FlagReranker.return_value = MagicMock()
-sys.modules.setdefault("FlagEmbedding", _flag_mock)
+# 强制覆盖：即使其它测试（如 agent 测试）已先 import 真实的 FlagEmbedding，
+# 这里也保证 reranker 拿到的是 mock，避免离线环境下实例化真实模型触发 OSError。
+sys.modules["FlagEmbedding"] = _flag_mock
+
+# 若 reranker 模块已被其它测试先行 import，其内部的 FlagReranker 已绑定真实类；
+# 这里强制重导入，使其重新绑定到上面的 mock，保证离线稳定、不受导入顺序影响。
+_reranker_name = "note_assistant.retrieval.reranker"
+if _reranker_name in sys.modules:
+    importlib.reload(sys.modules[_reranker_name])
 
 from note_assistant.retrieval.reranker import LocalReranker
 from note_assistant.retrieval.types import RetrievalResult

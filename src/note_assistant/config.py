@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     agent_db_path: str = "data/agent.sqlite"     # SQLite 文件路径（相对 PROJECT_ROOT 或绝对路径）
     agent_run_orphan_ttl: int = 600              # run 未完成超过该秒数判定为 interrupted（孤儿检测）
 
+    # === Agent Graph Expand（自动图扩展，默认关闭）===
+    agent_graph_expand_enabled: bool = False     # 每轮检索后自动沿 [[wikilinks]] 扩展关联笔记
+    agent_graph_expand_hop: int = 1              # 扩展跳数
+
     # === Agent Reranker（双层精排，可独立开关对比）===
     agent_reranker_loop_enabled: bool = True    # Rerank ①：循环内闸门（tools→reflect）
     agent_reranker_exit_enabled: bool = True    # Rerank ②：出口总安检（reflect→generate）

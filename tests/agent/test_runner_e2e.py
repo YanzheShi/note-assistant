@@ -32,7 +32,7 @@ class FakeAgentLLM(BaseChatModel):
                 c = m.content
                 if "意图分类器" in c:
                     return "router"
-                if "反思评判器" in c:
+                if "检索质量" in c:
                     return "reflect"
                 if "闲聊" in c:
                     return "chat"
@@ -96,11 +96,23 @@ def patched(monkeypatch):
     import note_assistant.agent.agent as agent_mod
     from note_assistant.agent.runner import reset_store
     from note_assistant.config import settings
+    from unittest.mock import MagicMock
     # 关掉持久化，避免 e2e 测试触碰真实 SQLite 文件（保持无副作用、快速）
     monkeypatch.setattr(settings, "agent_session_enabled", False)
     # 关掉相关性裁剪，避免 e2e 触碰 Ollama embedder（离线、确定性）
     monkeypatch.setattr(settings, "agent_history_relevance_enabled", False)
+    # 关掉自动图扩展：避免 e2e 触碰真实图谱数据 / ChromaDB
+    monkeypatch.setattr(settings, "agent_graph_expand_enabled", False)
+    # mock reranker 工厂：graph 中仍保留 rerank 节点（双层精排结构不变），
+    # 但用 mock 替代 1.1GB 模型加载，保证离线、快速、确定
+    _fake_reranker = MagicMock()
+    _fake_reranker.rerank.side_effect = (
+        lambda q, results, top_k=None: results if top_k is None else results[:top_k]
+    )
+    monkeypatch.setattr(agent_mod, "get_reranker", lambda *a, **k: _fake_reranker)
     reset_store()
+    # 当前 settings（含上述开关）已定稿，清空 build_graph 缓存以便用最新开关重建 graph
+    agent_mod.build_graph.cache_clear()
     set_context_manager_for_test(None)  # 每次按当前 settings 懒重建 ContextManager
     # context.py 的凝练走 note_assistant.llm.client.get_llm，需一并 mock 才离线
     monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: FakeAgentLLM())

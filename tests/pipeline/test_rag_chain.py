@@ -114,7 +114,12 @@ class TestAsk:
             graph=None,
             generator=mock_gen,
         )
-        result = r.ask("测试问题")
+        # mock 路由 LLM：判定为「不需要检索」→ 返回固定问候语（离线、确定）
+        with patch("note_assistant.pipeline.rag_chain.httpx.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "choices": [{"message": {"content": '{"need_retrieval": false}'}}]
+            }
+            result = r.ask("测试问题")
         assert result.graph_expansion == 0
         # 路由判断为 false 时不走 generator，返回固定问候语
         assert "你好" in result.answer
@@ -246,12 +251,12 @@ class TestNeedsRetrieval:
                 assert r._needs_retrieval_sync("hi") is False, f"Failed for {text}"
 
     def test_api_error_defaults_to_true(self):
-        """API 调用失败时保守默认：仍然检索"""
+        """API 调用失败时保守默认：仍然检索（避免漏答）"""
         import httpx as _httpx
         with patch("note_assistant.pipeline.rag_chain.httpx.post", side_effect=_httpx.HTTPError("network error")):
             r = RAGChain(_make_mock_retriever(), _make_mock_reranker())
-            # API 不可用时默认不检索（避免浪费时间和 token）
-            assert r._needs_retrieval_sync("hi") is False
+            # 源码 _needs_retrieval_sync 在异常时降级为「默认检索」(return True)
+            assert r._needs_retrieval_sync("hi") is True
 
     def test_json_parse_error_defaults_to_true(self):
         """非 JSON 字符串（如"不需要"）被 _parse_routing_result 解析为 False（不需要检索）"""
