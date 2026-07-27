@@ -81,7 +81,7 @@ async def lifespan(app: FastAPI):
     
     # LangSmith 链路追踪（通过环境变量，LangChain 自动拾取）
     import os
-    if settings.langsmith_api_key:
+    if settings.langsmith_tracing_enabled and settings.langsmith_api_key:
         os.environ["LANGSMITH_TRACING"] = "true"
         os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
         os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint

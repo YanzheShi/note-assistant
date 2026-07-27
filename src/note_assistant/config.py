@@ -46,8 +46,9 @@ class Settings(BaseSettings):
     longcat_model: str
 
     # === LangSmith (Tracing) ===
+    langsmith_tracing_enabled: bool = True
     langsmith_api_key: str = ""
-    langsmith_endpoint: str = "https://apiv2.smith.langchain.com"
+    langsmith_endpoint: str
     langsmith_project: str = "note-assistant"
 
     # === Retrieval ===

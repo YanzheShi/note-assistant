@@ -16,7 +16,8 @@ import logging
 import logging.config
 from typing import Optional
 
-from pythonjsonlogger import jsonlogger
+# from pythonjsonlogger import jsonlogger
+from pythonjsonlogger.json import JsonFormatter
 
 # ── request_id 跨 await 传递 ──
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -79,10 +80,12 @@ def setup_logging(
         "filters": {"request_id": {"()": RequestIdFilter}},
         "formatters": {
             "json": {
-                "()": jsonlogger.JsonFormatter,
+                "()": JsonFormatter,
                 "format": (
-                    "%(timestamp)s %(level)s %(logger)s %(message)s"
+                    "%(asctime)s %(levelname)s %(name)s %(message)s"
                 ),
+                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+                "json_ensure_ascii": False,
             },
             "text": {"format": text_fmt},
         },
