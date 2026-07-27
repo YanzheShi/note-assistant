@@ -69,7 +69,7 @@ class HybridRetriever:
 
     def _results_from_chroma(self, query_results: dict) -> List[RetrievalResult]:
         """把 ChromaDB query 输出（含 distances）转为归一化 similarity 的 RetrievalResult 列表。"""
-        if not query_results.get("distances"):
+        if not query_results.get("distances") or not query_results["distances"][0]:
             return []
         distances = query_results["distances"][0]
         docs = query_results["documents"][0]

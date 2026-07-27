@@ -95,13 +95,13 @@ async def lifespan(app: FastAPI):
     # ═══════════════════════════════════════════════════
     from note_assistant.pipeline.rag_chain import RAGChain
     from note_assistant.retrieval.hybrid import HybridRetriever
-    from note_assistant.retrieval.reranker import LocalReranker
+    from note_assistant.retrieval.reranker import get_reranker
     from note_assistant.retrieval.graph import WikiGraph
     from note_assistant.generation.generator import Generator
 
     # HybridRetriever 内部自行创建 embedder/ingestor/bm25，不需要外部传
     hybrid = HybridRetriever(alpha=settings.dense_weight)
-    reranker = LocalReranker(str(settings.reranker_model))
+    reranker = get_reranker(model_path=str(settings.reranker_model))
     graph = WikiGraph()
     generator = Generator()
 

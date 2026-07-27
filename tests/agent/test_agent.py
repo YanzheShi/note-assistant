@@ -285,3 +285,42 @@ async def test_log_task_exception_logs_and_does_not_propagate(caplog):
     task.add_done_callback(_log_task_exception)
     await asyncio.gather(task, return_exceptions=True)
     assert any("kaboom" in r.message for r in caplog.records)
+
+# ──────────────────────────────────────────────
+# Reranker 路由测试（出口开关控制 _reflect_branch 行为）
+# ──────────────────────────────────────────────
+
+def test_reflect_branch_routes_to_rerank_exit_when_enabled(monkeypatch):
+    """rerank_exit 开启时，sufficient/give_up/达上限 应走 rerank_exit 而非 generate。"""
+    monkeypatch.setattr(settings, "agent_reranker_exit_enabled", True)
+    s = {"iteration": 1, "judge_verdict": "sufficient"}
+    assert _reflect_branch(s) == "rerank_exit"
+    s = {"iteration": 1, "judge_verdict": "give_up"}
+    assert _reflect_branch(s) == "rerank_exit"
+    # 达上限也应走 rerank_exit
+    s = {"iteration": settings.agent_max_iter, "judge_verdict": "need_more"}
+    assert _reflect_branch(s) == "rerank_exit"
+
+
+def test_reflect_branch_routes_to_generate_when_disabled():
+    """rerank_exit 关闭时，行为不变，仍走 generate。"""
+    s = {"iteration": 1, "judge_verdict": "sufficient"}
+    assert _reflect_branch(s) == "generate"
+    s = {"iteration": 1, "judge_verdict": "give_up"}
+    assert _reflect_branch(s) == "generate"
+
+
+def test_rerank_loop_disabled_returns_empty():
+    """rerank_loop 关闭时，直接透传，不做事。"""
+    from note_assistant.agent.agent import rerank_loop
+    import asyncio
+    result = asyncio.run(rerank_loop({"accumulated": [], "condensed_question": "q"}))
+    assert result == {}
+
+
+def test_rerank_exit_disabled_returns_empty():
+    """rerank_exit 关闭时，直接透传，不做事。"""
+    from note_assistant.agent.agent import rerank_exit
+    import asyncio
+    result = asyncio.run(rerank_exit({"accumulated": [], "condensed_question": "q"}))
+    assert result == {}

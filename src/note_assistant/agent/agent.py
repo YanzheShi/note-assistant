@@ -37,6 +37,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from note_assistant.agent.tools import AGENT_TOOLS, run_tool_call
+from note_assistant.retrieval.reranker import get_reranker
 from note_assistant.config import settings
 from note_assistant.llm.client import get_llm
 from note_assistant.retrieval.types import RetrievalResult
@@ -386,6 +387,36 @@ async def rewrite_node(state: AgentState) -> dict:
     return {"messages": [HumanMessage(hint)]}
 
 
+async def rerank_loop(state: AgentState) -> dict:
+    """Rerank ①：循环内闸门。每轮工具调用后，对 accumulated 做精排，保留 top-k。
+
+    关闭时直接透传，不加载 reranker 模型。
+    """
+    if not settings.agent_reranker_loop_enabled:
+        return {}
+    if not state["accumulated"]:
+        return {}
+    reranker = get_reranker()
+    question = state.get("condensed_question") or state["question"]
+    results = reranker.rerank(question, state["accumulated"], top_k=settings.agent_reranker_loop_top_k)
+    return {"accumulated": results}
+
+
+async def rerank_exit(state: AgentState) -> dict:
+    """Rerank ②：出口总安检。Judge 判定通过后，对多轮累积做全局精排。
+
+    关闭时直接透传，不加载 reranker 模型。
+    """
+    if not settings.agent_reranker_exit_enabled:
+        return {}
+    if not state["accumulated"]:
+        return {}
+    reranker = get_reranker()
+    question = state.get("condensed_question") or state["question"]
+    results = reranker.rerank(question, state["accumulated"], top_k=settings.top_k_rerank)
+    return {"accumulated": results}
+
+
 async def generate_node(state: AgentState) -> dict:
     """生成节点：用累积去重 + Top-K 裁剪后的上下文生成带引用的答案。
 
@@ -448,10 +479,10 @@ def _agent_branch(state: AgentState) -> str:
 
 def _reflect_branch(state: AgentState) -> str:
     if state["iteration"] >= MAX_ITER:
-        return "generate"
+        return "rerank_exit" if settings.agent_reranker_exit_enabled else "generate"
     verdict = state.get("judge_verdict", "sufficient")
     if verdict in ("sufficient", "give_up"):
-        return "generate"
+        return "rerank_exit" if settings.agent_reranker_exit_enabled else "generate"
     return "rewrite"  # need_rewrite / need_more
 
 
@@ -465,7 +496,9 @@ def build_graph():
     g.add_node("router", router)
     g.add_node("agent", agent_node)
     g.add_node("tools", tools_node)
+    g.add_node("rerank_loop", rerank_loop)
     g.add_node("reflect", reflect)
+    g.add_node("rerank_exit", rerank_exit)
     g.add_node("rewrite", rewrite_node)
     g.add_node("generate", generate_node)
     g.add_node("direct_chat", direct_chat)
@@ -477,10 +510,12 @@ def build_graph():
     g.add_conditional_edges(
         "agent", _agent_branch, {"tools": "tools", "generate": "generate"}
     )
-    g.add_edge("tools", "reflect")
+    g.add_edge("tools", "rerank_loop" if settings.agent_reranker_loop_enabled else "reflect")
+    g.add_edge("rerank_loop", "reflect")
     g.add_conditional_edges(
-        "reflect", _reflect_branch, {"generate": "generate", "rewrite": "rewrite"}
+        "reflect", _reflect_branch, {"generate": "generate", "rerank_exit": "rerank_exit", "rewrite": "rewrite"}
     )
+    g.add_edge("rerank_exit", "generate")
     g.add_edge("rewrite", "agent")
     g.add_edge("generate", END)
     g.add_edge("direct_chat", END)

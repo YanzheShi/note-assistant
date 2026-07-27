@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     agent_db_path: str = "data/agent.sqlite"     # SQLite 文件路径（相对 PROJECT_ROOT 或绝对路径）
     agent_run_orphan_ttl: int = 600              # run 未完成超过该秒数判定为 interrupted（孤儿检测）
 
+    # === Agent Reranker（双层精排，可独立开关对比）===
+    agent_reranker_loop_enabled: bool = True    # Rerank ①：循环内闸门（tools→reflect）
+    agent_reranker_exit_enabled: bool = True    # Rerank ②：出口总安检（reflect→generate）
+    agent_reranker_loop_top_k: int = 10          # 循环内保留条数（出口复用 top_k_rerank=5）
+
     # === 上下文管理（ContextManager）===
     # 总预算硬上限：历史 + 累积 + 工具观察三段之和不可超过此值（模型窗口 - 输出预留）。
     # ⚠️ 不变式：本值须 ≥ 三个子预算之和（2000+1500+800=4300）。
