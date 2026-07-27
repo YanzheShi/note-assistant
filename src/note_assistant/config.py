@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-v4-flash"
     longcat_model: str
 
+    # === LangSmith (Tracing) ===
+    langsmith_api_key: str = ""
+    langsmith_endpoint: str = "https://apiv2.smith.langchain.com"
+    langsmith_project: str = "note-assistant"
+
     # === Retrieval ===
     bm25_index_path: Path = Path("./data/bm25.pkl")
     chunk_size: int = 800

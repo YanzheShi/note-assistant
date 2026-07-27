@@ -78,6 +78,16 @@ async def lifespan(app: FastAPI):
     - 重启 API 服务后需要重新 init——冷启动约 3-5s（reranker 加载耗时）
     """
     global rag_chain
+    
+    # LangSmith 链路追踪（通过环境变量，LangChain 自动拾取）
+    import os
+    if settings.langsmith_api_key:
+        os.environ["LANGSMITH_TRACING"] = "true"
+        os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
+        os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint
+        os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
+        logger.info("LangSmith 链路追踪已启用，端点: %s", settings.langsmith_endpoint)
+
     logger.info("🚀 正在初始化 RAG Chain...")
 
     # ═══════════════════════════════════════════════════
