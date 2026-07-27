@@ -120,10 +120,6 @@ def split_v2(
     """
     # 1. 得到父块（List[Document]）
     parent_chunks = header_sp.split_text(node.raw_md)
-    print(f"Debug: 切出 {len(parent_chunks)} 个父块")
-    for i, pc in enumerate(parent_chunks):
-        print(f"  父块{i}: h1={pc.metadata.get('h1')!r}, h2={pc.metadata.get('h2')!r}")
-        print(f"  内容预览: {pc.page_content[:80]!r}")
 
     # 2. 细切父块（继承metadata）
     fine_chunks = child_sp.split_documents(parent_chunks)

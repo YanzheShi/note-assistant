@@ -38,19 +38,12 @@ class Generator:
             model_provider="openai",
             api_key=settings.agnes_api_key,
             openai_api_base=settings.agnes_base_url,
-            temperature=0.6,       # 比 rewrite 高，允许一定创造力
-            max_tokens=2048,       # 回答可以长一些
+            temperature=0.6,  # 比 rewrite 高，允许一定创造力
+            max_tokens=2048,  # 回答可以长一些
+            # 使用流式输出保证首字响应时间
+            streaming=True,
         )
 
-        self.stream_llm = llm or init_chat_model(
-            model=settings.agnes_model,
-            model_provider="openai",
-            api_key=settings.agnes_api_key,
-            openai_api_base=settings.agnes_base_url,
-            temperature=0.6,       # 比 rewrite 高，允许一定创造力
-            max_tokens=2048,       # 回答可以长一些
-            streaming=True
-        )
 
     @staticmethod
     def _format_history(history: list[dict]) -> list[tuple[str, str]]:

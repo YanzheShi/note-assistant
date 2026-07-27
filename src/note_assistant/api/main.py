@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from note_assistant.config import settings
+from note_assistant.logger_util import set_request_id, setup_logging
 from note_assistant.agent import runner as agent_runner
 from note_assistant.api.schemas import (
     AskRequest,
@@ -46,12 +47,10 @@ from note_assistant.agent.runner import get_store
 
 logger = logging.getLogger(__name__)
 
-# ─── 日志落盘 ──────────────────────────────────────────────────
+# ─── 日志落盘（入口统一配置：console + api.log 均为 JSON）──────────
 _log_dir = settings.chroma_persist_dir.parent / "logs"
 _log_dir.mkdir(parents=True, exist_ok=True)
-_fh = logging.FileHandler(_log_dir / "api.log", encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(_fh)
+setup_logging(log_file=str(_log_dir / "api.log"))
 
 # ─── 全局 RAG Chain ──────────────────────────────────────────
 # lifespan 中初始化，启动后常驻内存
@@ -79,6 +78,16 @@ async def lifespan(app: FastAPI):
     - 重启 API 服务后需要重新 init——冷启动约 3-5s（reranker 加载耗时）
     """
     global rag_chain
+    
+    # LangSmith 链路追踪（通过环境变量，LangChain 自动拾取）
+    import os
+    if settings.langsmith_tracing_enabled and settings.langsmith_api_key:
+        os.environ["LANGSMITH_TRACING"] = "true"
+        os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
+        os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint
+        os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
+        logger.info("LangSmith 链路追踪已启用，端点: %s", settings.langsmith_endpoint)
+
     logger.info("🚀 正在初始化 RAG Chain...")
 
     # ═══════════════════════════════════════════════════
@@ -86,13 +95,13 @@ async def lifespan(app: FastAPI):
     # ═══════════════════════════════════════════════════
     from note_assistant.pipeline.rag_chain import RAGChain
     from note_assistant.retrieval.hybrid import HybridRetriever
-    from note_assistant.retrieval.reranker import LocalReranker
+    from note_assistant.retrieval.reranker import get_reranker
     from note_assistant.retrieval.graph import WikiGraph
     from note_assistant.generation.generator import Generator
 
     # HybridRetriever 内部自行创建 embedder/ingestor/bm25，不需要外部传
     hybrid = HybridRetriever(alpha=settings.dense_weight)
-    reranker = LocalReranker(str(settings.reranker_model))
+    reranker = get_reranker(model_path=str(settings.reranker_model))
     graph = WikiGraph()
     generator = Generator()
 
@@ -148,9 +157,12 @@ async def ask(req: AskRequest):
         raise HTTPException(status_code=503, detail="RAG Chain 未初始化，请检查后端状态")
 
     t0 = time.time()
+    set_request_id(f"ask-{int(t0)}")
+    logger.info("api.request", extra={"endpoint": "POST /ask", "question_preview": req.question[:60]})
     ask_response = rag_chain.ask(req.question, history=req.history)
 
     t1 = time.time()
+    logger.info("api.done", extra={"endpoint": "POST /ask", "total_ms": round((t1 - t0) * 1000)})
 
 
 
@@ -288,11 +300,14 @@ async def agent_ask(req: AskRequest):
     与 /ask（传统 RAGChain）并存，作为对比/升级通道。返回答案 + 去重来源 + 完整轨迹。
     """
     t0 = time.time()
+    set_request_id(req.run_id or f"agent-{int(t0)}")
+    logger.info("api.request", extra={"endpoint": "POST /agent/ask", "run_id": req.run_id, "session_id": req.session_id, "question_preview": req.question[:60]})
     result = await agent_runner.ainvoke(
         req.question, history=req.history,
         session_id=req.session_id, run_id=req.run_id,
     )
     t1 = time.time()
+    logger.info("api.done", extra={"endpoint": "POST /agent/ask", "total_ms": round((t1 - t0) * 1000), "cached": result.cached})
 
     sources = [AgentSource(**s) for s in result.sources]
     trajectory = [AgentTrajectoryItem(**t) for t in result.trajectory]
@@ -327,7 +342,10 @@ async def agent_ask_stream(req: AskRequest):
     """
     import json as _json
 
+    set_request_id(req.run_id or f"agent-stream-{int(time.time())}")
+
     async def generate():
+        logger.info("api.request", extra={"endpoint": "POST /agent/ask_stream", "run_id": req.run_id, "session_id": req.session_id, "question_preview": req.question[:60]})
         try:
             async for event in agent_runner.astream(
                 req.question, history=req.history,

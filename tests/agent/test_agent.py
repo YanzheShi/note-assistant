@@ -113,8 +113,9 @@ def test_agent_branch():
     assert _agent_branch({"messages": [AIMessage(content="直接回答")]}) == "generate"
 
 
-def test_reflect_branch_under_max():
-    # 未达上限：sufficient / give_up → 生成；need_* → 改写
+def test_reflect_branch_under_max(monkeypatch):
+    # rerank_exit 关闭时：未达上限 sufficient / give_up → 生成；need_* → 改写
+    monkeypatch.setattr(settings, "agent_reranker_exit_enabled", False)
     s = {"iteration": 1, "judge_verdict": "sufficient"}
     assert _reflect_branch(s) == "generate"
     s = {"iteration": 1, "judge_verdict": "give_up"}
@@ -125,8 +126,9 @@ def test_reflect_branch_under_max():
     assert _reflect_branch(s) == "rewrite"
 
 
-def test_reflect_branch_at_max_forces_generate():
-    # 达到 max_iter 无论如何强制生成（硬性降级）
+def test_reflect_branch_at_max_forces_generate(monkeypatch):
+    # 达到 max_iter 无论如何强制生成（硬性降级），即便 rerank_exit 关闭
+    monkeypatch.setattr(settings, "agent_reranker_exit_enabled", False)
     s = {"iteration": settings.agent_max_iter, "judge_verdict": "need_more"}
     assert _reflect_branch(s) == "generate"
     s = {"iteration": settings.agent_max_iter, "judge_verdict": "need_rewrite"}
@@ -285,3 +287,103 @@ async def test_log_task_exception_logs_and_does_not_propagate(caplog):
     task.add_done_callback(_log_task_exception)
     await asyncio.gather(task, return_exceptions=True)
     assert any("kaboom" in r.message for r in caplog.records)
+
+# ──────────────────────────────────────────────
+# Reranker 路由测试（出口开关控制 _reflect_branch 行为）
+# ──────────────────────────────────────────────
+
+def test_reflect_branch_routes_to_rerank_exit_when_enabled(monkeypatch):
+    """rerank_exit 开启时，sufficient/give_up/达上限 应走 rerank_exit 而非 generate。"""
+    monkeypatch.setattr(settings, "agent_reranker_exit_enabled", True)
+    s = {"iteration": 1, "judge_verdict": "sufficient"}
+    assert _reflect_branch(s) == "rerank_exit"
+    s = {"iteration": 1, "judge_verdict": "give_up"}
+    assert _reflect_branch(s) == "rerank_exit"
+    # 达上限也应走 rerank_exit
+    s = {"iteration": settings.agent_max_iter, "judge_verdict": "need_more"}
+    assert _reflect_branch(s) == "rerank_exit"
+
+
+def test_reflect_branch_routes_to_generate_when_disabled(monkeypatch):
+    """rerank_exit 关闭时，行为不变，仍走 generate。"""
+    monkeypatch.setattr(settings, "agent_reranker_exit_enabled", False)
+    s = {"iteration": 1, "judge_verdict": "sufficient"}
+    assert _reflect_branch(s) == "generate"
+    s = {"iteration": 1, "judge_verdict": "give_up"}
+    assert _reflect_branch(s) == "generate"
+
+
+def test_rerank_loop_disabled_returns_empty():
+    """rerank_loop 关闭时，直接透传，不做事。"""
+    from note_assistant.agent.agent import rerank_loop
+    import asyncio
+    result = asyncio.run(rerank_loop({"accumulated": [], "condensed_question": "q"}))
+    assert result == {}
+
+
+def test_rerank_exit_disabled_returns_empty():
+    """rerank_exit 关闭时，直接透传，不做事。"""
+    from note_assistant.agent.agent import rerank_exit
+    import asyncio
+    result = asyncio.run(rerank_exit({"accumulated": [], "condensed_question": "q"}))
+    assert result == {}
+
+# ──────────────────────────────────────────────
+# Graph Expand 节点测试
+# ──────────────────────────────────────────────
+
+def test_graph_expand_node_disabled_returns_empty():
+    """graph_expand_node 关闭时，直接透传，不做事。"""
+    from note_assistant.agent.agent import graph_expand_node
+    import asyncio
+    result = asyncio.run(graph_expand_node({"accumulated": []}))
+    assert result == {}
+
+
+def test_graph_expand_node_skips_stub_filepaths(monkeypatch):
+    """stub 节点（[[xxx]]）跳过，不调 graph_expand_impl。"""
+    from note_assistant.agent.agent import graph_expand_node
+    import asyncio
+    from note_assistant.retrieval.types import RetrievalResult
+
+    called = []
+    monkeypatch.setattr(settings, "agent_graph_expand_enabled", True)
+
+    # 只有 stub 节点，graph_expand_impl 不应被调用
+    def fake_impl(fp, hop=1):
+        called.append(fp)
+        return []
+    monkeypatch.setattr("note_assistant.agent.agent.graph_expand_impl", fake_impl)
+
+    state = {
+        "accumulated": [
+            RetrievalResult(score=0.5, page_content="x", metadata={"filepath": "[[stub]]", "heading_path": ""}),
+        ]
+    }
+    result = asyncio.run(graph_expand_node(state))
+    assert called == []  # 不应调 graph_expand_impl
+    assert result == {}
+
+
+def test_graph_expand_node_dedup(monkeypatch):
+    """图扩展返回的 chunk 与已有 accumulated 按 (filepath, heading) 去重。"""
+    from note_assistant.agent.agent import graph_expand_node
+    import asyncio
+    from note_assistant.retrieval.types import RetrievalResult
+
+    monkeypatch.setattr(settings, "agent_graph_expand_enabled", True)
+
+    existing = RetrievalResult(score=0.9, page_content="已有内容", metadata={"filepath": "a.md", "heading_path": "h1"})
+    new_unique = RetrievalResult(score=0.5, page_content="新内容", metadata={"filepath": "b.md", "heading_path": "h2"})
+    new_dup = RetrievalResult(score=0.4, page_content="重复内容", metadata={"filepath": "a.md", "heading_path": "h1"})
+
+    def fake_impl(fp, hop=1):
+        return [new_unique, new_dup]
+
+    monkeypatch.setattr("note_assistant.agent.agent.graph_expand_impl", fake_impl)
+
+    state = {"accumulated": [existing]}
+    result = asyncio.run(graph_expand_node(state))
+    assert len(result["accumulated"]) == 2  # existing + new_unique，new_dup 被去重
+    fps = {(r.filepath, r.metadata.get("heading_path", "")) for r in result["accumulated"]}
+    assert fps == {("a.md", "h1"), ("b.md", "h2")}

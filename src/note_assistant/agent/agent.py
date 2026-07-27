@@ -24,6 +24,8 @@ import operator
 from functools import lru_cache
 from typing import Annotated, List, TypedDict
 
+import logging
+
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -34,12 +36,15 @@ from langchain_core.messages import (
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from note_assistant.agent.tools import AGENT_TOOLS, run_tool_call
+from note_assistant.agent.tools import AGENT_TOOLS, graph_expand_impl, run_tool_call
+from note_assistant.retrieval.reranker import get_reranker
 from note_assistant.config import settings
 from note_assistant.llm.client import get_llm
 from note_assistant.retrieval.types import RetrievalResult
 
 MAX_ITER = settings.agent_max_iter
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
@@ -85,22 +90,70 @@ AGENT_SYSTEM_PROMPT = (
 )
 
 ROUTER_SYSTEM = (
-    "你是意图分类器。判断用户问题是否需要检索个人知识库（Obsidian 笔记）才能回答。\n"
-    "需要检索：询问笔记中的概念、操作、项目、人名、资料等具体知识。\n"
-    "不需要检索：纯闲聊、问候、询问你的身份/能力、纯常识性问题。\n"
-    "只输出一个 JSON 对象：{\"needs_search\": true 或 false, \"reason\": \"简短理由\"}"
+    "你是意图分类器，决定用户问题是否需要检索个人知识库（Obsidian 笔记）才能回答。\n"
+    "\n"
+    "判定标准（关键）：\n"
+    "- 只要问题中涉及的主题、概念、术语、人物、项目、方法论，有可能在个人知识库中被记录、注释或个性化阐述，就必须检索。\n"
+    "- 个人知识库涵盖：技术概念笔记、读书摘要、项目记录、工具使用心得、个人总结与反思等。\n"
+    "- 因此，大多数'XX 是什么'、'XX 有哪些组件'、'如何做 XX'这类知识性问题，都应检索——即使用户问的是通用话题，知识库中也可能有相关的个人笔记、摘录或见解。\n"
+    "\n"
+    "不需要检索的情况（仅限以下）：\n"
+    "- 纯闲聊 / 问候（'你好'、'在吗'）\n"
+    "- 询问你的身份或能力（'你是谁'、'你能做什么'）\n"
+    "- 与知识库主题完全无关的通用问题（'今天天气'、'现在几点'）\n"
+    "\n"
+    "犹豫不决时，宁可检索，不要跳过。\n"
+    "\n"
+    "不要做可能判定，宁可检索，不要因为可能没有就不检索。\n"
+    "\n"
+    "只输出一个 JSON 对象，不要有任何其他文字：\n"
+    "{\"needs_search\": true 或 false, \"reason\": \"简短理由\", \"confidence\": 0.0到1.0之间}\n"
+    "\n"
+    "示例：\n"
+    "输入：现代 LLM 的标配组件有哪些？\n"
+    "输出：{\"needs_search\": true, \"reason\": \"涉及 LLM 架构概念，知识库可能有相关笔记\", \"confidence\": 0.9}\n"
+    "\n"
+    "输入：你好\n"
+    "输出：{\"needs_search\": false, \"reason\": \"纯问候闲聊\", \"confidence\": 0.99}\n"
+    "\n"
+    "输入：RAG 系统中的 ReRank 应该怎么实现？\n"
+    "输出：{\"needs_search\": true, \"reason\": \"RAG 技术细节，知识库应有相关实践笔记\", \"confidence\": 0.85}"
 )
 
 JUDGE_SYSTEM = (
-    "你是反思评判器。给定用户问题与目前已收集的知识库片段，判断信息是否足够回答。\n"
-    "只输出一个 JSON 对象：\n"
-    "{\"verdict\": \"...\", \"reason\": \"...\", \"rewritten_query\": \"...\"}\n\n"
-    "verdict 取值：\n"
-    "- \"sufficient\": 现有片段足以回答，可以生成。\n"
-    "- \"need_rewrite\": 信息不足，但改写查询后可能找到，请在 rewritten_query 给出改写后的查询。\n"
-    "- \"need_more\": 信息不足，需用其它检索策略/工具再查一次（不要改写查询）。\n"
-    "- \"give_up\": 多次检索仍无相关内容，放弃检索，如实告知用户知识库缺少信息。\n\n"
-    "注意：已有相关片段时应判 sufficient；只有证据明显不足时才判不足。"
+    "你是检索质量评判器。给定用户问题与已检索到的知识库片段，评估这些片段是否足以回答。\n"
+    "\n"
+    "第一步：逐条检查（在脑内完成）\n"
+    "- 用户问题的核心信息需求是什么？（例如问'路线图'，核心需求是：阶段划分、各阶段目标/产出）\n"
+    "- 检索到的片段是否直接命中这些需求？请逐条列出命中情况。\n"
+    "\n"
+    "第二步：打出 relevance_score（0 到 2 的浮点数）\n"
+    "  2.0 = 片段直接且完整地覆盖了问题的核心需求\n"
+    "  1.0 = 片段相关，覆盖了核心需求的主要部分（即使细节不完全）\n"
+    "  0.5 = 片段部分相关，但关键信息缺失\n"
+    "  0.0 = 片段与问题无关\n"
+    "\n"
+    "第三步：按以下确定性规则映射到 verdict（严格遵守，不要凭感觉）：\n"
+    "- relevance_score >= 1.0 → verdict = \"sufficient\"（直接生成，不要改写）\n"
+    "- relevance_score == 0.5 → verdict = \"need_rewrite\"，并在 rewritten_query 给出改写\n"
+    "- relevance_score == 0.0 → 若检索次数 < 2，verdict = \"need_more\"；否则 verdict = \"give_up\"\n"
+    "\n"
+    "关键原则：\n"
+    "- 只要片段的标题或内容与问题的核心实体/主题直接匹配，且包含了回答问题所需的关键信息（如阶段、步骤、列表），就必须判 >= 1.0。\n"
+    "- 不要因为'希望找到更详细/更完整的资料'就判 need_rewrite。sufficient 不代表完美，代表'足够回答'。\n"
+    "- 检索次数已达上限时，即使觉得不够也判 give_up，不要无限循环。\n"
+    "\n"
+    "只输出 JSON 对象：\n"
+    "{\"verdict\": \"sufficient|need_rewrite|need_more|give_up\", \"relevance_score\": 0.0到2.0, \"reason\": \"简短理由\", \"rewritten_query\": \"仅 need_rewrite 时填写，其余为空字符串\"}\n"
+    "\n"
+    "示例：\n"
+    "问题：Agent 开发官方框架整体路线图是什么？\n"
+    "片段：《Agent开发官方框架学习路径》中包含'整体路线图'章节，列出阶段一至阶段四，每阶段有目标、产出、核心。\n"
+    "输出：{\"verdict\": \"sufficient\", \"relevance_score\": 2.0, \"reason\": \"片段直接命中'整体路线图'，包含完整的四阶段划分\", \"rewritten_query\": \"\"}\n"
+    "\n"
+    "问题：Agent 开发官方框架整体路线图是什么？\n"
+    "片段：一篇讲 LangGraph 基础用法的笔记，未提及整体路线图。\n"
+    "输出：{\"verdict\": \"need_rewrite\", \"relevance_score\": 0.5, \"reason\": \"片段仅涉及 LangGraph 单点技术，缺少路线图整体信息\", \"rewritten_query\": \"Agent 开发官方框架 学习路径 整体路线图 阶段规划\"}\n"
 )
 
 GENERATE_SYSTEM = (
@@ -198,9 +251,13 @@ async def router(state: AgentState) -> dict:
         ])
         data = json.loads(_extract_json(str(resp.content)))
         needs = bool(data.get("needs_search", True))
+        reason = data.get("reason", "")
     except Exception:
         needs = True
-    return {"route": "search" if needs else "chat"}
+        reason = ""
+    route = "search" if needs else "chat"
+    logger.info("router.decision", extra={"route": route, "needs_search": needs, "reason": reason})
+    return {"route": route}
 
 
 async def agent_node(state: AgentState) -> dict:
@@ -241,6 +298,7 @@ async def tools_node(state: AgentState) -> dict:
     accumulated = list(state["accumulated"])
     # 确定性去重：用 (filepath, heading) 作 key
     seen = {(r.filepath, r.metadata.get("heading_path", "")) for r in accumulated}
+    new_before = len(accumulated)
     for tc in last.tool_calls:
         # 工具调用可能含同步 LLM（query_rewrite），放到线程避免阻塞事件循环
         obs_text, results = await asyncio.to_thread(
@@ -253,6 +311,15 @@ async def tools_node(state: AgentState) -> dict:
                 seen.add(key)
                 accumulated.append(r)
         new_messages.append(ToolMessage(content=obs_text, tool_call_id=tc["id"]))
+    logger.info(
+        "tools.summary",
+        extra={
+            "tools_executed": len(last.tool_calls),
+            "results_added": len(accumulated) - new_before,
+            "accumulated_total": len(accumulated),
+            "iteration": state["iteration"] + 1,
+        },
+    )
     return {
         "messages": new_messages,
         "accumulated": accumulated,
@@ -290,14 +357,22 @@ async def reflect(state: AgentState) -> dict:
         # Judge 异常时保守处理：已达到上限就生成，否则再查一轮
         verdict = "sufficient" if state["iteration"] >= MAX_ITER else "need_more"
         rewritten = ""
-
+        data = {}
+    logger.info(
+        "reflect.decision",
+        extra={
+            "iteration": state["iteration"],
+            "verdict": verdict,
+            "rewritten_query": rewritten,
+        },
+    )
     return {
         "judge_verdict": verdict,
         "rewritten_query": rewritten,
         "judge_log": [{
             "iteration": state["iteration"],
             "verdict": verdict,
-            "reason": "",
+            "reason": data.get("reason", ""),
             "rewritten_query": rewritten,
         }],
     }
@@ -310,7 +385,71 @@ async def rewrite_node(state: AgentState) -> dict:
         hint = f"（反思改写）上一轮检索证据不足。请基于改写后的查询重新检索：{q}"
     else:
         hint = "（反思）上一轮检索证据不足，请尝试其它检索工具/策略（如单独 vector_search、bm25_search、filtered_search 或 graph_expand）再查一次。"
+    logger.info("rewrite.decision", extra={"rewritten_query": q})
     return {"messages": [HumanMessage(hint)]}
+
+
+async def graph_expand_node(state: AgentState) -> dict:
+    """自动图扩展节点：每轮检索后，从 accumulated 的 filepath 出发沿 [[wikilinks]] 扩展关联笔记。
+
+    关闭时直接透传，不加载图。
+    """
+    if not settings.agent_graph_expand_enabled:
+        return {}
+    if not state["accumulated"]:
+        return {}
+    filepaths = list({
+        r.filepath for r in state["accumulated"]
+        if r.filepath and not r.filepath.startswith("[[")
+    })
+    if not filepaths:
+        return {}
+    new_chunks = graph_expand_impl(filepaths, hop=settings.agent_graph_expand_hop)
+    if not new_chunks:
+        return {}
+    # 去重合并：按 (filepath, heading) 去重
+    accumulated = list(state["accumulated"])
+    seen = {(r.filepath, r.metadata.get("heading_path", "")) for r in accumulated}
+    added = 0
+    for r in new_chunks:
+        key = (r.filepath, r.metadata.get("heading_path", ""))
+        if key not in seen:
+            seen.add(key)
+            accumulated.append(r)
+            added += 1
+    if added == 0:
+        return {}
+    return {"accumulated": accumulated}
+
+
+async def rerank_loop(state: AgentState) -> dict:
+    """Rerank ①：循环内闸门。每轮工具调用后，对 accumulated 做精排，保留 top-k。
+
+    关闭时直接透传，不加载 reranker 模型。
+    """
+    if not settings.agent_reranker_loop_enabled:
+        return {}
+    if not state["accumulated"]:
+        return {}
+    reranker = get_reranker()
+    question = state.get("condensed_question") or state["question"]
+    results = reranker.rerank(question, state["accumulated"], top_k=settings.agent_reranker_loop_top_k)
+    return {"accumulated": results}
+
+
+async def rerank_exit(state: AgentState) -> dict:
+    """Rerank ②：出口总安检。Judge 判定通过后，对多轮累积做全局精排。
+
+    关闭时直接透传，不加载 reranker 模型。
+    """
+    if not settings.agent_reranker_exit_enabled:
+        return {}
+    if not state["accumulated"]:
+        return {}
+    reranker = get_reranker()
+    question = state.get("condensed_question") or state["question"]
+    results = reranker.rerank(question, state["accumulated"], top_k=settings.top_k_rerank)
+    return {"accumulated": results}
 
 
 async def generate_node(state: AgentState) -> dict:
@@ -338,6 +477,10 @@ async def generate_node(state: AgentState) -> dict:
     )
     resp = await llm.ainvoke(msgs)
     answer = str(resp.content)
+    logger.info(
+        "generate.summary",
+        extra={"answer_len": len(answer), "degraded": degraded},
+    )
     return {"answer": answer, "messages": [AIMessage(answer)]}
 
 
@@ -350,6 +493,7 @@ async def direct_chat(state: AgentState) -> dict:
     msgs.append(HumanMessage(q))
     resp = await llm.ainvoke(msgs)
     answer = str(resp.content)
+    logger.info("direct_chat.summary", extra={"answer_len": len(answer)})
     return {"answer": answer, "messages": [AIMessage(answer)]}
 
 
@@ -370,10 +514,10 @@ def _agent_branch(state: AgentState) -> str:
 
 def _reflect_branch(state: AgentState) -> str:
     if state["iteration"] >= MAX_ITER:
-        return "generate"
+        return "rerank_exit" if settings.agent_reranker_exit_enabled else "generate"
     verdict = state.get("judge_verdict", "sufficient")
     if verdict in ("sufficient", "give_up"):
-        return "generate"
+        return "rerank_exit" if settings.agent_reranker_exit_enabled else "generate"
     return "rewrite"  # need_rewrite / need_more
 
 
@@ -387,7 +531,10 @@ def build_graph():
     g.add_node("router", router)
     g.add_node("agent", agent_node)
     g.add_node("tools", tools_node)
+    g.add_node("graph_expand_node", graph_expand_node)
+    g.add_node("rerank_loop", rerank_loop)
     g.add_node("reflect", reflect)
+    g.add_node("rerank_exit", rerank_exit)
     g.add_node("rewrite", rewrite_node)
     g.add_node("generate", generate_node)
     g.add_node("direct_chat", direct_chat)
@@ -399,10 +546,13 @@ def build_graph():
     g.add_conditional_edges(
         "agent", _agent_branch, {"tools": "tools", "generate": "generate"}
     )
-    g.add_edge("tools", "reflect")
+    g.add_edge("tools", "graph_expand_node" if settings.agent_graph_expand_enabled else               ("rerank_loop" if settings.agent_reranker_loop_enabled else "reflect"))
+    g.add_edge("graph_expand_node", "rerank_loop" if settings.agent_reranker_loop_enabled else "reflect")
+    g.add_edge("rerank_loop", "reflect")
     g.add_conditional_edges(
-        "reflect", _reflect_branch, {"generate": "generate", "rewrite": "rewrite"}
+        "reflect", _reflect_branch, {"generate": "generate", "rerank_exit": "rerank_exit", "rewrite": "rewrite"}
     )
+    g.add_edge("rerank_exit", "generate")
     g.add_edge("rewrite", "agent")
     g.add_edge("generate", END)
     g.add_edge("direct_chat", END)

@@ -41,6 +41,8 @@ dependencies = [
     "ragas>=0.3.0",
     "datasets>=2.0",
     "tiktoken>=0.13.0",
+    "python-json-logger>=4.1.0",
+    "langsmith>=0.3.0",
 ]
 
 [build-system]

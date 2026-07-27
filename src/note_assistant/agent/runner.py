@@ -8,7 +8,13 @@
 import asyncio
 import logging
 from dataclasses import dataclass, field
+import time
+import uuid
 from typing import List, Optional
+
+from note_assistant.logger_util import set_request_id, get_request_id
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
@@ -240,8 +246,20 @@ async def ainvoke(
     run_id: str = "",
 ) -> AgentRunResult:
     """非流式运行；命中缓存直接返回。可选持久化（run 快照 + 跨会话记忆）。"""
+    _t0 = time.perf_counter()
+    rid = run_id or str(uuid.uuid4())[:8]
+    set_request_id(rid)
+
     store = get_store()
 
+    logger.info(
+        "ainvoke.request",
+        extra={
+            "run_id": rid,
+            "session_id": session_id,
+            "question_preview": question[:60],
+        },
+    )
     # 历史来源：session 优先（服务端持有），否则用调用方传入的 history
     if session_id and store is not None:
         effective_history = await asyncio.to_thread(store.get_history, session_id)
@@ -257,15 +275,30 @@ async def ainvoke(
     if cache.enabled:
         hit = cache.get(question, ctx_key=ctx_key)
         if hit is not None:
-            result = AgentRunResult(
+            elapsed = (time.perf_counter() - _t0) * 1000
+            logger.info(
+                "ainvoke.done",
+                extra={
+                    "run_id": rid,
+                    "session_id": session_id,
+                    "cached": True,
+                    "sources": len(hit.sources),
+                    "elapsed_ms": round(elapsed),
+                },
+            )
+            await _record_run(store, session_id, rid, question, AgentRunResult(
+                answer=hit.answer, sources=hit.sources,
+                trajectory=hit.trajectory, cached=True, run_id=rid,
+            ), effective_history)
+            _post_run_context(store, session_id, get_context_manager(), seed, question, hit.answer)
+            return AgentRunResult(
                 answer=hit.answer,
                 sources=hit.sources,
                 trajectory=hit.trajectory,
                 cached=True,
+                run_id=rid,
+                timing={"total_ms": round(elapsed)},
             )
-            await _record_run(store, session_id, run_id, question, result, effective_history)
-            _post_run_context(store, session_id, get_context_manager(), seed, question, result.answer)
-            return result
 
     graph = agent_mod.build_graph()
     final = await graph.ainvoke(
@@ -277,6 +310,7 @@ async def ainvoke(
             accumulated=seed,
         )
     )
+    elapsed = (time.perf_counter() - _t0) * 1000
     traj = _trajectory_from_state(final)
     sources = _sources_from_results(final.get("accumulated", seed))
     traj.append({"type": "sources", "sources": sources})
@@ -284,10 +318,22 @@ async def ainvoke(
         answer=final.get("answer", ""),
         sources=sources,
         trajectory=traj,
+        run_id=rid,
+        timing={"total_ms": round(elapsed)},
+    )
+    logger.info(
+        "ainvoke.done",
+        extra={
+            "run_id": rid,
+            "session_id": session_id,
+            "cached": False,
+            "sources": len(sources),
+            "elapsed_ms": round(elapsed),
+        },
     )
     if cache.enabled:
         cache.put(question, result.answer, result.sources, result.trajectory, ctx_key=ctx_key)
-    await _record_run(store, session_id, run_id, question, result, effective_history)
+    await _record_run(store, session_id, rid, question, result, effective_history)
     _post_run_context(store, session_id, get_context_manager(), final.get("accumulated", seed), question, result.answer)
     return result
 
@@ -369,6 +415,9 @@ async def astream(
     每个响应流以 ``{"type": "run", "run_id": ...}`` 起始，客户端据此在断流后
     轮询 ``GET /agent/runs/{run_id}`` 取回完整结果。
     """
+    _t0 = time.perf_counter()
+    rid = run_id or str(uuid.uuid4())[:8]
+    set_request_id(rid)
     store = get_store()
     if session_id and store is not None:
         effective_history = await asyncio.to_thread(store.get_history, session_id)
@@ -498,4 +547,16 @@ async def astream(
             await asyncio.to_thread(store.append_turn, session_id, "assistant", final_answer)
     if cache.enabled:
         cache.put(question, final_answer, sources, traj, ctx_key=ctx_key)
+    elapsed = (time.perf_counter() - _t0) * 1000
+    logger.info(
+        "astream.done",
+        extra={
+            "run_id": rid,
+            "session_id": session_id,
+            "cached": False,
+            "sources": len(sources),
+            "events": len(traj),
+            "elapsed_ms": round(elapsed),
+        },
+    )
     _post_run_context(store, session_id, get_context_manager(), accumulated, question, final_answer)

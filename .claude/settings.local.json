@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Select-Object -First 10)",
+      "Bash(uv run *)",
+      "Bash(env:PYTHONIOENCODING=utf-8 uv *)",
+      "Bash(export PYTHONIOENCODING=utf-8)",
+      "Bash(Remove-Item *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(Select-String -Pattern \"⚠️|Error|Traceback\")",
+      "Bash(Select-Object -First 20)",
+      "Bash(Select-String -Pattern \"empty list\")",
+      "Bash(Select-String \"empty list\")",
+      "Bash(Select-String \"empty\")",
+      "Bash(Select-String \"⚠\")",
+      "Bash(Select-String \"tags\")",
+      "Bash(Select-String \"chunk\\\\[\")",
+      "Bash(New-Item *)",
+      "Bash(uv pip *)",
+      "Bash(Select-String \"prepare_for_model\")",
+      "Bash(findstr *)",
+      "Bash(python *)",
+      "Bash(Move-Item -Force src/note_assistant/retrieval/graph.py tem/src/note_assistant/retrieval/graph.py)",
+      "Bash(Move-Item -Force src/note_assistant/indexing/sync.py tem/src/note_assistant/indexing/sync.py)",
+      "Bash(Move-Item -Force src/note_assistant/pipeline/rag_chain.py tem/src/note_assistant/pipeline/rag_chain.py)",
+      "Bash(Move-Item -Force scripts/reindex.py tem/scripts/reindex.py)",
+      "Bash(Move-Item -Force tests/retrieval/test_graph.py tem/tests/retrieval/test_graph.py)",
+      "Bash(sed -i 's/rag_chain\\\\.ask\\(question\\) → {answer, sources}/rag_chain.ask\\(question\\) → AskResponse/' src/note_assistant/evaluation/evaluator.py)",
+      "Bash(sed -i 's/提取 retrieved_files（从 sources 中拿 filepath）/提取 retrieved_files（从 sources 中拿 SourceInfo.filepath）/' src/note_assistant/evaluation/evaluator.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(xxd \"D:/Code/PycharmProjects/note-assitant/src/note_assistant/pipeline/rag_chain.py\")"
+    ]
+  }
+}
