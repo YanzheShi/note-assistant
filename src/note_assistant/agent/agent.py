@@ -24,6 +24,8 @@ import operator
 from functools import lru_cache
 from typing import Annotated, List, TypedDict
 
+import logging
+
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -40,6 +42,8 @@ from note_assistant.llm.client import get_llm
 from note_assistant.retrieval.types import RetrievalResult
 
 MAX_ITER = settings.agent_max_iter
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
@@ -198,9 +202,13 @@ async def router(state: AgentState) -> dict:
         ])
         data = json.loads(_extract_json(str(resp.content)))
         needs = bool(data.get("needs_search", True))
+        reason = data.get("reason", "")
     except Exception:
         needs = True
-    return {"route": "search" if needs else "chat"}
+        reason = ""
+    route = "search" if needs else "chat"
+    logger.info("router.decision", extra={"route": route, "needs_search": needs, "reason": reason})
+    return {"route": route}
 
 
 async def agent_node(state: AgentState) -> dict:
@@ -241,6 +249,7 @@ async def tools_node(state: AgentState) -> dict:
     accumulated = list(state["accumulated"])
     # 确定性去重：用 (filepath, heading) 作 key
     seen = {(r.filepath, r.metadata.get("heading_path", "")) for r in accumulated}
+    new_before = len(accumulated)
     for tc in last.tool_calls:
         # 工具调用可能含同步 LLM（query_rewrite），放到线程避免阻塞事件循环
         obs_text, results = await asyncio.to_thread(
@@ -253,6 +262,15 @@ async def tools_node(state: AgentState) -> dict:
                 seen.add(key)
                 accumulated.append(r)
         new_messages.append(ToolMessage(content=obs_text, tool_call_id=tc["id"]))
+    logger.info(
+        "tools.summary",
+        extra={
+            "tools_executed": len(last.tool_calls),
+            "results_added": len(accumulated) - new_before,
+            "accumulated_total": len(accumulated),
+            "iteration": state["iteration"] + 1,
+        },
+    )
     return {
         "messages": new_messages,
         "accumulated": accumulated,
@@ -290,14 +308,22 @@ async def reflect(state: AgentState) -> dict:
         # Judge 异常时保守处理：已达到上限就生成，否则再查一轮
         verdict = "sufficient" if state["iteration"] >= MAX_ITER else "need_more"
         rewritten = ""
-
+        data = {}
+    logger.info(
+        "reflect.decision",
+        extra={
+            "iteration": state["iteration"],
+            "verdict": verdict,
+            "rewritten_query": rewritten,
+        },
+    )
     return {
         "judge_verdict": verdict,
         "rewritten_query": rewritten,
         "judge_log": [{
             "iteration": state["iteration"],
             "verdict": verdict,
-            "reason": "",
+            "reason": data.get("reason", ""),
             "rewritten_query": rewritten,
         }],
     }
@@ -310,6 +336,7 @@ async def rewrite_node(state: AgentState) -> dict:
         hint = f"（反思改写）上一轮检索证据不足。请基于改写后的查询重新检索：{q}"
     else:
         hint = "（反思）上一轮检索证据不足，请尝试其它检索工具/策略（如单独 vector_search、bm25_search、filtered_search 或 graph_expand）再查一次。"
+    logger.info("rewrite.decision", extra={"rewritten_query": q})
     return {"messages": [HumanMessage(hint)]}
 
 
@@ -338,6 +365,10 @@ async def generate_node(state: AgentState) -> dict:
     )
     resp = await llm.ainvoke(msgs)
     answer = str(resp.content)
+    logger.info(
+        "generate.summary",
+        extra={"answer_len": len(answer), "degraded": degraded},
+    )
     return {"answer": answer, "messages": [AIMessage(answer)]}
 
 
@@ -350,6 +381,7 @@ async def direct_chat(state: AgentState) -> dict:
     msgs.append(HumanMessage(q))
     resp = await llm.ainvoke(msgs)
     answer = str(resp.content)
+    logger.info("direct_chat.summary", extra={"answer_len": len(answer)})
     return {"answer": answer, "messages": [AIMessage(answer)]}
 
 

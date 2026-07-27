@@ -3,6 +3,7 @@
 混合检索器：dense（ChromaDB 向量）+ sparse（BM25 稀疏）加权融合
 """
 
+import logging
 import time
 from typing import List
 
@@ -11,6 +12,8 @@ from note_assistant.indexing.embedder import OllamaEmbedder
 from note_assistant.indexing.ingestor import Ingestor
 from note_assistant.retrieval.sparse_retriever import BM25Retriever
 from note_assistant.retrieval.types import RetrievalResult
+
+logger = logging.getLogger(__name__)
 
 
 class HybridRetriever:
@@ -225,24 +228,49 @@ class HybridRetriever:
         Args:
             query: 用户查询（可能已被 QueryRewriter 改写）
             top_k: 返回多少个结果
-
         Returns:
             [RetrievalResult, ...]，按 final_score 降序排列
         """
+        _t0 = time.perf_counter()
         top_k = top_k if top_k is not None else self.top_k
+        logger.info("hybrid_search.start", extra={"query_preview": query[:50], "top_k": top_k})
 
         # 1. embedding
+        qe_t0 = time.perf_counter()
         query_embedding = self.embedder.embed_one(query)
+        embed_ms = (time.perf_counter() - qe_t0) * 1000
 
         # 2. 两路并行检索（各取 top-50，融合后截断）
+        dense_t0 = time.perf_counter()
         dense_results = self._dense_search(query_embedding, n_results=50)
+        dense_ms = (time.perf_counter() - dense_t0) * 1000
+
+        sparse_t0 = time.perf_counter()
         sparse_results = self._sparse_search(query, top_k=50)
+        sparse_ms = (time.perf_counter() - sparse_t0) * 1000
 
         # 3. 融合
+        merge_t0 = time.perf_counter()
         merged = self._merge_results(dense_results, sparse_results)
+        merge_ms = (time.perf_counter() - merge_t0) * 1000
 
-        # 4. 截断
-        return merged[:top_k]
+        out = merged[:top_k]
+        elapsed = (time.perf_counter() - _t0) * 1000
+        logger.info(
+            "hybrid_search.done",
+            extra={
+                "query_preview": query[:50],
+                "top_k": top_k,
+                "results": len(out),
+                "alpha": self.alpha,
+                "embed_ms": round(embed_ms),
+                "dense_ms": round(dense_ms),
+                "sparse_ms": round(sparse_ms),
+                "merge_ms": round(merge_ms),
+                "elapsed_ms": round(elapsed),
+            },
+        )
+        return out
 
     # ──────────────────────────────────────────────
     # 跟踪检索（逐步骤输出）

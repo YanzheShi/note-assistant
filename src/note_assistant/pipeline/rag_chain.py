@@ -24,6 +24,8 @@ from typing import AsyncIterator, List
 from note_assistant.config import settings
 from note_assistant.retrieval.types import RetrievalResult
 
+logger = logging.getLogger(__name__)
+
 
 # ─── 路由结果解析工具函数 ───────────────────────────────────────
 
@@ -161,10 +163,14 @@ class RAGChain:
             except json.JSONDecodeError:
                 # 不是合法 JSON，直接当字符串处理（如 "不需要"/"否"）
                 result = text
-            return _parse_routing_result(result)
+            result = _parse_routing_result(result)
+            logger.info("routing.decision", extra={"needs_retrieval": result, "sync": True})
+            return result
         except Exception as e:
-            logging.warning(f"路由判断失败，默认不检索: {e}")
-            return False
+            logging.warning(f"路由判断失败，默认检索: {e}")
+            logging.error(f"路由 LLM 调用失败，已降级为默认检索，请检查路由服务: {e}")
+            logger.warning("routing.failed", extra={"error": str(e)[:120]})
+            return True
 
     async def _needs_retrieval_async(self, question: str) -> bool:
         """异步调用 LLM 判断是否需要检索（用于 ask_stream / ask_with_trace）。"""
@@ -193,10 +199,14 @@ class RAGChain:
             except json.JSONDecodeError:
                 # 不是合法 JSON，直接当字符串处理（如 "不需要"/"否"）
                 result = text
-            return _parse_routing_result(result)
+            result = _parse_routing_result(result)
+            logger.info("routing.decision", extra={"needs_retrieval": result, "sync": False})
+            return result
         except Exception as e:
-            logging.warning(f"路由判断失败，默认不检索: {e}")
-            return False
+            logging.warning(f"路由判断失败，默认检索: {e}")
+            logging.error(f"路由 LLM 调用失败，已降级为默认检索，请检查路由服务: {e}")
+            logger.warning("routing.failed", extra={"error": str(e)[:120]})
+            return True
 
     # ------------------------------------------------------------------
     # 主入口
@@ -245,6 +255,7 @@ class RAGChain:
         answer = ""
         if self.generator:
             answer = self.generator.generate(question, merge_chunks, history=history)
+            logger.info("rag_chain.generate", extra={"answer_len": len(answer)})
 
         sources = []
         for r in rerank_result:
@@ -530,7 +541,7 @@ class RAGChain:
                     for doc, meta in zip(results["documents"], results["metadatas"]):
                         chunks.append(
                             RetrievalResult(
-                                score=0.0,  # 图扩展没有 rerank score
+                                score=score * 0.1,  # 图扩展 decay_score 压缩 0.1 倍
                                 page_content=doc,
                                 metadata=meta,
                             )

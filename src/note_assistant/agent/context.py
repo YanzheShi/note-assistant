@@ -159,10 +159,12 @@ class ContextManager:
             )
             resp = await llm.ainvoke([HumanMessage(prompt)])
             text = _strip_resp(resp).strip()
-            return text or current
         except Exception as e:  # noqa: BLE001
             logger.warning("condense_question 失败，降级用原问题: %s", e)
+            logger.warning("condense.question_failed", extra={"error": str(e)[:120]})
             return current
+        logger.info("condense.question", extra={"original": current[:40], "condensed": text[:40]})
+        return text or current
 
     # ── 缓存指纹 ──
     def context_key(self, condensed: str, summary: str = "") -> str:
@@ -244,6 +246,7 @@ class ContextManager:
             nr.score = r.score * settings.agent_accumulated_decay
             decayed.append(nr)
         self._accum[session_id] = decayed
+        logger.info("context.seed", extra={"session_id": session_id, "items": len(decayed)})
         return list(decayed)
 
     def record_turn(
@@ -365,8 +368,10 @@ class ContextManager:
             store.save_summary(session_id, from_idx, to_idx, summary_text)
             store.delete_turns_up_to(session_id, to_idx)
             store.enforce_session_cap(session_id, settings.agent_session_max_turns)
+            logger.info("context.summarize", extra={"session_id": session_id, "from_idx": from_idx, "to_idx": to_idx, "summary_len": len(summary_text)})
         except Exception as e:  # noqa: BLE001
             logger.warning("maybe_summarize 失败，降级跳过: %s", e)
+            logger.warning("context.summarize_failed", extra={"error": str(e)[:120]})
 
     async def _summarize_batch(
         self, turns: Sequence[dict], prev_summary: Optional[str]

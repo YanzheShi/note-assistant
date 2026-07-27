@@ -99,7 +99,7 @@ def graph_expand_impl(filepaths: List[str], hop: int = 1) -> List[RetrievalResul
         return []
     chunks: List[RetrievalResult] = []
     collection = _hybrid_retriever().ingestor.collection
-    for filepath, _score in neighbors:
+    for filepath, score in neighbors:
         if filepath.startswith("[["):
             continue
         try:
@@ -112,7 +112,7 @@ def graph_expand_impl(filepaths: List[str], hop: int = 1) -> List[RetrievalResul
             ):
                 chunks.append(
                     RetrievalResult(
-                        score=0.0,
+                        score=score * 0.1,  # 图扩展 decay_score 压缩 0.1 倍
                         page_content=doc,
                         metadata=meta or {},
                     )
@@ -307,9 +307,12 @@ def _dispatch(name: str, args: dict) -> Tuple[str, List[RetrievalResult]]:
             str(args.get("original_query", args.get("query", ""))),
             str(args.get("missing_aspect", "")),
         )
+        logger.info("tool.done", extra={"tool": name, "results": 0, "rewritten": text})
         return text, []
     else:
+        logger.warning("tool.unknown", extra={"tool": name})
         return f"（未知工具: {name}）", []
+    logger.info("tool.done", extra={"tool": name, "results": len(results)})
     return _format_results(results), results
 
 
@@ -333,16 +336,19 @@ def run_tool_call(name: str, args: dict) -> Tuple[str, List[RetrievalResult]]:
         - 兜底：任何工具最终失败 → 返回空结果 + 友好提示，不让链路崩溃。
     """
     args = args or {}
-
     try:
         return _retry(lambda: _dispatch(name, args))
     except Exception as e:  # noqa: BLE001
         logger.warning("工具 %s 调用失败: %s", name, e)
+        logger.warning("tool.retry_failed", extra={"tool": name, "error": str(e)})
         # hybrid 失败降级为纯向量检索
         if name == "hybrid_search":
             try:
+                logger.info("tool.fallback", extra={"tool": "hybrid_search", "fallback_to": "vector_search"})
                 text, results = _retry(lambda: _dispatch("vector_search", args))
                 return text + "\n（注：hybrid 检索失败，已降级为纯向量检索）", results
             except Exception as e2:  # noqa: BLE001
                 logger.warning("hybrid 降级 vector 也失败: %s", e2)
+                logger.warning("tool.fallback_failed", extra={"tool": "hybrid_search", "fallback_to": "vector_search", "error": str(e2)})
+        logger.warning("tool.failed", extra={"tool": name})
         return f"（工具 {name} 调用失败，已跳过）", []

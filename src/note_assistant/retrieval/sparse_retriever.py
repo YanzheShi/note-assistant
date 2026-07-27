@@ -5,7 +5,9 @@ BM25 稀疏检索器
 中文分词使用 jieba。
 """
 
+import logging
 import pickle
+import time
 from pathlib import Path
 from typing import List
 
@@ -15,6 +17,8 @@ from rank_bm25 import BM25Okapi
 from note_assistant.config import settings
 from note_assistant.indexing.types import Chunk
 from note_assistant.retrieval.types import RetrievalResult
+
+logger = logging.getLogger(__name__)
 
 
 class BM25Retriever:
@@ -78,8 +82,11 @@ class BM25Retriever:
             [RetrievalResult, ...]，按 score 降序排列
         """
         if self.bm25 is None:
+            logger.warning("bm25_search.skip", extra={"reason": "bm25_not_loaded"})
             return []
 
+        _t0 = time.perf_counter()
+        logger.info("bm25_search.start", extra={"query_preview": query[:50], "top_k": top_k})
         tokenized_query = self.tokenize(query)
         scores = self.bm25.get_scores(tokenized_query)
 
@@ -99,6 +106,8 @@ class BM25Retriever:
                 index=idx,
             ))
 
+        elapsed = (time.perf_counter() - _t0) * 1000
+        logger.info("bm25_search.done", extra={"results": len(result), "elapsed_ms": round(elapsed)})
         return result
     # ──────────────────────────────────────────────
     # 持久化（pickle）

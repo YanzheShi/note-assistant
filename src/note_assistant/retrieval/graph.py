@@ -11,6 +11,7 @@
     注入 RAGChain：rerank 后扩展邻居 chunks → 附加到 context
 """
 
+import logging
 import pickle
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
@@ -20,6 +21,7 @@ import networkx as nx
 from note_assistant.config import settings
 from note_assistant.indexing.types import DocNode
 
+logger = logging.getLogger(__name__)
 
 class WikiGraph:
     """
@@ -55,6 +57,7 @@ class WikiGraph:
         for doc in docs:
             self.G.add_node(doc.filepath, front_matter=doc.front_matter)
 
+        logger.info("graph.build_from_docs.start", extra={"docs": len(docs)})
         # 遍历wikilink 建边
         for doc in docs:
             source = doc.filepath
@@ -153,8 +156,9 @@ class WikiGraph:
 
             current_level = next_level
 
-        # 限制最多扩展数量
-        return neighbors[:max_neighbors]
+        out = neighbors[:max_neighbors]
+        logger.info("graph_expand.done", extra={"neighbors": len(out), "max_neighbors": max_neighbors, "nodes": self.node_count})
+        return out
 
     # ───────────────────────────────
     # 查询

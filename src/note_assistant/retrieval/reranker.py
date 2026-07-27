@@ -2,10 +2,14 @@
 Reranker 重排模块 —— 对混合检索的 top-k 候选做交叉编码器重排
 """
 
+import logging
+import time
 from typing import List
 
 from note_assistant.config import settings
 from note_assistant.retrieval.types import RetrievalResult
+
+logger = logging.getLogger(__name__)
 
 # ─── 兼容层：FlagEmbedding 1.4.0 依赖 prepare_for_model（transformers < 4.34）───
 # transformers >= 4.34 移除了此方法，加回去让 FlagEmbedding 正常工作
@@ -29,6 +33,24 @@ if not hasattr(PreTrainedTokenizerBase, "prepare_for_model"):
     PreTrainedTokenizerBase.prepare_for_model = _prepare_for_model
 
 from FlagEmbedding import FlagReranker
+from functools import lru_cache
+
+
+@lru_cache(maxsize=None)
+def get_reranker(model_path: str | None = None, use_fp16: bool = True) -> "LocalReranker":
+    """LocalReranker 懒加载工厂：@lru_cache 保证全局单例，防重复加载 1.1GB 模型。
+
+    Args:
+        model_path: 模型路径，默认读 settings.reranker_model
+        use_fp16: 是否半精度推理
+
+    Returns:
+        LocalReranker 单例
+    """
+    return LocalReranker(model_path=model_path, use_fp16=use_fp16)
+
+
+
 
 
 class LocalReranker:
@@ -85,6 +107,8 @@ class LocalReranker:
             每个 result 的 score 被更新为 rerank 分数，metadata/breakdown 保留原值
         """
         top_k = top_k if top_k is not None else settings.top_k_rerank
+        _t0 = time.perf_counter()
+        logger.info("rerank.start", extra={"candidates": len(results), "top_k": top_k})
 
         # 1. 构造 pairs（取 page_content 做交叉编码）
         documents = [r.page_content for r in results]
@@ -95,6 +119,7 @@ class LocalReranker:
         top_k_idx = sorted(range(len(scores)),
                            key=lambda k: scores[k],
                            reverse=True)[:top_k]
+        batch_ms = (time.perf_counter() - _t0) * 1000
 
         reranked = []
         for idx in top_k_idx:
@@ -106,4 +131,8 @@ class LocalReranker:
                 dense_score=r.dense_score,
                 sparse_score=r.sparse_score,
             ))
+        elapsed = (time.perf_counter() - _t0) * 1000
+        logger.info(
+            "rerank.done", extra={"results": len(reranked), "top_k": top_k, "elapsed_ms": round(elapsed)}
+        )
         return reranked

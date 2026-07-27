@@ -1,5 +1,6 @@
 import ollama
 from typing import List
+
 from note_assistant.config import settings
 
 
