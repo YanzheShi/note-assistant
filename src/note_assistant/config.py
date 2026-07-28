@@ -34,16 +34,13 @@ class Settings(BaseSettings):
     ragas_llm_model: str = "qwen2.5:0.5b"
 
 
-    # === LLM ===
-    agnes_api_key: str
-    agnes_base_url: str
-    agnes_model: str
+    # === Agent / Generator LLM（统一走 AGENT_*）===
+    agent_api_key: str
+    agent_base_url: str
+    agent_model: str
     deepseek_api_key: str
-    longcat_api_key: str
     deepseek_base_url: str = "https://api.deepseek.com/v1"
-    longcat_base_url: str
     llm_model: str = "deepseek-v4-flash"
-    longcat_model: str
 
     # === LangSmith (Tracing) ===
     langsmith_tracing_enabled: bool = True

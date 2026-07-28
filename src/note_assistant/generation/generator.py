@@ -31,13 +31,13 @@ class Generator:
     def __init__(self, llm=None):
         """
         Args:
-            llm: 可选，传入自定义 LLM；默认用 DeepSeek-Chat
+            llm: 可选，传入自定义 LLM；默认用 AGENT_* 配置的模型
         """
         self.llm = llm or init_chat_model(
-            model=settings.agnes_model,
+            model=settings.agent_model,
             model_provider="openai",
-            api_key=settings.agnes_api_key,
-            openai_api_base=settings.agnes_base_url,
+            api_key=settings.agent_api_key,
+            openai_api_base=settings.agent_base_url,
             temperature=0.6,  # 比 rewrite 高，允许一定创造力
             max_tokens=2048,  # 回答可以长一些
             # 使用流式输出保证首字响应时间

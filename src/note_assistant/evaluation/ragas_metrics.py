@@ -71,17 +71,24 @@ def _make_ragas_llm(ollama_model: str | None = None):
     api_key = settings.ragas_api_key
 
     client = OpenAI(base_url=base_url, api_key=api_key)
-    llm = llm_factory(model, client=client)
-    # judge LLM 默认 max_tokens 偏小，遇到较长 answer/context 会被截断，
-    # 触发 ragas 的 IncompleteOutputException，进而污染 faithfulness /
-    # context_precision（指标变 nan → 被 _clean_float 记为 0.0）。
-    # ragas 的 RagasLLM 把真实模型挂在 .llm 上，直接调大即可。
+    # ragas 0.4.3 的 llm_factory 返回 InstructorLLM，默认 max_tokens=1024。
+    # 评判 LLM 输出偏长时 1024 会被截断，触发 ragas 的 IncompleteOutputException，
+    # 进而污染 faithfulness / context_precision（指标变 nan → 被 _clean_float 记 0.0）。
+    # 官方推荐做法（源码注释 824 行）是直接把 max_tokens 作为 kwargs 传给 llm_factory，
+    # 比事后改 model_args 字典更可靠；这里同时保留 model_args / .llm 兜底。
     _RAGAS_JUDGE_MAX_TOKENS = 4096
     try:
-        if hasattr(llm, "llm") and hasattr(llm.llm, "max_tokens"):
-            llm.llm.max_tokens = _RAGAS_JUDGE_MAX_TOKENS
-    except Exception as e:
-        logger.warning(f"设置 RAGAS judge max_tokens 失败（忽略）: {e}")
+        llm = llm_factory(model, client=client, max_tokens=_RAGAS_JUDGE_MAX_TOKENS)
+    except TypeError:
+        # 极旧版 llm_factory 不接受 max_tokens，退回后处理
+        llm = llm_factory(model, client=client)
+        try:
+            if hasattr(llm, "model_args") and isinstance(llm.model_args, dict):
+                llm.model_args["max_tokens"] = _RAGAS_JUDGE_MAX_TOKENS
+            elif hasattr(llm, "llm") and hasattr(llm.llm, "max_tokens"):
+                llm.llm.max_tokens = _RAGAS_JUDGE_MAX_TOKENS
+        except Exception as e:
+            logger.warning(f"设置 RAGAS judge max_tokens 失败（忽略）: {e}")
     return llm
 
 
