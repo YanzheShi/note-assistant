@@ -49,6 +49,15 @@ class HybridRetriever:
         self.embedder = OllamaEmbedder()
         self.ingestor = Ingestor()
         self.bm25 = BM25Retriever()
+        # 启动时尝试加载已有 BM25 索引（data/bm25.pkl）。
+        # 加载失败（索引不存在/损坏）时降级为纯 dense 检索，不影响主链路。
+        try:
+            self.bm25.load()
+        except Exception as e:
+            logger.info(
+                "bm25 index not loaded; sparse retrieval disabled",
+                extra={"path": str(self.bm25.index_path), "error": str(e)},
+            )
 
     # ──────────────────────────────────────────────
     # Dense 检索（ChromaDB）

@@ -38,6 +38,7 @@ class AgentRunResult:
     cached: bool = False
     run_id: str = ""                       # 运行快照 id（流式中断后可轮询 GET /agent/runs/{run_id}）
     timing: dict = field(default_factory=dict)
+    contexts: List[str] = field(default_factory=list)  # 评测用：agent 实际检索到的完整 chunk 正文（top_k_rerank，不截断）
 
 
 # ──────────────────────────────────────────────
@@ -123,6 +124,17 @@ def _sources_from_results(results: List[RetrievalResult]) -> List[dict]:
             "score": round(r.score, 4),
         })
     return out
+
+
+def _contexts_from_results(results: List[RetrievalResult]) -> List[str]:
+    """取 top_k_rerank 个结果的完整正文，作为评测上下文（不截断）。
+
+    与 ``_sources_from_results`` 同源排序，但保留 ``page_content`` 全文——
+    评测 ragas 的 context_precision / context_recall 需要较完整的上下文，
+    不能用 trajectory 里被 OBS_TRUNCATE 截断的 observation 片段。
+    """
+    ranked = sorted(results, key=lambda r: r.score, reverse=True)[: settings.top_k_rerank]
+    return [r.page_content for r in ranked if r.page_content]
 
 
 def _trajectory_from_messages(messages: List[BaseMessage]) -> List[dict]:
@@ -244,8 +256,15 @@ async def ainvoke(
     history: Optional[list] = None,
     session_id: str = "",
     run_id: str = "",
+    return_contexts: bool = False,
 ) -> AgentRunResult:
-    """非流式运行；命中缓存直接返回。可选持久化（run 快照 + 跨会话记忆）。"""
+    """非流式运行；命中缓存直接返回。可选持久化（run 快照 + 跨会话记忆）。
+
+    Args:
+        return_contexts: 为 True 时，在结果里附上 agent 实际检索到的完整 chunk
+            正文（top_k_rerank 条，按 score 排序），用于评测（ragas 上下文指标）。
+            默认 False，零副作用——不进轨迹、不撑大缓存/持久化、不影响 astream。
+    """
     _t0 = time.perf_counter()
     rid = run_id or str(uuid.uuid4())[:8]
     set_request_id(rid)
@@ -314,10 +333,12 @@ async def ainvoke(
     traj = _trajectory_from_state(final)
     sources = _sources_from_results(final.get("accumulated", seed))
     traj.append({"type": "sources", "sources": sources})
+    contexts = _contexts_from_results(final.get("accumulated", seed)) if return_contexts else []
     result = AgentRunResult(
         answer=final.get("answer", ""),
         sources=sources,
         trajectory=traj,
+        contexts=contexts,
         run_id=rid,
         timing={"total_ms": round(elapsed)},
     )

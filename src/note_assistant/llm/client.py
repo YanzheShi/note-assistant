@@ -1,12 +1,12 @@
 """统一 LLM 客户端。
 
-所有 LLM 调用（agent 决策、检索路由、查询改写、答案生成）统一走 agnes
-（OpenAI 兼容）通道，取代原先散落在各模块的 longcat/裸 httpx 调用。
+所有 LLM 调用（agent 决策、检索路由、查询改写、答案生成）统一走 AGENT_*
+（OpenAI 兼容）通道，取代原先散落在各模块的 agnes/longcat/裸 httpx 调用。
 
 配置来源（config.py）：
-    agnes_api_key   —— 必填
-    agnes_base_url  —— agnes 网关地址（OpenAI 兼容 /v1）
-    agnes_model     —— agnes 模型名
+    agent_api_key   —— 必填
+    agent_base_url  —— 模型网关地址（OpenAI 兼容 /v1）
+    agent_model     —— 模型名
 """
 from functools import lru_cache
 from typing import Optional
@@ -34,10 +34,10 @@ def get_llm(
         langchain ChatModel 实例，支持 .invoke/.ainvoke/.astream/.bind_tools
     """
     kwargs: dict = dict(
-        model=settings.agnes_model,
+        model=settings.agent_model,
         model_provider="openai",
-        api_key=settings.agnes_api_key,
-        openai_api_base=settings.agnes_base_url,
+        api_key=settings.agent_api_key,
+        openai_api_base=settings.agent_base_url,
         temperature=temperature,
         streaming=streaming,
     )
