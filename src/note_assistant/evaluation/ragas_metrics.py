@@ -71,7 +71,18 @@ def _make_ragas_llm(ollama_model: str | None = None):
     api_key = settings.ragas_api_key
 
     client = OpenAI(base_url=base_url, api_key=api_key)
-    return llm_factory(model, client=client)
+    llm = llm_factory(model, client=client)
+    # judge LLM 默认 max_tokens 偏小，遇到较长 answer/context 会被截断，
+    # 触发 ragas 的 IncompleteOutputException，进而污染 faithfulness /
+    # context_precision（指标变 nan → 被 _clean_float 记为 0.0）。
+    # ragas 的 RagasLLM 把真实模型挂在 .llm 上，直接调大即可。
+    _RAGAS_JUDGE_MAX_TOKENS = 4096
+    try:
+        if hasattr(llm, "llm") and hasattr(llm.llm, "max_tokens"):
+            llm.llm.max_tokens = _RAGAS_JUDGE_MAX_TOKENS
+    except Exception as e:
+        logger.warning(f"设置 RAGAS judge max_tokens 失败（忽略）: {e}")
+    return llm
 
 
 def batch_compute_ragas(
@@ -160,16 +171,27 @@ def _run_ragas_evaluate(
     """
     from datasets import Dataset
     from ragas import evaluate as ragas_evaluate
-    from ragas.metrics._faithfulness import faithfulness
-    from ragas.metrics._context_precision import context_precision
-    from ragas.metrics._context_recall import context_recall
 
-    # 配置 LLM
-    faithfulness.llm = llm
-    context_precision.llm = llm
-    context_recall.llm = llm
+    # ragas 0.4.3 的 ``ragas.metrics.collections`` 仍是占位包（import 到的是
+    # 子模块而非 metric 实例），官方 deprecation 提示的
+    # ``from ragas.metrics.collections import faithfulness`` 在 0.4.3 不可用。
+    # 0.4.3 真正可运行的是公共 ``ragas.metrics.*``（已实例化的单例，仅产生
+    # deprecation warning，v1.0 会移除）。升级到 ragas>=1.0 后，将此处改为
+    # ``from ragas.metrics.collections import faithfulness, context_precision,
+    # context_recall`` 即可（届时 collections 导出的是实例）。
+    # ``_as_metric`` 兼容「类」与「实例」两种导出形态，避免再次踩坑。
+    from ragas.metrics import faithfulness, context_precision, context_recall
 
-    metrics = [faithfulness, context_precision, context_recall]
+    def _as_metric(m):
+        return m() if isinstance(m, type) else m
+
+    f = _as_metric(faithfulness)
+    cp = _as_metric(context_precision)
+    cr = _as_metric(context_recall)
+    f.llm = llm
+    cp.llm = llm
+    cr.llm = llm
+    metrics = [f, cp, cr]
 
     # 构造 Dataset
     dataset = Dataset.from_dict({
