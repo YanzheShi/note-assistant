@@ -8,6 +8,7 @@ API 调用封装 —— 将前端与后端的网络通信抽象为纯函数。
 对外暴露三个函数：
     ask_question(api_url, question, history, session_id) -> dict
         非流式调用 /agent/ask，返回完整响应 dict
+        （前端页面已恒为流式，不再调用此函数；保留供脚本/调试直连后端使用）
 
     ask_question_stream(api_url, question, history, session_id)
         流式调用 /agent/ask_stream，返回 event generator

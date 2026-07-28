@@ -518,6 +518,8 @@ async def astream(
                         if store is not None:
                             await asyncio.to_thread(store.append_event, rid, ev, seq)
                             seq += 1
+                    # 已在循环内逐项 yield，置 None 避免底部 if ev is not None 重复发射最后一个
+                    ev = None
                 elif isinstance(ai, AIMessage) and str(ai.content).strip():
                     ev = {"type": "thought", "content": str(ai.content)}
             elif node == "tools":
@@ -532,6 +534,8 @@ async def astream(
                         if store is not None:
                             await asyncio.to_thread(store.append_event, rid, ev, seq)
                             seq += 1
+                # 已在循环内逐项 yield，置 None 避免底部 if ev is not None 重复发射最后一个
+                ev = None
             elif node == "reflect":
                 entry = (update.get("judge_log") or [{}])[-1]
                 ev = {
@@ -547,6 +551,34 @@ async def astream(
                 if ans:
                     final_answer = ans
                     ev = {"type": "answer", "content": ans}
+            elif node == "graph_expand_node":
+                # 静默节点：沿 [[wikilinks]] 扩展关联笔记，只改 accumulated。
+                new_acc = update.get("accumulated")
+                if new_acc is not None:
+                    added = len(new_acc) - len(accumulated)
+                    accumulated = new_acc
+                    ev = {"type": "thought",
+                          "content": f"🔗 图检索扩展：沿 wikilinks 关联，片段 {len(new_acc) - added} → {len(new_acc)}（新增 {added}）"}
+                else:
+                    ev = {"type": "thought", "content": "🔗 图检索扩展：本轮无新增关联笔记（未开启或未命中）"}
+            elif node == "rerank_loop":
+                # 静默节点：循环内闸门，每轮检索后精排并裁剪 top-k。
+                new_acc = update.get("accumulated")
+                if new_acc is not None:
+                    accumulated = new_acc
+                    ev = {"type": "thought",
+                          "content": f"🔄 循环内重排：精排后保留 {len(new_acc)} 个片段"}
+                else:
+                    ev = {"type": "thought", "content": "🔄 循环内重排：未启用，跳过"}
+            elif node == "rerank_exit":
+                # 静默节点：出口总安检，Judge 通过后对多轮累积做全局精排。
+                new_acc = update.get("accumulated")
+                if new_acc is not None:
+                    accumulated = new_acc
+                    ev = {"type": "thought",
+                          "content": f"🔄 出口重排：全局精排后保留 top-{len(new_acc)} 片段用于生成"}
+                else:
+                    ev = {"type": "thought", "content": "🔄 出口重排：未启用，跳过"}
 
             if ev is not None:
                 yield ev
