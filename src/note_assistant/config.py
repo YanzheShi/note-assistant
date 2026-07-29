@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
 
@@ -52,10 +53,18 @@ class Settings(BaseSettings):
     bm25_index_path: Path = Path("./data/bm25.pkl")
     chunk_size: int = 800
     chunk_overlap: int = 150
+    chunking_strategy: Literal["v1", "v2", "v2b"] = "v2"  # 启动前切换切分策略（改后重建向量库生效）
     bm25_weight: float = 0.3
     dense_weight: float = 0.7
     top_k_retrieve: int = 20
     top_k_rerank: int = 5
+
+    # === 父子双存切分（v2b，见 docs/父子双存切分（v2b）设计方案.md）===
+    # 父块（整节返回给 LLM）的最大字符数；子块（800）仍负责精准检索
+    parent_chunk_size: int = 2000
+    parent_chunk_overlap: int = 200
+    # 父块存储（不参与 embedding/BM25，仅在命中子块后按需取用）
+    parent_docstore_path: Path = Path("./data/docstore.pkl")
 
     # === 结构优先检索（层级标题 boost，见 docs/层级检索与结构优先设计方案.md）===
     # β：结构命中叠加到融合分的权重。"高一点"——结构命中段比纯正文段多一个 β 增量，
