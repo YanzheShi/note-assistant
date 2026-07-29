@@ -151,7 +151,7 @@ def split_v2(
 
 
 # ================================================================
-# v2b: Parent-Child 双存预留（Day3 评估，你下午不用实现）
+# v2b: Parent-Child 双存（检索用细块 child，返回用整节 parent）
 # ================================================================
 def split_v2b(
     node: DocNode,
@@ -159,13 +159,90 @@ def split_v2b(
     child_sp: RecursiveCharacterTextSplitter,
 ) -> Dict[str, List[Chunk]]:
     """
-    预留 Hierarchical Parent-Child 模式：
-    - parents：HeaderSplitter 切出的未细切父 chunk
-    - children：细切后的子 chunk
-    - child_to_parent：子 chunk 到父 chunk 的映射
-    你下午不用实现，DECISIONS.md 里先写清楚「当前 vault 篇短，暂不开这个」的理由
+    Hierarchical Parent-Child 模式：
+
+    - children：800 字细切块（进 ChromaDB 检索），每个带 `parent_id`
+    - parents ：整节级粗块（≤ parent_chunk_size，存 docstore，只返回给 LLM）
+
+    关键设计：父块必须是「整节」而非「硬切 2000 字」。做法是先按标题拆成细章节，
+    再在同 h1 内按 parent_chunk_size 预算把连续细章节合并成父段——
+    这样「八、最佳实践」与其下的 8.1/8.2/8.3 会作为整体成为一个父块，命中任一子块
+    都能回退整节。单 h1 章节超预算时再递归切成 bounded 父段。
+
+    返回 {"children": [...], "parents": [...]}。父块不进 embedding/BM25。
+
+    设计见 docs/父子双存切分（v2b）设计方案.md。
     """
-    raise NotImplementedError("TODO: Day3 评估后实现")
+    # 父块递归切分器（仅在单章节超 parent_chunk_size 时使用）
+    parent_sp = RecursiveCharacterTextSplitter(
+        chunk_size=settings.parent_chunk_size,
+        chunk_overlap=settings.parent_chunk_overlap,
+        separators=["\n\n", "\n", "。", " ", ""],
+        keep_separator=True,
+    )
+
+    # 1. 按标题拆成细章节（每个带 h1-h4 metadata）
+    sections = header_sp.split_text(node.raw_md)
+
+    def _hp(meta: dict) -> str:
+        parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4"]]
+        return " > ".join(p for p in parts if p) or "无标题"
+
+    # 2. 同 h1 内、按预算合并成父段
+    parent_segments: List[Dict[str, str]] = []
+    run: List[Dict[str, str]] = []
+    run_len = 0
+
+    def _flush(r: List[Dict[str, str]]) -> None:
+        if not r:
+            return
+        seg_text = "\n\n".join(x["text"] for x in r)
+        hp = r[0]["hp"]
+        # 合并后仍超预算 → 用 parent_sp 再切成 bounded 段
+        if len(seg_text) <= settings.parent_chunk_size:
+            parent_segments.append({"hp": hp, "text": seg_text})
+        else:
+            for p in parent_sp.split_text(seg_text):
+                parent_segments.append({"hp": hp, "text": p})
+
+    for s in sections:
+        hp = _hp(s.metadata)
+        h1 = s.metadata.get("h1", "")
+        rec = {"hp": hp, "text": s.page_content, "h1": h1}
+        if run and (h1 != run[0]["h1"] or run_len + len(rec["text"]) > settings.parent_chunk_size):
+            _flush(run)
+            run = []
+            run_len = 0
+        run.append(rec)
+        run_len += len(rec["text"])
+    _flush(run)
+
+    # 3. 每个父段 → 1 个 parent Chunk + N 个 child Chunk
+    children: List[Chunk] = []
+    parents: List[Chunk] = []
+    safe_fp = node.filepath.replace("/", "_").replace("\\", "_")
+
+    for idx, seg in enumerate(parent_segments):
+        pid = f"{safe_fp}::parent::{idx}"
+        parents.append(Chunk(
+            page_content=seg["text"],
+            metadata={
+                "parent_id": pid,
+                "kind": "parent",
+                "heading_path": seg["hp"],
+            },
+        ))
+        for cd in child_sp.split_text(seg["text"]):
+            children.append(Chunk(
+                page_content=cd,
+                metadata={
+                    "parent_id": pid,
+                    "kind": "text",
+                    "heading_path": seg["hp"],
+                },
+            ))
+
+    return {"children": children, "parents": parents}
 
 
 # ================================================================

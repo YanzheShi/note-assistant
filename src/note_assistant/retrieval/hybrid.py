@@ -5,7 +5,7 @@
 
 import logging
 import time
-from typing import List
+from typing import List, Dict
 
 from note_assistant.config import settings
 from note_assistant.indexing.embedder import OllamaEmbedder
@@ -13,6 +13,7 @@ from note_assistant.indexing.ingestor import Ingestor
 from note_assistant.retrieval.sparse_retriever import BM25Retriever
 from note_assistant.retrieval.structural import structural_score
 from note_assistant.retrieval.types import RetrievalResult
+from note_assistant.retrieval.docstore import ParentDocstore
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,17 @@ class HybridRetriever:
             logger.info(
                 "bm25 index not loaded; sparse retrieval disabled",
                 extra={"path": str(self.bm25.index_path), "error": str(e)},
+            )
+
+        # v2b 父块存储：检索命中子块后按 parent_id 回退整节。
+        # 加载失败（未用 v2b / 尚未重建 docstore）时为 None，_expand_to_parents 自动降级透传。
+        self._docstore: "ParentDocstore | None" = None
+        try:
+            self._docstore = ParentDocstore.load(settings.parent_docstore_path)
+        except Exception as e:
+            logger.info(
+                "parent docstore not loaded; v2b parent-expansion disabled",
+                extra={"path": str(settings.parent_docstore_path), "error": str(e)},
             )
 
     # ──────────────────────────────────────────────
@@ -138,7 +150,7 @@ class HybridRetriever:
             n_results=self._safe_n(top_k),
             include=["documents", "metadatas", "distances"],
         )
-        return self._results_from_chroma(qr)
+        return self._expand_to_parents(self._results_from_chroma(qr))
 
     def bm25_search(self, query: str, top_k: int | None = None) -> List[RetrievalResult]:
         """仅关键词（BM25 稀疏）检索。"""
@@ -162,7 +174,7 @@ class HybridRetriever:
             where=where,
             include=["documents", "metadatas", "distances"],
         )
-        return self._results_from_chroma(qr)
+        return self._expand_to_parents(self._results_from_chroma(qr))
 
     # ──────────────────────────────────────────────
     # Sparse 检索（BM25）
@@ -172,7 +184,7 @@ class HybridRetriever:
         """
         稀疏检索：BM25Okapi 算分数
         """
-        return self.bm25.search(query, top_k=top_k)
+        return self._expand_to_parents(self.bm25.search(query, top_k=top_k))
 
     # ──────────────────────────────────────────────
     # 融合：归一化 + 加权
@@ -245,6 +257,49 @@ class HybridRetriever:
         return merged
 
     # ──────────────────────────────────────────────
+    # v2b 父块展开：子块命中 → 回退整节（仅在 v2b 且 docstore 可用时）
+    # ──────────────────────────────────────────────
+
+    def _expand_to_parents(self, results: List[RetrievalResult]) -> List[RetrievalResult]:
+        """
+        v2b 父块展开：把检索命中的子块替换为整节父块返回给 LLM。
+
+        - 仅当 chunking_strategy=="v2b" 且 docstore 已加载时生效；否则直接透传（零回归）。
+        - 按 metadata.parent_id 取父块正文；同 parent_id 去重（保留分数最高的子块）。
+        - 父块缺失时 graceful 降级为该子块本身。
+        """
+        if settings.chunking_strategy != "v2b" or self._docstore is None:
+            return results
+
+        best_child: Dict[str, RetrievalResult] = {}
+        passthrough: List[RetrievalResult] = []
+        for r in results:
+            pid = r.metadata.get("parent_id")
+            if not pid:
+                passthrough.append(r)
+                continue
+            if pid not in best_child or r.score > best_child[pid].score:
+                best_child[pid] = r
+
+        expanded: List[RetrievalResult] = []
+        for pid, child in best_child.items():
+            entry = self._docstore.get(pid)
+            if entry is None:
+                expanded.append(child)
+                continue
+            expanded.append(RetrievalResult(
+                score=child.score,
+                page_content=entry["page_content"],
+                metadata=entry["metadata"],
+                dense_score=child.dense_score,
+                sparse_score=child.sparse_score,
+                structural_score=child.structural_score,
+            ))
+        expanded.extend(passthrough)
+        expanded.sort(key=lambda x: x.score, reverse=True)
+        return expanded
+
+    # ──────────────────────────────────────────────
     # 主入口
     # ──────────────────────────────────────────────
 
@@ -297,7 +352,7 @@ class HybridRetriever:
                 "elapsed_ms": round(elapsed),
             },
         )
-        return out
+        return self._expand_to_parents(out)
 
     # ──────────────────────────────────────────────
     # 跟踪检索（逐步骤输出）
@@ -335,7 +390,7 @@ class HybridRetriever:
         merged = self._merge_results(dense_results, sparse_results, query)
         trace.append({"step": "hybrid_fusion", "results": len(merged), "ms": int((time.time() - t0) * 1000)})
 
-        return merged[:top_k], trace
+        return self._expand_to_parents(merged[:top_k]), trace
 
     # ──────────────────────────────────────────────
     # 便捷方法：从 ChromaDB 建 BM25 索引

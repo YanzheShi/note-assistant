@@ -7,7 +7,8 @@ from note_assistant.indexing.embedder import OllamaEmbedder
 from note_assistant.indexing.types import Chunk
 from note_assistant.indexing.vault_loader import VaultLoader
 from note_assistant.indexing.preprocessor import RichPreprocessor
-from note_assistant.indexing.splitter import make_splitters, split_v2
+from note_assistant.indexing.splitter import make_splitters, split_v1, split_v2, split_v2b
+from note_assistant.retrieval.docstore import ParentDocstore
 
 
 def build_structural_prefix(node, meta: dict, dir_: str) -> str:
@@ -127,6 +128,9 @@ class Ingestor:
         hs, cs = make_splitters()
         preprocessor = RichPreprocessor()
         total_chunks = 0
+        is_v2b = settings.chunking_strategy == "v2b"
+        # v2b：父块存 docstore（不参与 embedding/BM25），检索命中子块后回退整节
+        docstore = ParentDocstore(settings.parent_docstore_path) if is_v2b else None
 
         for node in docs:
             # 0. 计算相对目录（层级结构前缀用，vault 内相对于根的路径父目录）
@@ -137,11 +141,21 @@ class Ingestor:
             # 1. preprocessor 抽取富结构 → cleaned text + front_matter chunks
             cleaned, fm_chunks = preprocessor.process_with_meta(node)
 
-            # 2. header + recursive 切分
-            chunks = split_v2(node, hs, cs)
+            # 2. 切分（启动前可按 chunking_strategy 切换 v1/v2/v2b；结构检索横切其上）
+            if settings.chunking_strategy == "v1":
+                chunks = split_v1(node, cs)
+                parents: List[Chunk] = []
+            elif settings.chunking_strategy == "v2b":
+                split_res = split_v2b(node, hs, cs)
+                chunks = split_res["children"]
+                parents = split_res["parents"]
+            else:  # v2
+                chunks = split_v2(node, hs, cs)
+                parents = []
 
-            # 3. restore 还原占位符
+            # 3. restore 还原占位符（parents 通常无占位符，restore 为安全 no-op）
             chunks = preprocessor.restore(chunks)
+            parents = preprocessor.restore(parents)
 
             # 4. 补 wikilinks + filepath + dir metadata，并拼结构前缀（机制 A：语义层感知层级）
             for c in chunks:
@@ -175,10 +189,33 @@ class Ingestor:
                 prefix = build_structural_prefix(node, fc.metadata, dir_)
                 fc.page_content = f"{prefix}\n\n{fc.page_content}"
 
-            # 6. 入库
+            # 5c. v2b 父块：补 metadata（无结构前缀），写入 docstore（不进 ChromaDB）
+            if docstore is not None:
+                for p in parents:
+                    p.metadata["filepath"] = node.filepath
+                    p.metadata["title"] = node.title
+                    if dir_:
+                        p.metadata["dir"] = dir_
+                    # 父块的 heading_path 来自 split_v2b（章节级），此处不覆盖
+                    p.metadata["wikilinks"] = node.wikilinks
+                    if node.tags:
+                        p.metadata["tags"] = node.tags
+                    docstore.add(
+                        p.metadata["parent_id"],
+                        p.page_content,
+                        p.metadata,
+                    )
+
+            # 6. 入库（仅 children + summary + fm 进 ChromaDB；父块只在 docstore）
             all_chunks = chunks + summary_chunks + fm_chunks
             n = self.upsert(all_chunks)
             total_chunks += n
+
+        # 收尾：v2b 落盘 docstore；非 v2b 清掉可能残留的旧 docstore（避免误加载）
+        if is_v2b and docstore is not None:
+            docstore.save()
+        elif not is_v2b and settings.parent_docstore_path.exists():
+            settings.parent_docstore_path.unlink()
 
         return {"files": len(docs), "chunks": total_chunks}
 
