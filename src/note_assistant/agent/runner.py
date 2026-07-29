@@ -227,7 +227,7 @@ async def _prepare_agent_context(
     """
     cm = get_context_manager()
     # 1) 问题凝练（消指代），供路由/检索/缓存指纹使用
-    condensed = await cm.condense_question(question, effective_history)
+    condensed = await cm.condense_question(question, effective_history, session_id)
 
     # 2) 长程摘要（若有），作为 SystemMessage 前置 + 掺入缓存指纹
     summary_text = ""

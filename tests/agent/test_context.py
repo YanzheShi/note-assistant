@@ -23,8 +23,10 @@ class FakeLLM:
 
     def __init__(self, reply: str):
         self.reply = reply
+        self.calls = 0
 
     async def ainvoke(self, messages):
+        self.calls += 1
         return AIMessage(content=self.reply)
 
 
@@ -78,11 +80,15 @@ async def test_condense_success_uses_llm(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_condense_degrades_without_llm(monkeypatch):
-    # 真实 LLM 不可用（get_llm 返回 None）→ 降级返回原问题，不抛异常
+    # 真实 LLM 不可用（get_llm 返回 None）→ 降级走零模型兜底（方案1 历史增强），不抛异常
     monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: None)
     cm = ContextManager(condense_llm=None)
-    out = await cm.condense_question("它有什么优点？", [{"role": "user", "content": "x"}])
-    assert out == "它有什么优点？"
+    out = await cm.condense_question(
+        "它有什么优点？", [{"role": "user", "content": "FlashAttention 是什么"}]
+    )
+    # 升级：不再裸返回原问题，而是带历史增强前缀（方案1）
+    assert "它有什么优点？" in out
+    assert "参考上下文" in out
 
 
 @pytest.mark.asyncio
@@ -91,6 +97,99 @@ async def test_condense_degrades_when_disabled(monkeypatch):
     cm = ContextManager(condense_llm=FakeLLM("改写"))
     out = await cm.condense_question("原问题", [])
     assert out == "原问题"
+
+
+# ──────────────────────────────────────────────
+# 方案0 / 方案1 / 方案3：指代消解降级增强（见面试笔记 B7）
+# ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_plan0_skip_without_pronoun_no_llm_call():
+    # 无指代代词 → 直接透传，且根本不调用 LLM（省一次往返）
+    llm = FakeLLM("不该被调用")
+    cm = ContextManager(condense_llm=llm)
+    hist = [
+        {"role": "user", "content": "FlashAttention 是什么"},
+        {"role": "assistant", "content": "是一种高效注意力机制"},
+    ]
+    out = await cm.condense_question("RAG 是什么", hist)
+    assert out == "RAG 是什么"
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan0_skip_when_history_empty():
+    # 历史为空、无上下文可解指代 → 透传，不调用 LLM
+    llm = FakeLLM("不该被调用")
+    cm = ContextManager(condense_llm=llm)
+    out = await cm.condense_question("它是什么？", [])
+    assert out == "它是什么？"
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan0_no_false_positive_on_qi_compound():
+    # Bug1 回归：「其」在「其他/其实/其次/其中」里是词素而非指代，不应误判含指代，
+    # 否则「其他RAG框架有哪些？」也会被白白调一次 LLM（匹配到了「其」）。
+    llm = FakeLLM("不该被调用")
+    cm = ContextManager(condense_llm=llm)
+    hist = [{"role": "user", "content": "RAG 是什么"}]
+    out = await cm.condense_question("其他RAG框架有哪些？", hist)
+    assert out == "其他RAG框架有哪些？"
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan1_history_augmented_fallback(monkeypatch):
+    # LLM 不可用（get_llm 返回 None）+ 有历史 → 降级返回「历史增强」版 query（方案1）
+    monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: None)
+    cm = ContextManager(condense_llm=None)
+    hist = [
+        {"role": "user", "content": "FlashAttention 比标准注意力快吗"},
+        {"role": "assistant", "content": "是的，因为它避免了显存瓶颈"},
+    ]
+    out = await cm.condense_question("它比标准注意力快多少？", hist, session_id="s1")
+    assert "参考上下文" in out
+    # 方案1 取「最近一轮 user 问题」作参考上下文（而非 assistant 长回复），对检索更有价值
+    assert "FlashAttention 比标准注意力快吗" in out
+
+
+@pytest.mark.asyncio
+async def test_plan3_last_entity_resolves_pronoun(monkeypatch):
+    # 方案3：LLM 不可用 + 已记 last_entity → 代词被规则替换为实体（零模型）
+    monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: None)
+    cm = ContextManager(condense_llm=None)
+    cm.record_turn(
+        "s1",
+        [
+            _rr(0.5, "低分内容", "a.md", "一、背景 > Foo"),
+            _rr(2.0, "高分内容", "b.md", "二、方法 > FlashAttention"),
+        ],
+        "q", "a",
+    )
+    # 历史里不含实体，实体只能来自 last_entity，确保替换确实生效
+    hist = [
+        {"role": "user", "content": "之前我们聊过一个方法"},
+        {"role": "assistant", "content": "对，那个方法很高效"},
+    ]
+    out = await cm.condense_question("它比标准注意力快多少？", hist, session_id="s1")
+    assert "FlashAttention" in out                  # 来自 last_entity 规则替换
+    assert "它比标准注意力快多少？" not in out       # 原代词已被替换
+    assert "参考上下文" in out                        # 同时叠加方案1 历史增强
+
+
+def test_record_turn_updates_last_entity():
+    # 方案3：record_turn 后 last_entity 被更新为最高分 chunk 标题末级
+    cm = ContextManager()
+    cm.record_turn(
+        "s1",
+        [
+            _rr(0.5, "低分", "a.md", "一、背景 > Foo"),
+            _rr(2.0, "高分", "b.md", "二、方法 > FlashAttention"),
+        ],
+        "q", "a",
+    )
+    assert cm._last_entity["s1"] == "FlashAttention"
 
 
 # ──────────────────────────────────────────────

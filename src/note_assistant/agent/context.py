@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import re
 import logging
 import math
 from typing import Callable, List, Optional, Sequence
@@ -69,6 +70,67 @@ def _strip_resp(resp) -> str:
         c = resp.content
         return c if isinstance(c, str) else str(c)
     return str(resp)
+
+
+# ──────────────────────────────────────────────
+# 指代消解降级辅助（方案0 拦截 / 方案3 规则替换 / 方案1 历史增强）
+# ──────────────────────────────────────────────
+
+# 中文指代代词集合（长词优先，避免「这些」被退化匹配成「这」）。
+# 注意：刻意不收录「其」与「他」——它们常作为词素出现在高频非指代词里：
+#   「其他 / 其实 / 其次 / 其中」含「其」，「其他 / 他们」含「他」。
+# 纳入会误触发（如「其他RAG框架有哪些？」被误判含指代 → 白调一次 LLM）。
+# 指代消解主要靠「这个/那个/这些/那些/这种/那种/它/此/该/前者/后者/上述」兜底，
+# 漏掉孤立的「其/他」代价远小于误触发。
+_PRONOUN_RE = re.compile(
+    r"(?:前者|后者|上述|这个|那个|这些|那些|这种|那种|它|她|这|那|此|该)"
+)
+# 方案1：降级时拼进检索 query 的历史上下文最大长度（避免 query 过长）
+_FALLBACK_HISTORY_MAX = 200
+
+
+def _has_referring_pronoun(text: str) -> bool:
+    """是否含指代代词（它/那/这个/前者…），用于方案0 前置拦截省 LLM 调用。"""
+    return bool(_PRONOUN_RE.search(text or ""))
+
+
+def _resolve_pronoun_with_entity(text: str, entity: str) -> str:
+    """方案3：把文本中第一个指代代词规则替换为 last_entity（零模型、零延迟）。"""
+    if not entity:
+        return text
+    return _PRONOUN_RE.sub(entity, text, count=1)
+
+
+def _last_exchange_text(history) -> str:
+    """取最近一轮 user 消息的文本（方案1 历史增强降级用）。
+
+    从后往前找最近一条 user 轮——上一轮「用户问题」比「助手长回复」更短、更精确、
+    是 query 形式，作检索参考上下文价值更高。原实现取 ``history[-1]`` 可能拿到
+    assistant 回复，导致降级 query 被长答案污染（如「参考上下文：assistant 500 字…」）。
+    """
+    if not history:
+        return ""
+    for turn in reversed(history):
+        if not turn:
+            continue
+        if isinstance(turn, dict) and turn.get("role") == "user":
+            content = turn.get("content", "")
+            return (content or "").strip()[:_FALLBACK_HISTORY_MAX]
+    return ""
+
+
+def _fallback_query(current: str, history, last_entity: str | None = None) -> str:
+    """方案1 + 方案3 的零模型降级兜底：
+
+    - 方案3：若记有 ``last_entity``，把指代代词规则替换为实体，给检索器锚点；
+    - 方案1：拼接最近一轮历史作参考上下文，提升 BM25 / dense 召回落点。
+    """
+    resolved = _resolve_pronoun_with_entity(current, last_entity)
+    prev = _last_exchange_text(history)
+    if prev:
+        # 换行分隔参考上下文与当前问题，语义更清晰，便于 BM25 / dense 切分（改进点）
+        return f"参考上下文：{prev}\n当前问题：{resolved}"
+    return resolved
 
 
 def _default_llm():
@@ -130,24 +192,35 @@ class ContextManager:
         self._summarize_llm = summarize_llm
         # 跨轮累积：按 session_id 缓存 RetrievalResult（内存，重启自然降级）
         self._accum: dict[str, list[RetrievalResult]] = {}
+        # 方案3：按 session_id 缓存「最近高分 chunk 标题末级」，作降级时指代消解实体槽位
+        self._last_entity: dict[str, str] = {}
 
     # ── token 计数 ──
     def count_tokens(self, text_or_messages) -> int:
         return TokenCounter.count(text_or_messages)
 
     # ── 问题凝练（消指代）──
-    async def condense_question(self, current: str, history: Sequence[dict]) -> str:
+    async def condense_question(
+        self, current: str, history: Sequence[dict], session_id: str = ""
+    ) -> str:
         """基于历史把追问改写为独立完整问题，供路由/检索/缓存指纹使用。
 
-        失败或开关关闭时降级返回原问题（不抛异常）。
+        失败或开关关闭时降级返回兜底问题（不抛异常）。降级策略见面试笔记 B7：
+        - 方案0：无指代代词 / 历史为空 → 直接透传，省一次 LLM 调用；
+        - LLM 不可用 / 异常 / 空返回 → 方案1+方案3 零模型兜底（历史增强 + last_entity 替换）。
         """
         if not settings.agent_condense_enabled or not current:
             return current
+        effective_history = [t for t in history if (t or {}).get("content")]
+        # 方案0：无指代代词 / 无历史可解指代 → 透传，省去不必要的 LLM 往返
+        if not effective_history or not _has_referring_pronoun(current):
+            return current
         llm = self._condense_llm or _default_llm()
         if llm is None:
-            return current
+            # LLM 不可用：走零模型降级，而非裸返回原问题
+            return _fallback_query(current, effective_history, self._last_entity.get(session_id))
         try:
-            recent = history[-settings.agent_history_relevance_window:]
+            recent = effective_history[-settings.agent_history_relevance_window:]
             hist_text = _format_turns_for_prompt(recent)
             prompt = (
                 "你是一个对话改写器。下面是一段多轮对话的历史与用户最新追问。\n"
@@ -160,11 +233,13 @@ class ContextManager:
             resp = await llm.ainvoke([HumanMessage(prompt)])
             text = _strip_resp(resp).strip()
         except Exception as e:  # noqa: BLE001
-            logger.warning("condense_question 失败，降级用原问题: %s", e)
+            logger.warning("condense_question 失败，降级用历史增强兜底: %s", e)
             logger.warning("condense.question_failed", extra={"error": str(e)[:120]})
-            return current
+            return _fallback_query(current, effective_history, self._last_entity.get(session_id))
         logger.info("condense.question", extra={"original": current[:40], "condensed": text[:40]})
-        return text or current
+        if not text:
+            return _fallback_query(current, effective_history, self._last_entity.get(session_id))
+        return text
 
     # ── 缓存指纹 ──
     def context_key(self, condensed: str, summary: str = "") -> str:
@@ -284,6 +359,21 @@ class ContextManager:
             if len(kept) >= settings.agent_accumulated_max_items:
                 break
         self._accum[session_id] = kept
+        self._update_last_entity(session_id)  # 方案3：更新 last_entity 槽位
+
+    def _update_last_entity(self, session_id: str) -> None:
+        """方案3：每轮把最近高分 chunk 的标题末级记为 ``last_entity``（零模型）。
+
+        复用已有 ``self._accum[session_id]``，零新增存储；供 ``condense_question``
+        降级时规则替换指代代词。分数来自 rerank/hybrid 已算好的排序，取最高分即可。
+        """
+        acc = self._accum.get(session_id)
+        if not acc:
+            return
+        top = max(acc, key=lambda r: r.score)
+        hp = top.metadata.get("heading_path", "") if isinstance(top.metadata, dict) else ""
+        if hp:
+            self._last_entity[session_id] = hp.split(">")[-1].strip()
 
     # ── 总预算兜底：已知两段（history + accumulated）之和超总上限时压缩 ──
     def fit_total_budget(
