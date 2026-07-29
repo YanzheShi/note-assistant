@@ -353,3 +353,61 @@ class TestBuildBm25FromChroma:
 
         mock_bm25_cls.from_chroma.assert_called_once()
         mock_bm25.save.assert_called_once()
+
+
+# ================================================================
+# _merge_results —— 结构优先 boost（机制 B）
+# ================================================================
+class TestMergeResultsStructural:
+    def _two_chunks_equal_base(self, meta_a, meta_b):
+        """构造两路分数完全相同的一对 chunk，使融合 base 分相等，便于隔离 boost 效果。"""
+        retriever = HybridRetriever(alpha=0.7)
+        dense = [
+            RetrievalResult(score=0.8, page_content="A body", metadata=meta_a),
+            RetrievalResult(score=0.8, page_content="B body", metadata=meta_b),
+        ]
+        sparse = [
+            RetrievalResult(score=1.0, page_content="A body", metadata=meta_a),
+            RetrievalResult(score=1.0, page_content="B body", metadata=meta_b),
+        ]
+        return retriever, dense, sparse
+
+    def test_title_hit_boosts_target_chunk(self):
+        """query 完整含文档标题时，目标 chunk 应因 title_hit 硬兜底获得 bonus 而排前。"""
+        meta_a = {"title": "Code Agent 架构", "heading_path": "二、关键设计点", "dir": "AI/Agents"}
+        meta_b = {"title": "其他文档", "heading_path": "一、前言", "dir": "Others"}
+        retriever, dense, sparse = self._two_chunks_equal_base(meta_a, meta_b)
+
+        query = "Code Agent 架构的关键设计点是什么"
+        merged = retriever._merge_results(dense, sparse, query)
+
+        a = next(r for r in merged if r.page_content == "A body")
+        b = next(r for r in merged if r.page_content == "B body")
+        # A 因 title 命中 +0.15 bonus，应高于 B
+        assert a.score > b.score
+        assert abs(a.score - b.score - settings.title_hit_bonus) < 1e-6
+        # structural_score 字段应被记录
+        assert a.structural_score is not None
+
+    def test_no_query_no_boost(self):
+        """不传 query（agent 旧调用路径）→ 不施 boost，base 相等（零回归）。"""
+        meta_a = {"title": "Code Agent 架构"}
+        meta_b = {"title": "其他文档"}
+        retriever, dense, sparse = self._two_chunks_equal_base(meta_a, meta_b)
+
+        merged = retriever._merge_results(dense, sparse)  # query=None
+        a = next(r for r in merged if r.page_content == "A body")
+        b = next(r for r in merged if r.page_content == "B body")
+        assert abs(a.score - b.score) < 1e-9
+        assert a.structural_score == 0.0
+
+    def test_irrelevant_query_no_boost(self):
+        """query 与结构信号无关 → 无 boost，两 chunk 分数相等。"""
+        meta_a = {"title": "Code Agent 架构"}
+        meta_b = {"title": "其他文档"}
+        retriever, dense, sparse = self._two_chunks_equal_base(meta_a, meta_b)
+
+        merged = retriever._merge_results(dense, sparse, "今天天气怎么样")
+        a = next(r for r in merged if r.page_content == "A body")
+        b = next(r for r in merged if r.page_content == "B body")
+        assert abs(a.score - b.score) < 1e-9

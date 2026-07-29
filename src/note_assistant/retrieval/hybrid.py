@@ -11,6 +11,7 @@ from note_assistant.config import settings
 from note_assistant.indexing.embedder import OllamaEmbedder
 from note_assistant.indexing.ingestor import Ingestor
 from note_assistant.retrieval.sparse_retriever import BM25Retriever
+from note_assistant.retrieval.structural import structural_score
 from note_assistant.retrieval.types import RetrievalResult
 
 logger = logging.getLogger(__name__)
@@ -181,13 +182,16 @@ class HybridRetriever:
         self,
         dense_results: List[RetrievalResult],
         sparse_results: List[RetrievalResult],
+        query: str | None = None,
     ) -> List[RetrievalResult]:
         """
-        两路结果融合：sparse 归一化 → 加权求和
+        两路结果融合：sparse 归一化 → 加权求和 → 结构优先 boost
 
         dense 已在 [0,1]（_dense_search 归一化过），sparse 需要 min-max 归一化。
         用 page_content 做 key 匹配（两路同源，文本相同）。
         并集融合：保留所有候选。
+        query 非空时叠加结构分（β·structural + title 精确命中 bonus），受
+        structural_min_score 门控；query 为 None 时不施 boost（零回归）。
         """
         dense_by_content = {r.page_content: r for r in dense_results}
         sparse_by_content = {r.page_content: r for r in sparse_results}
@@ -215,12 +219,26 @@ class HybridRetriever:
                 if content in dense_by_content
                 else sparse_by_content[content].metadata
             )
+
+            # 结构优先 boost（机制 B）：query 命中 chunk 结构元数据（dir/title/heading_path）时叠加
+            s_score, title_hit = structural_score(query, metadata) if query else (0.0, False)
+            if query:
+                boost = 0.0
+                # 软 boost：结构分较高时才施加（低分忽略，防噪声翻车）
+                if s_score > settings.structural_min_score:
+                    boost += settings.structure_weight * s_score
+                # 硬兜底：query 精确命中「文档标题」无论结构分高低都给 bonus（强信号）
+                if title_hit:
+                    boost += settings.title_hit_bonus
+                final_score += boost
+
             merged.append(RetrievalResult(
                 score=final_score,
                 page_content=content,
                 metadata=metadata,
                 dense_score=dense_score,
                 sparse_score=sparse_norm,
+                structural_score=s_score,
             ))
 
         merged.sort(key=lambda r: r.score, reverse=True)
@@ -260,7 +278,7 @@ class HybridRetriever:
 
         # 3. 融合
         merge_t0 = time.perf_counter()
-        merged = self._merge_results(dense_results, sparse_results)
+        merged = self._merge_results(dense_results, sparse_results, query)
         merge_ms = (time.perf_counter() - merge_t0) * 1000
 
         out = merged[:top_k]
@@ -314,7 +332,7 @@ class HybridRetriever:
 
         # 4. 融合
         t0 = time.time()
-        merged = self._merge_results(dense_results, sparse_results)
+        merged = self._merge_results(dense_results, sparse_results, query)
         trace.append({"step": "hybrid_fusion", "results": len(merged), "ms": int((time.time() - t0) * 1000)})
 
         return merged[:top_k], trace

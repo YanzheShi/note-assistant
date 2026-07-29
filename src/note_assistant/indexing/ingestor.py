@@ -10,6 +10,33 @@ from note_assistant.indexing.preprocessor import RichPreprocessor
 from note_assistant.indexing.splitter import make_splitters, split_v2
 
 
+def build_structural_prefix(node, meta: dict, dir_: str) -> str:
+    """
+    构造层级结构前缀：目录 › 《文档名》› 标题路径(去掉与文档标题重复的 h1 段)。
+
+    拼到 chunk.page_content 头部后，dense / BM25 / reranker 三处都能感知层级结构
+    （机制 A，语义层）。示例：
+        AI/Agents › 《Code Agent 架构》› 二、关键设计点
+
+    设计见 docs/层级检索与结构优先设计方案.md。dir_ 显式传入（fm/summary chunk 的
+    metadata 里没有 dir），title 取 node.title（fm/summary chunk 的 metadata 可能缺 title），
+    因此本函数不依赖 meta 一定含这些字段。
+    """
+    title = node.title
+    hp = (meta.get("heading_path") or "")
+    hp_segs = [s.strip() for s in hp.split(" > ") if s.strip()]
+    # heading_path 的 h1 段通常等于文档标题，去掉避免 "《标题》› 标题 > ..." 冗余
+    if hp_segs and hp_segs[0] == title:
+        hp_segs = hp_segs[1:]
+    parts = []
+    if dir_:
+        parts.append(dir_)
+    parts.append(f"《{title}》")
+    if hp_segs:
+        parts.append(" > ".join(hp_segs))
+    return " › ".join(parts)
+
+
 class Ingestor:
     """入库 ChromaDB，支持两路 chunk + 增量更新"""
 
@@ -46,10 +73,18 @@ class Ingestor:
             fp = c.metadata.get("filepath", "unknown")
             ids.append(self._make_id(fp, i, c.kind))
 
-        # ChromaDB 不接受空列表作为 metadata 值，清理掉
+        # ChromaDB metadata 校验：空列表不接受；list 元素必须同类型且为 str/int/float/bool。
+        # front matter 的 tags 可能混入整数（如年份 2026），统一转 str 以满足约束。
         metadatas = []
         for c in chunks:
-            clean = {k: v for k, v in c.metadata.items() if not (isinstance(v, list) and len(v) == 0)}
+            clean = {}
+            for k, v in c.metadata.items():
+                if isinstance(v, list):
+                    if len(v) == 0:
+                        continue  # ChromaDB 不接受空列表作为 metadata 值
+                    clean[k] = [str(x) for x in v]
+                else:
+                    clean[k] = v
             metadatas.append(clean)
 
         embeddings = self.embedder.embed([c.page_content for c in chunks])
@@ -94,6 +129,11 @@ class Ingestor:
         total_chunks = 0
 
         for node in docs:
+            # 0. 计算相对目录（层级结构前缀用，vault 内相对于根的路径父目录）
+            dir_ = str(Path(node.filepath).parent)
+            if dir_ == ".":
+                dir_ = ""
+
             # 1. preprocessor 抽取富结构 → cleaned text + front_matter chunks
             cleaned, fm_chunks = preprocessor.process_with_meta(node)
 
@@ -103,20 +143,37 @@ class Ingestor:
             # 3. restore 还原占位符
             chunks = preprocessor.restore(chunks)
 
-            # 4. 补 wikilinks + filepath metadata（整篇级）
+            # 4. 补 wikilinks + filepath + dir metadata，并拼结构前缀（机制 A：语义层感知层级）
             for c in chunks:
                 c.metadata["wikilinks"] = node.wikilinks
                 c.metadata["filepath"] = node.filepath
                 c.metadata["title"] = node.title
+                if dir_:
+                    c.metadata["dir"] = dir_
                 # ChromaDB 不接受空列表作为 metadata 值，tags 为空则不设置
                 if node.tags:
                     c.metadata["tags"] = node.tags
+                prefix = build_structural_prefix(node, c.metadata, dir_)
+                c.page_content = f"{prefix}\n\n{c.page_content}"
 
-            # 5. 辅路：富结构 summary chunks（补 metadata）
+            # 5. 辅路：富结构 summary chunks（补 metadata + 前缀）
             summary_chunks = preprocessor.generate_summaries()
             for sc in summary_chunks:
                 sc.metadata["filepath"] = node.filepath
                 sc.metadata["title"] = node.title
+                if dir_:
+                    sc.metadata["dir"] = dir_
+                prefix = build_structural_prefix(node, sc.metadata, dir_)
+                sc.page_content = f"{prefix}\n\n{sc.page_content}"
+
+            # 5b. front_matter chunks：此前漏补 metadata，这里补 filepath/title/dir + 前缀
+            for fc in fm_chunks:
+                fc.metadata["filepath"] = node.filepath
+                fc.metadata["title"] = node.title
+                if dir_:
+                    fc.metadata["dir"] = dir_
+                prefix = build_structural_prefix(node, fc.metadata, dir_)
+                fc.page_content = f"{prefix}\n\n{fc.page_content}"
 
             # 6. 入库
             all_chunks = chunks + summary_chunks + fm_chunks

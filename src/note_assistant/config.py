@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     top_k_retrieve: int = 20
     top_k_rerank: int = 5
 
+    # === 结构优先检索（层级标题 boost，见 docs/层级检索与结构优先设计方案.md）===
+    # β：结构命中叠加到融合分的权重。"高一点"——结构命中段比纯正文段多一个 β 增量，
+    #    稳定靠前但不至于完全盖掉内容相关性；β=0 时完全退化回现状，零回归。
+    structure_weight: float = 0.25
+    # 结构分门控：低于此值不施加 boost，避免弱结构信号噪声翻车（提到目录名就排前但正文不相关）。
+    structural_min_score: float = 0.5
+    # query 精确命中某段「文档标题」时的额外硬兜底 bonus（如问"Code Agent 架构"命中文档名）。
+    title_hit_bonus: float = 0.15
+
     # === Agentic RAG ===
     agent_max_iter: int = 3                     # 检索循环最大轮次（硬性降级上限）
     agent_max_tool_retry: int = 2               # 单次工具调用失败重试次数

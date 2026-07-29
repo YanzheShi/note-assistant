@@ -11,6 +11,7 @@ class RetrievalResult:
     index: Optional[int] = None           # 在 corpus 中的位置（sparse 用）
     dense_score: Optional[float] = None   # dense 通路分数（调试/优化用）
     sparse_score: Optional[float] = None  # sparse 通路分数（调试/优化用）
+    structural_score: Optional[float] = None  # 结构分（层级标题 boost，调试/排序观察用）
 
     @property
     def filepath(self) -> str:
