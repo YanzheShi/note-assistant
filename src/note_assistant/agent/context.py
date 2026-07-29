@@ -372,7 +372,9 @@ class ContextManager:
             return
         top = max(acc, key=lambda r: r.score)
         hp = top.metadata.get("heading_path", "") if isinstance(top.metadata, dict) else ""
-        if hp:
+        # 跳过占位符 "无标题"（heading_path 全空时的 fallback），否则会被当合法实体，
+        # 在方案3 兜底时把代词替换成字面「无标题」，污染检索 query
+        if hp and hp != "无标题":
             self._last_entity[session_id] = hp.split(">")[-1].strip()
 
     # ── 总预算兜底：已知两段（history + accumulated）之和超总上限时压缩 ──

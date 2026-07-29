@@ -192,6 +192,22 @@ def test_record_turn_updates_last_entity():
     assert cm._last_entity["s1"] == "FlashAttention"
 
 
+def test_update_last_entity_skips_placeholder():
+    # 方案3 边界：heading_path 全空时 splitter 填占位符"无标题"，不应被记为实体，
+    # 否则方案3 兜底会把代词替换成字面「无标题」污染检索 query
+    cm = ContextManager()
+    cm.record_turn(
+        "ph1",
+        [
+            _rr(0.5, "导言段", "a.md", "无标题"),
+            _rr(2.0, "另一段", "b.md", "无标题"),
+        ],
+        "q", "a",
+    )
+    # 占位符被跳过 → 不写入任何实体
+    assert "ph1" not in cm._last_entity
+
+
 # ──────────────────────────────────────────────
 # 历史预算 + 相关性裁剪
 # ──────────────────────────────────────────────
