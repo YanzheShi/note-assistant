@@ -165,9 +165,9 @@ def split_v2b(
     - parents ：整节级粗块（≤ parent_chunk_size，存 docstore，只返回给 LLM）
 
     关键设计：父块必须是「整节」而非「硬切 2000 字」。做法是先按标题拆成细章节，
-    再在同 h1 内按 parent_chunk_size 预算把连续细章节合并成父段——
-    这样「八、最佳实践」与其下的 8.1/8.2/8.3 会作为整体成为一个父块，命中任一子块
-    都能回退整节。单 h1 章节超预算时再递归切成 bounded 父段。
+    再在同「最高层级标题」（有 h1 用 h1；无 h1 时回退 h2/h3/h4）内按 parent_chunk_size
+    预算把连续细章节合并成父段——这样「八、最佳实践」与其下的 8.1/8.2/8.3 会作为整体
+    成为一个父块，命中任一子块都能回退整节。单章节超预算时再递归切成 bounded 父段。
 
     返回 {"children": [...], "parents": [...]}。父块不进 embedding/BM25。
 
@@ -188,7 +188,19 @@ def split_v2b(
         parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4"]]
         return " > ".join(p for p in parts if p) or "无标题"
 
-    # 2. 同 h1 内、按预算合并成父段
+    def _top_header(meta: dict) -> str:
+        """取文档中最高（最浅）层级的标题，作为父块分段依据。
+
+        无 h1 时回退到 h2/h3/h4，避免从 `##` 起手的笔记把所有章节
+        合并进同一个父块（原实现只看 h1，缺 h1 时换段条件恒为假）。
+        """
+        for k in ["h1", "h2", "h3", "h4"]:
+            v = meta.get(k, "")
+            if v:
+                return v
+        return ""
+
+    # 2. 同「最高层级标题」内、按预算合并成父段
     parent_segments: List[Dict[str, str]] = []
     run: List[Dict[str, str]] = []
     run_len = 0
@@ -207,9 +219,9 @@ def split_v2b(
 
     for s in sections:
         hp = _hp(s.metadata)
-        h1 = s.metadata.get("h1", "")
-        rec = {"hp": hp, "text": s.page_content, "h1": h1}
-        if run and (h1 != run[0]["h1"] or run_len + len(rec["text"]) > settings.parent_chunk_size):
+        key = _top_header(s.metadata)
+        rec = {"hp": hp, "text": s.page_content, "key": key}
+        if run and (key != run[0]["key"] or run_len + len(rec["text"]) > settings.parent_chunk_size):
             _flush(run)
             run = []
             run_len = 0
