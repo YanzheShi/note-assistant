@@ -26,6 +26,7 @@ import hashlib
 import re
 import logging
 import math
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
 
 import tiktoken
@@ -94,6 +95,23 @@ def _has_referring_pronoun(text: str) -> bool:
     return bool(_PRONOUN_RE.search(text or ""))
 
 
+def _needs_condense(current: str, history) -> bool:
+    """是否需要送 LLM 消解（方案0 前置拦截的放宽版）。
+
+    原实现只看「是否含指代代词」，导致中文里最常见的**零主语省略式追问**
+    （「性能呢？」「优缺点」「怎么优化」「和 v1 比呢」）压根没进消解，
+    残缺 query 直接进检索。这里补一条：历史非空且问题过短 → 同样送 LLM。
+
+    阈值取 ``agent_condense_short_threshold``（默认 8 字）：正常独立问题
+    「FlashAttention 的原理是什么」远超此长度，不会被误触发。
+    """
+    if not history:
+        return False
+    if _has_referring_pronoun(current):
+        return True
+    return len((current or "").strip()) < settings.agent_condense_short_threshold
+
+
 def _resolve_pronoun_with_entity(text: str, entity: str) -> str:
     """方案3：把文本中第一个指代代词规则替换为 last_entity（零模型、零延迟）。"""
     if not entity:
@@ -131,6 +149,34 @@ def _fallback_query(current: str, history, last_entity: str | None = None) -> st
         # 换行分隔参考上下文与当前问题，语义更清晰，便于 BM25 / dense 切分（改进点）
         return f"参考上下文：{prev}\n当前问题：{resolved}"
     return resolved
+
+
+# ──────────────────────────────────────────────
+# 消解置信信号（旁路，不改 condense_question -> str 签名）
+# ──────────────────────────────────────────────
+
+@dataclass
+class CondenseSignal:
+    """一次指代消解的可信度旁路信号，供检索后的 Judge 综合判定是否需要反问。
+
+    刻意**不进** ``condense_question`` 的返回值：该函数唯一调用点在
+    ``runner._prepare_agent_context``，改签名会波及全部既有测试。信号走
+    ``ContextManager._condense_signal[session_id]`` 槽位，读取接口
+    ``get_condense_signal(session_id)``。
+
+    字段语义：
+        confidence       — 0.0~1.0，越低越可能歧义；见 15.3 节确定性规则表
+        method           — passthrough | llm | fallback
+        entity_agreement — 方案2（LLM 改写）与方案3（last_entity 规则替换）是否一致
+        candidates       — 上一轮召回的竞争主题 top-N（反问时可直接作选项）
+        topic_margin     — 上一轮召回 top1 与 top2 的归一化分差，越小竞争越激烈
+    """
+
+    confidence: float = 1.0
+    method: str = "passthrough"
+    entity_agreement: bool = True
+    candidates: List[str] = field(default_factory=list)
+    topic_margin: float = 1.0
 
 
 def _default_llm():
@@ -194,6 +240,34 @@ class ContextManager:
         self._accum: dict[str, list[RetrievalResult]] = {}
         # 方案3：按 session_id 缓存「最近高分 chunk 标题末级」，作降级时指代消解实体槽位
         self._last_entity: dict[str, str] = {}
+        # 上一轮召回的竞争主题 top-N 与归一化分差（澄清判定的客观歧义证据）
+        self._last_topics: dict[str, list[str]] = {}
+        self._last_topic_margin: dict[str, float] = {}
+        # 本轮消解的置信信号（旁路槽位，不改 condense_question 签名）
+        self._condense_signal: dict[str, CondenseSignal] = {}
+        # 「上一轮刚反问过」标记，用于防连续追问
+        self._clarified: set[str] = set()
+
+    # ── 消解置信信号（旁路读写）──
+    def get_condense_signal(self, session_id: str) -> CondenseSignal:
+        """取本轮消解置信信号；未记录时返回「完全可信」的默认值（不触发澄清）。"""
+        return self._condense_signal.get(session_id) or CondenseSignal()
+
+    def _set_condense_signal(self, session_id: str, sig: CondenseSignal) -> None:
+        if session_id:
+            self._condense_signal[session_id] = sig
+
+    def mark_clarified(self, session_id: str) -> None:
+        """标记本轮已反问，下一轮禁止再反问（防连续追问）。"""
+        if session_id:
+            self._clarified.add(session_id)
+
+    def pop_clarified(self, session_id: str) -> bool:
+        """读取并清除「上一轮刚反问过」标记（一次性）。"""
+        if session_id and session_id in self._clarified:
+            self._clarified.discard(session_id)
+            return True
+        return False
 
     # ── token 计数 ──
     def count_tokens(self, text_or_messages) -> int:
@@ -210,14 +284,34 @@ class ContextManager:
         - LLM 不可用 / 异常 / 空返回 → 方案1+方案3 零模型兜底（历史增强 + last_entity 替换）。
         """
         if not settings.agent_condense_enabled or not current:
+            self._set_condense_signal(session_id, CondenseSignal())
             return current
         effective_history = [t for t in history if (t or {}).get("content")]
-        # 方案0：无指代代词 / 无历史可解指代 → 透传，省去不必要的 LLM 往返
-        if not effective_history or not _has_referring_pronoun(current):
+        # 无历史但含指代代词：先行词客观上不存在 → 最歧义，直接给低置信信号
+        # （不调 LLM，反正没有历史可供消解），让 clarify 闸门据此反问，
+        # 而不是被 _needs_condense 的「无历史→完全可信 1.0」永远压制。
+        if not effective_history and _has_referring_pronoun(current):
+            self._set_condense_signal(
+                session_id,
+                CondenseSignal(
+                    confidence=0.3,
+                    method="no_antecedent",
+                    entity_agreement=False,
+                    candidates=list(self._last_topics.get(session_id, [])),
+                    topic_margin=self._last_topic_margin.get(session_id, 1.0),
+                ),
+            )
+            return current
+        # 方案0：问题本身独立完整（无指代且不过短）/ 无历史可解指代 → 透传，省 LLM 往返
+        if not _needs_condense(current, effective_history):
+            self._set_condense_signal(session_id, CondenseSignal())
             return current
         llm = self._condense_llm or _default_llm()
         if llm is None:
             # LLM 不可用：走零模型降级，而非裸返回原问题
+            self._set_condense_signal(
+                session_id, self._build_signal(session_id, "fallback", "")
+            )
             return _fallback_query(current, effective_history, self._last_entity.get(session_id))
         try:
             recent = effective_history[-settings.agent_history_relevance_window:]
@@ -235,11 +329,71 @@ class ContextManager:
         except Exception as e:  # noqa: BLE001
             logger.warning("condense_question 失败，降级用历史增强兜底: %s", e)
             logger.warning("condense.question_failed", extra={"error": str(e)[:120]})
+            self._set_condense_signal(
+                session_id, self._build_signal(session_id, "fallback", "")
+            )
             return _fallback_query(current, effective_history, self._last_entity.get(session_id))
         logger.info("condense.question", extra={"original": current[:40], "condensed": text[:40]})
         if not text:
+            self._set_condense_signal(
+                session_id, self._build_signal(session_id, "fallback", "")
+            )
             return _fallback_query(current, effective_history, self._last_entity.get(session_id))
+        self._set_condense_signal(session_id, self._build_signal(session_id, "llm", text))
         return text
+
+    def _build_signal(self, session_id: str, method: str, condensed: str) -> CondenseSignal:
+        """把「几种消解手段是否互相印证」折算成确定性置信度（零额外 LLM 调用）。
+
+        判据来自两条**互相独立**的路径：
+          - 方案2（LLM 改写）产出 ``condensed``；
+          - 方案3（``last_entity`` 规则替换）产出候选实体。
+        两者若指向同一实体，说明消解可信；分歧则说明「那个」到底指谁存在争议。
+
+        另一维证据是上一轮召回的主题分布：top1 与 top2 分差过小，
+        说明上一轮本就同时命中了两个竞争主题，此时代词的先行词客观上不唯一。
+
+        注：方案1（历史增强）产出的是 ``参考上下文：…\\n当前问题：…`` 拼接串，
+        不是候选实体，无法参与实体级比对，仅作检索锚点。
+
+        任何异常都退回「完全可信」（不触发澄清），保证新增逻辑不会让主链路变差。
+        """
+        try:
+            entity = self._last_entity.get(session_id, "")
+            candidates = list(self._last_topics.get(session_id, []))
+            margin = self._last_topic_margin.get(session_id, 1.0)
+            topic_competing = margin < settings.agent_clarify_topic_margin
+
+            if method == "fallback":
+                # 强手（LLM）失效，只剩零模型兜底 —— 置信最低
+                return CondenseSignal(
+                    confidence=0.3, method="fallback", entity_agreement=True,
+                    candidates=candidates, topic_margin=margin,
+                )
+
+            if not entity:
+                # 单路径，无从互证（上一轮没有可用实体槽位）
+                return CondenseSignal(
+                    confidence=0.7, method=method, entity_agreement=True,
+                    candidates=candidates, topic_margin=margin,
+                )
+
+            agreement = entity in (condensed or "")
+            if not agreement:
+                # 方案2 与方案3 指向不同实体 —— 两条独立路径分歧，最强的歧义信号
+                confidence = 0.4
+            elif topic_competing:
+                # 实体一致，但上一轮召回本就存在竞争主题
+                confidence = 0.5
+            else:
+                confidence = 0.9
+            return CondenseSignal(
+                confidence=confidence, method=method, entity_agreement=agreement,
+                candidates=candidates, topic_margin=margin,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("_build_signal 失败，降级为完全可信: %s", e)
+            return CondenseSignal()
 
     # ── 缓存指纹 ──
     def context_key(self, condensed: str, summary: str = "") -> str:
@@ -366,6 +520,11 @@ class ContextManager:
 
         复用已有 ``self._accum[session_id]``，零新增存储；供 ``condense_question``
         降级时规则替换指代代词。分数来自 rerank/hybrid 已算好的排序，取最高分即可。
+
+        额外记录**竞争主题**（改造点）：原实现取 ``max(acc, key=score)`` 就走，
+        上一轮若同时召回两个不相干主题，它直接挑分最高那个，**完全不记录存在竞争者**
+        —— 这是一次静默赌博。现同时记录 top-N 主题与 top1/top2 归一化分差，
+        分差小即「代词的先行词客观上不唯一」，是澄清判定的硬证据，也是反问时的现成选项。
         """
         acc = self._accum.get(session_id)
         if not acc:
@@ -376,6 +535,39 @@ class ContextManager:
         # 在方案3 兜底时把代词替换成字面「无标题」，污染检索 query
         if hp and hp != "无标题":
             self._last_entity[session_id] = hp.split(">")[-1].strip()
+        self._update_last_topics(session_id, acc)
+
+    def _update_last_topics(self, session_id: str, acc: Sequence[RetrievalResult]) -> None:
+        """记录上一轮召回的竞争主题 top-N 与 top1/top2 归一化分差。
+
+        主题以 ``heading_path`` 末级去重（同一主题的多个片段只算一次，取其最高分），
+        避免「同一篇笔记切出 5 个 chunk」被误判成 5 个竞争主题。
+        失败一律降级为「无竞争」，不影响主链路。
+        """
+        try:
+            best: dict[str, float] = {}
+            for r in acc:
+                hp = r.metadata.get("heading_path", "") if isinstance(r.metadata, dict) else ""
+                if not hp or hp == "无标题":
+                    continue
+                name = hp.split(">")[-1].strip()
+                if not name:
+                    continue
+                if r.score > best.get(name, float("-inf")):
+                    best[name] = r.score
+            ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
+            self._last_topics[session_id] = [
+                n for n, _ in ranked[: settings.agent_clarify_max_candidates]
+            ]
+            if len(ranked) >= 2 and ranked[0][1] > 0:
+                self._last_topic_margin[session_id] = (
+                    ranked[0][1] - ranked[1][1]
+                ) / ranked[0][1]
+            else:
+                self._last_topic_margin[session_id] = 1.0  # 只有一个主题 = 无竞争
+        except Exception as e:  # noqa: BLE001
+            logger.warning("_update_last_topics 失败，降级为无竞争: %s", e)
+            self._last_topic_margin[session_id] = 1.0
 
     # ── 总预算兜底：已知两段（history + accumulated）之和超总上限时压缩 ──
     def fit_total_budget(

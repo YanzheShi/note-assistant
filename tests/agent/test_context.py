@@ -105,15 +105,44 @@ async def test_condense_degrades_when_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_plan0_skip_without_pronoun_no_llm_call():
-    # 无指代代词 → 直接透传，且根本不调用 LLM（省一次往返）
+    # 无指代代词 且 问题足够长（语义自足）→ 直接透传，且根本不调用 LLM（省一次往返）
     llm = FakeLLM("不该被调用")
     cm = ContextManager(condense_llm=llm)
     hist = [
         {"role": "user", "content": "FlashAttention 是什么"},
         {"role": "assistant", "content": "是一种高效注意力机制"},
     ]
-    out = await cm.condense_question("RAG 是什么", hist)
-    assert out == "RAG 是什么"
+    q = "RAG 的混合检索是怎么实现的"
+    out = await cm.condense_question(q, hist)
+    assert out == q
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan0_short_followup_triggers_llm():
+    """补漏（设计文档 13.3）：零主语省略式追问不含代词，但严重依赖上文。
+
+    「性能呢？」「优缺点」「怎么优化」这类问题过短且历史非空时也必须送 LLM 消解，
+    否则前置拦截会让检索拿着一个没有主语的问题盲跑。
+    """
+    llm = FakeLLM("FlashAttention 的性能如何")
+    cm = ContextManager(condense_llm=llm)
+    hist = [
+        {"role": "user", "content": "FlashAttention 是什么"},
+        {"role": "assistant", "content": "是一种高效注意力机制"},
+    ]
+    out = await cm.condense_question("性能呢？", hist)
+    assert out == "FlashAttention 的性能如何"
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_plan0_short_question_without_history_passthrough():
+    # 短问题但历史为空：无上下文可依，仍然透传、不浪费一次 LLM 往返
+    llm = FakeLLM("不该被调用")
+    cm = ContextManager(condense_llm=llm)
+    out = await cm.condense_question("性能呢？", [])
+    assert out == "性能呢？"
     assert llm.calls == 0
 
 

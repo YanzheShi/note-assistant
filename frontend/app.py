@@ -147,6 +147,7 @@ with st.chat_message("assistant"):
                     "need_rewrite": ("🔄", "信息不足，改写法检索"),
                     "need_more": ("🔍", "信息不足，换策略检索"),
                     "give_up": ("⚠️", "多次无果，生成受限答案"),
+                    "need_clarify": ("❓", "问题指向多个主题，反问澄清"),
                 }
                 icon, label = vmap.get(verdict, ("➡️", verdict))
                 detail = label
@@ -183,6 +184,13 @@ with st.chat_message("assistant"):
 
             elif etype == "done":
                 break
+
+            else:
+                # 兜底：未知事件类型此前会静默穿过整条 if/elif 链——占位符已被清掉、
+                # 却什么也不渲染，表现为「界面卡住」，排查成本极高。这里至少留个痕迹。
+                if trace_container is not None:
+                    with trace_container:
+                        st.caption(f"➡️ 未识别事件：{etype}")
 
         if trace_container is not None:
             with trace_container:

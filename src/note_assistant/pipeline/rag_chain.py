@@ -14,14 +14,14 @@ RAG 完整管线：检索路由 -> 检索 -> 图扩展 -> Rerank -> 生成。
              -> Generator.generate() -> 最终回答
 """
 import asyncio
-import httpx
 import json
 import logging
 import time
 from dataclasses import dataclass, asdict
 from typing import AsyncIterator, List
 
-from note_assistant.config import settings
+from langchain_core.messages import HumanMessage
+from note_assistant.llm.client import get_llm
 from note_assistant.retrieval.types import RetrievalResult
 
 logger = logging.getLogger(__name__)
@@ -141,20 +141,10 @@ class RAGChain:
         """同步调用 LLM 判断是否需要检索（用于 ask 主入口）。"""
         try:
             prompt = self.NEEDS_RETRIEVAL_PROMPT.format(question=question)
-            resp = httpx.post(
-                f"{settings.agnes_base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {settings.agnes_api_key}"},
-                json={
-                    "model": settings.agnes_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0,
-                    "max_tokens": 50,
-                },
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            text = data["choices"][0]["message"]["content"].strip()
+            llm = get_llm(temperature=0, max_tokens=50)
+            resp = llm.invoke([HumanMessage(content=prompt)])
+            text = resp.content if isinstance(resp.content, str) else str(resp.content)
+            text = text.strip()
             # 去掉可能的 markdown 代码块包裹（如 ```json ... ```）
             text = _clean_json_text(text)
             logging.debug(f"路由返回(sync): {text}")
@@ -176,21 +166,10 @@ class RAGChain:
         """异步调用 LLM 判断是否需要检索（用于 ask_stream / ask_with_trace）。"""
         try:
             prompt = self.NEEDS_RETRIEVAL_PROMPT.format(question=question)
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{settings.agnes_base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.agnes_api_key}"},
-                    json={
-                        "model": settings.agnes_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0,
-                        "max_tokens": 50,
-                    },
-                    timeout=10.0,
-                )
-            resp.raise_for_status()
-            data = resp.json()
-            text = data["choices"][0]["message"]["content"].strip()
+            llm = get_llm(temperature=0, max_tokens=50)
+            resp = await llm.ainvoke([HumanMessage(content=prompt)])
+            text = resp.content if isinstance(resp.content, str) else str(resp.content)
+            text = text.strip()
             # 去掉可能的 markdown 代码块包裹
             text = _clean_json_text(text)
             logging.debug(f"路由返回(async): {text}")

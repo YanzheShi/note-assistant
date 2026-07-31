@@ -20,7 +20,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from note_assistant.agent import agent as agent_mod
 from note_assistant.agent.cache import SemanticCache
-from note_assistant.agent.context import get_context_manager
+from note_assistant.agent.context import CondenseSignal, get_context_manager
 from note_assistant.agent.store import AgentStore
 from note_assistant.config import settings
 from note_assistant.retrieval.types import RetrievalResult
@@ -198,7 +198,10 @@ def _initial_state(
     condensed: str = "",
     history_messages: Optional[list] = None,
     accumulated: Optional[list] = None,
+    signal: Optional[CondenseSignal] = None,
+    just_clarified: bool = False,
 ) -> dict:
+    sig = signal or CondenseSignal()
     return {
         "messages": [HumanMessage(question)],
         "accumulated": accumulated or [],
@@ -212,6 +215,13 @@ def _initial_state(
         "judge_verdict": "",
         "rewritten_query": "",
         "judge_log": [],
+        # 澄清（clarify-as-terminal）相关：消解置信度作为旁路信号注入，
+        # 与 condense_question 的返回值签名解耦。
+        "clarify_question": "",
+        "condense_confidence": sig.confidence,
+        "condense_candidates": list(sig.candidates),
+        "just_clarified": just_clarified,
+        "clarified": False,
     }
 
 
@@ -220,10 +230,14 @@ async def _prepare_agent_context(
     session_id: str,
     store: Optional[AgentStore],
     effective_history: list,
-) -> tuple[str, List[BaseMessage], List[RetrievalResult], str]:
+) -> tuple[str, List[BaseMessage], List[RetrievalResult], str, CondenseSignal, bool]:
     """入口上下文装配：凝练问题 → 取长程摘要 → 预算裁剪历史 → 跨轮累积 seed → 缓存指纹。
 
-    返回 ``(condensed, history_messages, seed_accumulated, ctx_key)``。
+    返回 ``(condensed, history_messages, seed_accumulated, ctx_key, signal, just_clarified)``。
+
+    后两项服务于澄清（clarify-as-terminal）：``signal`` 是本次指代消解的旁路置信度信号
+    （不改 ``condense_question -> str`` 的签名），``just_clarified`` 表示上一轮刚反问过 ——
+    两者共同构成 ``_should_clarify`` 级联守卫的输入，确保「反问是级联终点而非首选」。
     """
     cm = get_context_manager()
     # 1) 问题凝练（消指代），供路由/检索/缓存指纹使用
@@ -248,7 +262,12 @@ async def _prepare_agent_context(
 
     # 6) 缓存指纹：凝练问题 + 摘要 hash，不同上下文 → 不同 key，防串台
     ctx_key = cm.context_key(condensed, summary_text)
-    return condensed, history_messages, seed, ctx_key
+
+    # 7) 澄清旁路信号：condense 阶段记下的置信度/候选主题 + 「上一轮是否刚反问过」
+    #    pop 语义（读取即清除）保证连续反问最多发生一次，不会把用户困在问句里。
+    signal = cm.get_condense_signal(session_id)
+    just_clarified = cm.pop_clarified(session_id)
+    return condensed, history_messages, seed, ctx_key, signal, just_clarified
 
 
 async def ainvoke(
@@ -285,8 +304,8 @@ async def ainvoke(
     else:
         effective_history = history or []
 
-    # 上下文装配：凝练问题 + 预算历史 + 跨轮累积 + 缓存指纹
-    condensed, history_messages, seed, ctx_key = await _prepare_agent_context(
+    # 上下文装配：凝练问题 + 预算历史 + 跨轮累积 + 缓存指纹 + 澄清旁路信号
+    condensed, history_messages, seed, ctx_key, signal, just_clarified = await _prepare_agent_context(
         question, session_id, store, effective_history
     )
 
@@ -327,6 +346,8 @@ async def ainvoke(
             condensed=condensed,
             history_messages=history_messages,
             accumulated=seed,
+            signal=signal,
+            just_clarified=just_clarified,
         )
     )
     elapsed = (time.perf_counter() - _t0) * 1000
@@ -352,7 +373,12 @@ async def ainvoke(
             "elapsed_ms": round(elapsed),
         },
     )
-    if cache.enabled:
+    clarified = bool(final.get("clarified"))
+    if clarified:
+        # 反问轮：记下 session 标记，下一轮 _should_clarify 直接否决（不连续反问）
+        get_context_manager().mark_clarified(session_id)
+    # 澄清问句不入缓存：否则同一个模糊问题再问一次会命中缓存里的问句，永远吐反问
+    if cache.enabled and not clarified:
         cache.put(question, result.answer, result.sources, result.trajectory, ctx_key=ctx_key)
     await _record_run(store, session_id, rid, question, result, effective_history)
     _post_run_context(store, session_id, get_context_manager(), final.get("accumulated", seed), question, result.answer)
@@ -446,8 +472,8 @@ async def astream(
         effective_history = history or []
     cache = _get_cache()
 
-    # 上下文装配（与 ainvoke 同源）：凝练 / 预算历史 / 跨轮累积 / 缓存指纹
-    condensed, history_messages, seed, ctx_key = await _prepare_agent_context(
+    # 上下文装配（与 ainvoke 同源）：凝练 / 预算历史 / 跨轮累积 / 缓存指纹 / 澄清信号
+    condensed, history_messages, seed, ctx_key, signal, just_clarified = await _prepare_agent_context(
         question, session_id, store, effective_history
     )
 
@@ -495,11 +521,13 @@ async def astream(
     state = _initial_state(
         question, effective_history,
         condensed=condensed, history_messages=history_messages, accumulated=seed,
+        signal=signal, just_clarified=just_clarified,
     )
     seq = 0
     traj: List[dict] = []
     accumulated: List[RetrievalResult] = []
     final_answer = ""
+    clarified = False
 
     async for chunk in graph.astream(state, stream_mode="updates"):
         for node, update in chunk.items():
@@ -546,10 +574,14 @@ async def astream(
                 }
             elif node == "rewrite":
                 ev = {"type": "thought", "content": "（反思改写）重新检索"}
-            elif node in ("generate", "direct_chat"):
+            elif node in ("generate", "direct_chat", "clarify"):
+                # clarify 复用 answer 事件类型：clarify-as-terminal 的终止语义与
+                # generate / direct_chat 完全同构，前端零改动即可渲染澄清问句。
                 ans = update.get("answer", "")
                 if ans:
                     final_answer = ans
+                    if update.get("clarified"):
+                        clarified = True
                     ev = {"type": "answer", "content": ans}
             elif node == "graph_expand_node":
                 # 静默节点：沿 [[wikilinks]] 扩展关联笔记，只改 accumulated。
@@ -598,7 +630,11 @@ async def astream(
         if session_id:
             await asyncio.to_thread(store.append_turn, session_id, "user", question)
             await asyncio.to_thread(store.append_turn, session_id, "assistant", final_answer)
-    if cache.enabled:
+    if clarified:
+        # 反问轮：置位 session 标记，下一轮 _should_clarify 直接否决（不连续反问）
+        get_context_manager().mark_clarified(session_id)
+    # 澄清问句不入缓存：否则同一个模糊问题再问会命中缓存里的问句，形成反问死循环
+    if cache.enabled and not clarified:
         cache.put(question, final_answer, sources, traj, ctx_key=ctx_key)
     elapsed = (time.perf_counter() - _t0) * 1000
     logger.info(

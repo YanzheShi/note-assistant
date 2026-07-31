@@ -11,7 +11,7 @@ import pytest
 
 from pathlib import Path
 
-from note_assistant.config import settings
+from note_assistant.config import Settings, settings
 from note_assistant.indexing.splitter import make_splitters, split_v1, split_v2
 from note_assistant.indexing.types import DocNode
 
@@ -36,8 +36,12 @@ SAMPLE = (
 )
 
 
-def test_default_strategy_is_v2():
-    assert settings.chunking_strategy == "v2"
+def test_default_strategy_is_v2(monkeypatch):
+    # 隔离 .env 与 load_dotenv 已注入 os.environ 的覆盖（config.py 第 7 行
+    # load_dotenv 会把 CHUNKING_STRATEGY=v2b 灌进 os.environ），验证「代码声明的
+    # 默认值」而非运行环境覆盖后的值。本机运行默认是 v2b，不代表代码默认变了。
+    monkeypatch.delenv("CHUNKING_STRATEGY", raising=False)
+    assert Settings(_env_file=None).chunking_strategy == "v2"
 
 
 def test_v2_produces_heading_path():

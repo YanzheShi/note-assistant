@@ -61,9 +61,14 @@ class AgentState(TypedDict):
     history: list                                # 预算裁剪后的历史 dicts（generate_node）
     history_messages: list                       # 预算裁剪后的历史 BaseMessage（agent/direct_chat）
     answer: str
-    judge_verdict: str                           # 最新 Judge 判定：sufficient/need_rewrite/need_more/give_up
+    judge_verdict: str                           # 最新 Judge 判定：sufficient/need_rewrite/need_more/give_up/need_clarify
     rewritten_query: str                         # Judge 建议的改写查询
     judge_log: Annotated[list, operator.add]     # 每轮 Judge 决策事件（可观测、可回放）
+    clarify_question: str                        # Judge 给出的澄清问句（need_clarify 时）
+    condense_confidence: float                   # 入口消解置信度（旁路信号，1.0=完全可信）
+    condense_candidates: List[str]               # 上一轮召回的竞争主题，供澄清时作选项
+    just_clarified: bool                         # 上一轮刚反问过 → 本轮禁止再反问
+    clarified: bool                              # 本轮答案是澄清问句（runner 据此跳过缓存收录）
 
 
 # ──────────────────────────────────────────────
@@ -138,13 +143,22 @@ JUDGE_SYSTEM = (
     "- relevance_score == 0.5 → verdict = \"need_rewrite\"，并在 rewritten_query 给出改写\n"
     "- relevance_score == 0.0 → 若检索次数 < 2，verdict = \"need_more\"；否则 verdict = \"give_up\"\n"
     "\n"
+    "例外档位 need_clarify（极少数情况，判定标准极严）：\n"
+    "- 仅当片段**同时命中两个及以上互不相干的主题**，且无法从问题本身判断用户指的是哪一个时，"
+    "才可判 verdict = \"need_clarify\"，并在 clarify_question 给出一句带具体选项的澄清问句。\n"
+    "- 澄清问句必须**从检索到的真实片段标题中取选项**，形如"
+    "「你问的是 A 还是 B？」；严禁输出「你能说得更清楚一点吗」这类把负担甩给用户的空泛问法。\n"
+    "- 若靠改写查询就能解决，一律判 need_rewrite，不要判 need_clarify。\n"
+    "- 若片段虽多但都围绕同一主题，判 sufficient，不要判 need_clarify。\n"
+    "- 若片段为空或全无关，判 need_more / give_up，不要判 need_clarify。\n"
+    "\n"
     "关键原则：\n"
     "- 只要片段的标题或内容与问题的核心实体/主题直接匹配，且包含了回答问题所需的关键信息（如阶段、步骤、列表），就必须判 >= 1.0。\n"
     "- 不要因为'希望找到更详细/更完整的资料'就判 need_rewrite。sufficient 不代表完美，代表'足够回答'。\n"
     "- 检索次数已达上限时，即使觉得不够也判 give_up，不要无限循环。\n"
     "\n"
     "只输出 JSON 对象：\n"
-    "{\"verdict\": \"sufficient|need_rewrite|need_more|give_up\", \"relevance_score\": 0.0到2.0, \"reason\": \"简短理由\", \"rewritten_query\": \"仅 need_rewrite 时填写，其余为空字符串\"}\n"
+    "{\"verdict\": \"sufficient|need_rewrite|need_more|give_up|need_clarify\", \"relevance_score\": 0.0到2.0, \"reason\": \"简短理由\", \"rewritten_query\": \"仅 need_rewrite 时填写，其余为空字符串\", \"clarify_question\": \"仅 need_clarify 时填写带选项的澄清问句，其余为空字符串\"}\n"
     "\n"
     "示例：\n"
     "问题：Agent 开发官方框架整体路线图是什么？\n"
@@ -153,7 +167,11 @@ JUDGE_SYSTEM = (
     "\n"
     "问题：Agent 开发官方框架整体路线图是什么？\n"
     "片段：一篇讲 LangGraph 基础用法的笔记，未提及整体路线图。\n"
-    "输出：{\"verdict\": \"need_rewrite\", \"relevance_score\": 0.5, \"reason\": \"片段仅涉及 LangGraph 单点技术，缺少路线图整体信息\", \"rewritten_query\": \"Agent 开发官方框架 学习路径 整体路线图 阶段规划\"}\n"
+    "输出：{\"verdict\": \"need_rewrite\", \"relevance_score\": 0.5, \"reason\": \"片段仅涉及 LangGraph 单点技术，缺少路线图整体信息\", \"rewritten_query\": \"Agent 开发官方框架 学习路径 整体路线图 阶段规划\", \"clarify_question\": \"\"}\n"
+    "\n"
+    "问题：那个的改进点是什么？\n"
+    "片段：《FlashAttention-2 算法改进》与《Paged Attention 显存管理》两篇，主题互不相干，分数接近。\n"
+    "输出：{\"verdict\": \"need_clarify\", \"relevance_score\": 0.5, \"reason\": \"片段命中两个互不相干主题，无法判断指代对象\", \"rewritten_query\": \"\", \"clarify_question\": \"你问的是 FlashAttention-2 的算法改进，还是 Paged Attention 的显存管理？\"}\n"
 )
 
 GENERATE_SYSTEM = (
@@ -187,11 +205,42 @@ def _extract_json(text: str) -> str:
     return text
 
 
+_VALID_VERDICTS = ("sufficient", "need_rewrite", "need_more", "give_up", "need_clarify")
+
+
 def _norm_verdict(v: str) -> str:
     v = (v or "").strip().lower()
-    if v not in ("sufficient", "need_rewrite", "need_more", "give_up"):
+    if v not in _VALID_VERDICTS:
         return "sufficient"  # 默认充分，避免无限循环
     return v
+
+
+def _format_judge_evidence(results: List[RetrievalResult]) -> str:
+    """把已检索片段格式化成 Judge 的证据清单（P0：修复 Judge 盲判）。
+
+    改造前 ``reflect`` 只把 ``len(accumulated)`` 这个**数字**传给 Judge，
+    而 ``JUDGE_SYSTEM`` 开头声称「给定用户问题与已检索到的知识库片段」——
+    Judge 一直在盲判，``relevance_score`` 全靠猜，这也是原 prompt 不得不用
+    极重措辞去压 need_rewrite 的根因。
+
+    这里按分数降序取 top-N，每条给出「标题 + heading_path + 正文摘要」。
+    正文按 ``agent_judge_evidence_chars`` 截断，避免撑爆 Judge 的上下文
+    （Judge 只需判断相关性，不需要读全文）。
+    """
+    if not results:
+        return "（本轮未检索到任何片段）"
+    ranked = sorted(results, key=lambda r: r.score, reverse=True)
+    ranked = ranked[: settings.agent_judge_evidence_top_n]
+    limit = settings.agent_judge_evidence_chars
+    parts = []
+    for i, r in enumerate(ranked, 1):
+        meta = r.metadata if isinstance(r.metadata, dict) else {}
+        title = meta.get("title", "未知笔记")
+        heading = meta.get("heading_path", "")
+        head = f"[{i}] 《{title}》" + (f" — {heading}" if heading else "")
+        body = (r.page_content or "").strip().replace("\n", " ")[:limit]
+        parts.append(f"{head}\n{body}")
+    return "\n\n".join(parts)
 
 
 def _format_context(results: List[RetrievalResult]) -> str:
@@ -334,17 +383,22 @@ async def reflect(state: AgentState) -> dict:
       - sufficient / give_up → 进入生成（give_up 会触发降级提示）
       - need_rewrite → 写入改写查询，走 rewrite 节点重检
       - need_more    → 不改写，换检索策略重检
+      - need_clarify → 片段命中多个不相干主题，写入澄清问句（需通过 ``_should_clarify`` 守卫）
     达到 max_iter 时无论判定如何都强制进入生成（硬性降级）。
+
+    P0：这里必须把**片段内容**传给 Judge。改造前只传了片段数量，Judge 在盲判。
     """
     llm = get_llm(temperature=0.0)
     label = "达上限（强制生成）" if state["iteration"] >= MAX_ITER else "未达上限"
     q = state.get("condensed_question") or state["question"]
+    evidence = _format_judge_evidence(state["accumulated"])
     try:
         msgs: list[BaseMessage] = [
             SystemMessage(JUDGE_SYSTEM),
             HumanMessage(
                 f"用户问题：{q}\n\n"
-                f"当前已收集片段数：{len(state['accumulated'])}\n"
+                f"=== 已检索到的知识库片段（共 {len(state['accumulated'])} 条，"
+                f"以下为分数最高的若干条）===\n{evidence}\n\n"
                 f"已检索轮次：{state['iteration']}/{MAX_ITER}（{label}）\n\n"
                 "请判断信息是否足够回答（输出 JSON）。"
             ),
@@ -353,10 +407,12 @@ async def reflect(state: AgentState) -> dict:
         data = json.loads(_extract_json(str(resp.content)))
         verdict = _norm_verdict(data.get("verdict"))
         rewritten = str(data.get("rewritten_query") or "").strip()
+        clarify_q = str(data.get("clarify_question") or "").strip()
     except Exception:
         # Judge 异常时保守处理：已达到上限就生成，否则再查一轮
         verdict = "sufficient" if state["iteration"] >= MAX_ITER else "need_more"
         rewritten = ""
+        clarify_q = ""
         data = {}
     logger.info(
         "reflect.decision",
@@ -364,16 +420,19 @@ async def reflect(state: AgentState) -> dict:
             "iteration": state["iteration"],
             "verdict": verdict,
             "rewritten_query": rewritten,
+            "evidence_items": len(state["accumulated"]),
         },
     )
     return {
         "judge_verdict": verdict,
         "rewritten_query": rewritten,
+        "clarify_question": clarify_q,
         "judge_log": [{
             "iteration": state["iteration"],
             "verdict": verdict,
             "reason": data.get("reason", ""),
             "rewritten_query": rewritten,
+            "clarify_question": clarify_q,
         }],
     }
 
@@ -484,6 +543,36 @@ async def generate_node(state: AgentState) -> dict:
     return {"answer": answer, "messages": [AIMessage(answer)]}
 
 
+async def clarify_node(state: AgentState) -> dict:
+    """澄清节点（clarify-as-terminal）：把澄清问句当答案返回，本次请求正常结束。
+
+    刻意**不挂起**任何东西 —— 不 interrupt、不存 checkpoint、不占协程。
+    走 END 后终止语义与 ``generate`` / ``direct_chat`` 完全同构，
+    ``runner`` 已有的收尾链路（set_answer / finish_run / append_turn）不改就是对的。
+
+    跨轮恢复不需要任何新机制：澄清问句作为普通 assistant 轮次落进 ``session_turns``，
+    用户下一轮回答进来时，``condense_question`` 面对
+    「user: 那个的改进 / assistant: 你问的是 A 还是 B？ / user: 第一个」
+    这段历史本就能合成出完整问题 —— 指代消解本来就是它的职责。
+    """
+    q = (state.get("clarify_question") or "").strip()
+    if not q:
+        # 守卫兜底：理论上 _should_clarify 已拦截，这里再防一层空问句
+        q = "你的问题可能指向多个不同主题，能补充说明一下具体想了解哪一方面吗？"
+    candidates = state.get("condense_candidates") or []
+    logger.info(
+        "clarify.ask",
+        extra={
+            "question_preview": q[:60],
+            "candidates": candidates[:3],
+            "condense_confidence": state.get("condense_confidence", 1.0),
+        },
+    )
+    # clarified=True 是给 runner 的显式标记：澄清问句**绝不能进语义缓存**，
+    # 否则同一个模糊问题第二次问会永远命中缓存里的问句，形成「反问死循环」。
+    return {"answer": q, "messages": [AIMessage(q)], "clarified": True}
+
+
 async def direct_chat(state: AgentState) -> dict:
     """直接对话节点：闲聊/人设类问题，不检索，友好回复。接入历史不再失忆。"""
     llm = get_llm(temperature=0.6, max_tokens=1024)
@@ -512,11 +601,56 @@ def _agent_branch(state: AgentState) -> str:
     return "generate"
 
 
+def _should_clarify(state: AgentState) -> bool:
+    """澄清级联守卫：把「多档消解都不行才问」编码成代码。
+
+    clarify 是**级联的终点**，不是与 rewrite 并列的分支。五道闸门全过才反问：
+
+        开关关闭                → False（默认关，行为与改造前逐字节等价）
+        Judge 未判 need_clarify → False
+        无澄清问句              → False（拒绝「你能说清楚点吗」这类空澄清）
+        消解置信度 >= 阈值      → False（消解本就成功，不该打扰用户）
+        上一轮刚反问过          → False（防连续追问）
+
+    第四道闸门是关键：Judge 只看得到「检索结果指向多主题」，看不到「入口消解
+    到底靠不靠谱」。若 LLM 改写与规则替换互相印证、上一轮主题也不存在竞争
+    （confidence 0.9），那多主题很可能只是召回噪声，改写重检即可，不必反问。
+    """
+    logger.info(
+        "CLARIFY_GATE_IN enabled=%s verdict=%s q=%r conf=%s thr=%s just=%s",
+        settings.agent_clarify_enabled,
+        state.get("judge_verdict"),
+        (state.get("clarify_question") or "")[:20],
+        state.get("condense_confidence", 1.0),
+        settings.agent_clarify_confidence_threshold,
+        state.get("just_clarified"),
+    )
+    if not settings.agent_clarify_enabled:
+        return False
+    if state.get("judge_verdict") != "need_clarify":
+        return False
+    if not (state.get("clarify_question") or "").strip():
+        return False
+    conf = state.get("condense_confidence", 1.0)
+    if conf is None:
+        conf = 1.0
+    if conf >= settings.agent_clarify_confidence_threshold:
+        return False
+    if state.get("just_clarified"):
+        return False
+    return True
+
+
 def _reflect_branch(state: AgentState) -> str:
+    if _should_clarify(state):
+        return "clarify"
     if state["iteration"] >= MAX_ITER:
         return "rerank_exit" if settings.agent_reranker_exit_enabled else "generate"
     verdict = state.get("judge_verdict", "sufficient")
-    if verdict in ("sufficient", "give_up"):
+    # 未通过澄清守卫的 need_clarify 降级为 sufficient —— 与改造前
+    # （need_clarify 不在 _norm_verdict 白名单、被静默归一成 sufficient）行为一致，
+    # 保证 agent_clarify_enabled=False 时整条链路逐字节等价。
+    if verdict in ("sufficient", "give_up", "need_clarify"):
         return "rerank_exit" if settings.agent_reranker_exit_enabled else "generate"
     return "rewrite"  # need_rewrite / need_more
 
@@ -538,6 +672,7 @@ def build_graph():
     g.add_node("rewrite", rewrite_node)
     g.add_node("generate", generate_node)
     g.add_node("direct_chat", direct_chat)
+    g.add_node("clarify", clarify_node)
 
     g.add_edge(START, "router")
     g.add_conditional_edges(
@@ -550,10 +685,18 @@ def build_graph():
     g.add_edge("graph_expand_node", "rerank_loop" if settings.agent_reranker_loop_enabled else "reflect")
     g.add_edge("rerank_loop", "reflect")
     g.add_conditional_edges(
-        "reflect", _reflect_branch, {"generate": "generate", "rerank_exit": "rerank_exit", "rewrite": "rewrite"}
+        "reflect",
+        _reflect_branch,
+        {
+            "generate": "generate",
+            "rerank_exit": "rerank_exit",
+            "rewrite": "rewrite",
+            "clarify": "clarify",
+        },
     )
     g.add_edge("rerank_exit", "generate")
     g.add_edge("rewrite", "agent")
     g.add_edge("generate", END)
     g.add_edge("direct_chat", END)
+    g.add_edge("clarify", END)  # clarify-as-terminal：不挂起，正常结束本次请求
     return g.compile()

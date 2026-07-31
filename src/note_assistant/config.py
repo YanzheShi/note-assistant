@@ -132,5 +132,21 @@ class Settings(BaseSettings):
     # 跨轮累积按 token 预算硬截断时保留的最大片段数（辅助上限）
     agent_accumulated_max_items: int = 30
 
+    # === 澄清 / 反问（clarify-as-terminal，方案 B）===
+    # 方案0 前置拦截补漏：问题字数 < 该阈值且历史非空 → 也送 LLM 消解。
+    # 修复「性能呢？/ 优缺点 / 怎么优化」这类零主语追问从未进入消解的漏洞。
+    agent_condense_short_threshold: int = 8
+    # 澄清总开关。关闭时所有澄清分支短路，行为与改造前逐字节等价。
+    agent_clarify_enabled: bool = True
+    # 消解置信度阈值：低于该值才允许进入澄清候选（级联终点约束）
+    agent_clarify_confidence_threshold: float = 0.6
+    # 上一轮召回 top1/top2 归一化分差低于此值 → 视为存在竞争主题
+    agent_clarify_topic_margin: float = 0.15
+    # last_entity 槽位记录的竞争主题条数上限
+    agent_clarify_max_candidates: int = 3
+    # 给 Judge 的证据片段条数 / 每条正文摘要字数（P0 盲判修复）
+    agent_judge_evidence_top_n: int = 5
+    agent_judge_evidence_chars: int = 200
+
 
 settings = Settings()
