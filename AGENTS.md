@@ -24,8 +24,26 @@ uv run pytest tests/indexing/test_vault_loader.py::test_scan_excludes_hidden_dir
 # Run the splitter CLI (loads vault, compares v1 vs v2 chunking)
 uv run python -m note_assistant.indexing.splitter
 
-# Run full indexing pipeline (requires Ollama running)
+# Full indexing pipeline (requires Ollama running)
 uv run python -m note_assistant.indexing.ingestor
+
+# Incremental index (only changed files)
+uv run python scripts/reindex.py
+
+# End-to-end smoke test
+uv run python scripts/demo_e2e.py
+
+# Run evaluation suite (retrieval + generation + Ragas)
+uv run python scripts/run_eval.py
+
+# Compare retrieval strategies (A vector / B hybrid / C hybrid+rerank)
+uv run python scripts/compare_retrieval.py
+
+# Start backend (default port 8005)
+uv run uvicorn note_assistant.api.main:app --host 0.0.0.0 --port 8005 --reload
+
+# Start Streamlit frontend
+uv run streamlit run frontend/app.py
 
 # Lint
 uv run ruff check .
@@ -33,7 +51,7 @@ uv run ruff check .
 
 ## Architecture
 
-The package lives under `src/note_assistant/`. The codebase is in **early stages** — the `indexing` module is functional; `retrieval`, `generation`, `pipeline`, `api`, and `evaluation` are mostly stubs awaiting implementation.
+The package lives under `src/note_assistant/`. The codebase is **functional end-to-end**: `indexing`, `retrieval`, `generation`, `pipeline`, `agent`, `api`, `evaluation`, and the Streamlit frontend are all implemented and tested. See the real module status table below.
 
 ### Data Flow (indexing)
 
@@ -43,7 +61,7 @@ VaultLoader → DocNode → RichPreprocessor → split_v2 → restore → Ingest
 
 1. **`indexing/vault_loader.py`** — Scans the vault, parses YAML front matter (fault-tolerant: bad FM is skipped, title falls back to filename), extracts `[[wikilinks]]` (deduped, order-preserved), and the heading tree. Returns `DocNode` objects (defined in `indexing/types.py`).
 2. **`indexing/preprocessor.py`** — `RichPreprocessor` extracts rich structures (code fences, tables, mermaid, images) into placeholders so the splitter doesn't mangle them. After splitting, `restore()` puts originals back. Also generates "summary chunks" for each extracted structure so they're searchable.
-3. **`indexing/splitter.py`** — Two-layer strategy: `MarkdownHeaderTextSplitter` (preserves `#`/`##`/`###`/`####` hierarchy) → `RecursiveCharacterTextSplitter` (800 char / 150 overlap, Chinese-aware with `。` in separators). Produces chunks with `heading_path` metadata like `"一、背景 > 检索方法"`. v1 (flat Recursive) and v3 (per-chunk wikilinks) are stubbed for comparison.
+3. **`indexing/splitter.py`** — Two-layer strategy: `MarkdownHeaderTextSplitter` (preserves `#`/`##`/`###`/`####` hierarchy) → `RecursiveCharacterTextSplitter` (800 char / 150 overlap, Chinese-aware with `。` in separators). Produces chunks with `heading_path` metadata like `"一、背景 > 检索方法"`. `split_v1` (flat Recursive) and `split_v2` are baselines; **`split_v2b` (parent-child dual storage) is fully implemented** — child chunks (800) go to ChromaDB for retrieval, parent blocks (whole section) go to `ParentDocstore` and are expanded back after a hit.
 4. **`indexing/embedder.py`** — Wraps Ollama's `bge-m3:latest` model (1024-dim dense vectors).
 5. **`indexing/ingestor.py`** — `Ingestor.index_vault()` ties it all together: load → preprocess → split → restore → enrich with wikilinks/metadata → upsert into ChromaDB (cosine similarity).
 
@@ -58,7 +76,7 @@ VaultLoader → DocNode → RichPreprocessor → split_v2 → restore → Ingest
 
 ### Configuration
 
-All config is in `src/note_assistant/config.py` via `pydantic-settings`. Reads `.env` and `.env.local` (override). Key settings: `vault_path`, `ollama_base_url`, `embed_model`, `chroma_persist_dir`, `deepseek_api_key`, `chunk_size`, `bm25_weight`/`dense_weight`, `top_k_retrieve`, `top_k_rerank`.
+All config is in `src/note_assistant/config.py` via `pydantic-settings`. Reads `.env` and `.env.local` (override). Key settings: `vault_path`, `ollama_base_url`, `embed_model`, `chroma_persist_dir`, `chunking_strategy` (`v1`/`v2`/`v2b`), `agent_base_url`/`agent_api_key`/`agent_model` (unified LLM channel via `llm/client.py::get_llm()`), `deepseek_*` (alternate), `bm25_weight`/`dense_weight`, `top_k_retrieve`, `top_k_rerank`, `agent_max_iter`, `agent_clarify_enabled`, `agent_session_enabled`.
 
 ### What's a Stub vs. What's Real
 
@@ -66,15 +84,17 @@ All config is in `src/note_assistant/config.py` via `pydantic-settings`. Reads `
 |---|---|
 | `indexing/vault_loader.py` | ✅ Functional |
 | `indexing/preprocessor.py` | ✅ Functional |
-| `indexing/splitter.py` | ✅ v1 + v2 implemented; v2b/v3 stubbed |
+| `indexing/splitter.py` | ✅ v1 + v2 + **v2b (parent-child) implemented** |
 | `indexing/embedder.py` | ✅ Functional (requires Ollama) |
 | `indexing/ingestor.py` | ✅ Functional (requires Ollama + vault) |
-| `retrieval/` | 🚧 Stub only |
-| `generation/` | 🚧 Stub only |
-| `pipeline/` | 🚧 Stub only |
-| `api/` | 🚧 Stub only |
-| `evaluation/` | 🚧 Stub only |
-| `frontend/app.py` | 🚧 Placeholder (`st.title('Obsidian RAG')`) |
+| `indexing/sync.py` | ✅ Incremental index (mtime + sha256) |
+| `retrieval/` | ✅ Functional: hybrid (dense+sparse), structural score, ParentDocstore, reranker, query_rewrite, WikiGraph, BM25 |
+| `generation/generator.py` | ✅ Functional (LangChain prompt + streaming) |
+| `pipeline/rag_chain.py` | ✅ Production Naive RAG path (used by `/ask*`) |
+| `agent/` | ✅ Functional: LangGraph StateGraph, 7 tools, ContextManager, SemanticCache, AgentStore (SQLite), runner, clarify/condense |
+| `api/main.py` | ✅ Functional: `/ask`, `/ask_stream`, `/ask_trace`, `/agent/ask`, `/agent/ask_stream`, `/agent/runs/{id}`, `/agent/sessions/{id}`, `/health`, `/config`, `/reindex` |
+| `evaluation/` | ✅ Functional: retrieval + generation + Ragas + trajectory metrics |
+| `frontend/app.py` | ✅ Functional Streamlit chat UI (trace mode, source fold) |
 
 ## Testing
 

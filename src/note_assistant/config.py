@@ -39,9 +39,6 @@ class Settings(BaseSettings):
     agent_api_key: str
     agent_base_url: str
     agent_model: str
-    deepseek_api_key: str
-    deepseek_base_url: str = "https://api.deepseek.com/v1"
-    llm_model: str = "deepseek-v4-flash"
 
     # === LangSmith (Tracing) ===
     langsmith_tracing_enabled: bool = True

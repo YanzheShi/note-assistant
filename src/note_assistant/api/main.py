@@ -455,7 +455,7 @@ async def config():
         top_k_rerank=settings.top_k_rerank,
         graph_hop=1,                       # 当前固定 1 跳，可在 settings 中配置
         embed_model=settings.embed_model,
-        llm_model=settings.llm_model,
+        llm_model=settings.agent_model,
     )
 
 
