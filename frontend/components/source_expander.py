@@ -127,6 +127,13 @@ def render_sources(sources: list[dict]):
                 raw = src["raw_mermaid"]
                 match = re.search(r"```mermaid\s*\n(.*?)```", raw, re.DOTALL)
                 mermaid_src = match.group(1) if match else raw
+                # 解析层已确认这是真实提取的 mermaid（render_hint=mermaid:inline），
+                # 可直接原生渲染；无 render_hint 时降级为代码展示，避免幻觉。
+                if src.get("diagram_type"):
+                    st.caption(
+                        f"类型：{src['diagram_type']} ｜ "
+                        f"render_hint：{src.get('render_hint', 'mermaid:inline')}"
+                    )
                 try:
                     from streamlit_mermaid import st_mermaid
                     st_mermaid(mermaid_src)

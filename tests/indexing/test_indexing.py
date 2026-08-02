@@ -83,10 +83,10 @@ title: Test
         assert len(pp.extracted) == 1
         assert pp.extracted[0].kind == "table"
 
-    def test_mermaid_extracted_as_code_fence(self, tmp_path):
+    def test_mermaid_extracted_as_mermaid_not_code(self, tmp_path):
         """
-        mermaid 块会被 code fence 先捕获为 code 类型。
-        这是当前预处理器的行为：code fence 保护先于 mermaid 抽取。
+        P1 修复：```mermaid 围栏不能被 code fence 保护吞掉，必须被 _extract_mermaid
+        捕获为 kind="mermaid"（设计文档 5.B.4.4 的前提）。普通代码围栏仍应被当 code 捕获。
         """
         node = _make_node(tmp_path, "mermaid.md", """---
 title: Test
@@ -99,16 +99,27 @@ graph TD
     A[开始] --> B[结束]
 ```
 
+```python
+def f():
+    return 1
+```
+
 正文。
 """)
         pp = RichPreprocessor()
         cleaned, _ = pp.process_with_meta(node)
 
-        # mermaid 被 code fence 正则先捕获
+        # mermaid 块被抽成 MERMAID_UID 占位符（源存活在 ExtractedChunk 里），
+        # 普通 python 代码被抽成 CODE_UID 占位符
+        assert "[MERMAID_UID_" in cleaned
         assert "<CODE_UID_" in cleaned
-        assert "graph TD" not in cleaned
-        assert len(pp.extracted) == 1
-        assert pp.extracted[0].kind == "code"
+
+        kinds = {e.kind for e in pp.extracted}
+        assert "mermaid" in kinds, "mermaid 必须被抽成 kind=mermaid"
+        assert "code" in kinds, "普通代码围栏仍应被当 code 捕获"
+        mermaid_ext = [e for e in pp.extracted if e.kind == "mermaid"][0]
+        assert "graph TD" in mermaid_ext.raw
+        assert mermaid_ext.placeholder.startswith("[MERMAID_UID_")
 
     def test_extract_image(self, tmp_path):
         """Obsidian embed 图片应被替换为占位符"""

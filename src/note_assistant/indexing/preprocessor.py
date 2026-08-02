@@ -26,8 +26,19 @@ def strip_placeholders(text: str) -> str:
 
 
 class RichPreprocessor:
-    def __init__(self):
+    def __init__(self, *, image_enricher=None):
+        """
+        Args:
+            image_enricher: 可选钩子，签名 `f(ext: ExtractedChunk, heading_path: str)
+                -> Optional[tuple[str, dict]]`。返回 (富摘要文本, 额外 metadata) 时，
+                图片 summary chunk 使用该结果（如 VLM 结构化理解 / SVG 原生解析的产出）；
+                返回 None 时退化为默认摘要（只 alt+上下文）。
+
+                默认 None：不触发任何取图/VLM，完全保持原行为（离线、无网、零成本）。
+                生产环境由 ingestor 注入真实 enricher（见 indexing/understanding.py）。
+        """
         self.extracted: list[ExtractedChunk] = []
+        self._image_enricher = image_enricher
         # placeholder → heading_path，在 restore() 阶段回填。
         # 富结构被抽走时还不知道它落在哪一节，只有切分后的 chunk 才带 heading_path，
         # 因此由 restore() 反查，供 generate_summaries() 给 summary chunk 补章节定位。
@@ -43,14 +54,17 @@ class RichPreprocessor:
         self._placeholder_heading = {}
         text = md_text
 
-        # P1: code fence 保护（必须在最前面，防 MarkdownHeaderTextSplitter 误解析）
+        # P1: 抽取 Mermaid（必须在 code fence 保护之前！否则 ```mermaid 会被
+        #      _protect_code_fences 当普通代码块抢先捕获成 kind="code"，设计文档
+        #      5.B.4.4 期望的 ExtractedChunk(kind="mermaid") 永远到不了）。
+        text = self._extract_mermaid(text)
+
+        # P2: code fence 保护（防 MarkdownHeaderTextSplitter 误解析；此时 mermaid
+        #      已是 MERMAID_UID 占位符，不会再被误伤）
         text = self._protect_code_fences(text)
 
-        # P2: 抽取表格
+        # P3: 抽取表格
         text = self._extract_tables(text)
-
-        # P3: 抽取 Mermaid
-        text = self._extract_mermaid(text)
 
         # P4: 抽取图片
         text = self._extract_images(text, context_window=80)
@@ -147,6 +161,9 @@ class RichPreprocessor:
         """
         summary_chunks = []
         for ext in self.extracted:
+            # 各分支可往 meta_extra 注入额外 metadata（如 mermaid 的 render_hint）。
+            meta_extra: dict = {}
+
             if ext.kind == "table":
                 # 表格：caption 取前一行 + 列数信息
                 col_count = max(ext.raw.count('|') - 1, 1)
@@ -154,20 +171,46 @@ class RichPreprocessor:
                 summary = f"表格（约{col_count}列）: {ext.context or first_row}"
 
             elif ext.kind == "mermaid":
-                # Mermaid：取图类型 + 前一行 caption
-                graph_type_match = re.match(r'(graph|sequenceDiagram|classDiagram|'
-                                            r'stateDiagram|erDiagram|gantt|pie)',
-                                            ext.raw, re.IGNORECASE)
-                graph_type = graph_type_match.group(1) if graph_type_match else "图"
-                summary = f"Mermaid {graph_type} 图: {ext.context or '流程图'}"
+                # Mermaid：P1 原生解析层（5.B.4.4）——把图解析成 DiagramGraph，
+                # 节点/边 label 拼成结构化文本入索引（比旧式「图类型 + 前一行 caption」
+                # 信息密度高得多），并写 render_hint 供前端原生渲染（mermaid.render）。
+                # 解析失败（罕见）降级为旧弱摘要，绝不中断索引。
+                # P1-b：原始 mermaid 源码恒入 metadata（mermaid_src），并经
+                #   classify_source → SourceInfo → SourceSchema → API 透传到前端
+                #   原生渲染（streamlit_mermaid）。render_hint 标记可安全渲染，
+                #   前端无该标记时退化为代码展示，避免幻觉。
+                meta_extra["mermaid_src"] = ext.raw
+                meta_extra["render_hint"] = "mermaid:inline"
+                summary = None
+                try:
+                    from note_assistant.indexing.diagrams import MermaidParser
+                    dg = MermaidParser.parse(ext.raw, title=ext.context or "")
+                    summary = f"Mermaid {dg.diagram_type} 图: {dg.raw_text}"
+                    meta_extra["diagram_type"] = dg.diagram_type
+                    meta_extra["has_diagram"] = True
+                except Exception:
+                    graph_type_match = re.match(r'(graph|sequenceDiagram|classDiagram|'
+                                                r'stateDiagram|erDiagram|gantt|pie)',
+                                                ext.raw, re.IGNORECASE)
+                    graph_type = graph_type_match.group(1) if graph_type_match else "图"
+                    meta_extra["diagram_type"] = graph_type
+                    summary = f"Mermaid {graph_type} 图: {ext.context or '流程图'}"
 
             elif ext.kind == "image":
                 # Image：路径 + alt + 上下文。src/alt 走 ext.meta（结构化），
                 # 不再依赖把 alt 拼进 context 字符串的旧反模式。
+                # P1-c/P1-d：若注入了 image_enricher（生产环境），则用其产出的
+                # 结构化理解 / 原生解析结果富化本 chunk；否则保持默认摘要。
                 src = ext.meta.get("src") or ext.raw
                 alt = ext.meta.get("alt") or ""
                 desc = " | ".join(p for p in (alt, ext.context) if p)
                 summary = f"图片: {src} ({desc})" if desc else f"图片: {src}"
+                meta_extra = {}
+                if self._image_enricher is not None:
+                    hp = self._placeholder_heading.get(ext.placeholder, "")
+                    enriched = self._image_enricher(ext, hp)
+                    if enriched is not None:
+                        summary, meta_extra = enriched
 
             elif ext.kind == "code":
                 # Code：取语言标记 + 前几行
@@ -196,6 +239,9 @@ class RichPreprocessor:
                 alt = ext.meta.get("alt")
                 if alt:
                     meta["img_alt"] = alt
+            # 其它分支注入的结构化 metadata（mermaid 的 render_hint / diagram_type 等）
+            if meta_extra:
+                meta.update(meta_extra)
 
             summary_chunks.append(Chunk(
                 page_content=summary,
@@ -259,7 +305,9 @@ class RichPreprocessor:
             uid = f"<CODE_UID_{uuid.uuid4().hex[:8]}>"
             self.extracted.append(ExtractedChunk(uid, "code", uid, m.group(0), ""))
             return uid
-        # 匹配 ``` ... ``` 块（含语言标记）
+        # 匹配 ``` ... ``` 块（含语言标记）。
+        # 注意：mermaid 围栏由 _extract_mermaid 先行抽取（见 process() 顺序），
+        # 这里只保护普通代码围栏，避免把 mermaid 当 code 捕获。
         return re.sub(r'```[\w]*\n.*?```', replace_fn, text, flags=re.DOTALL)
 
     def _extract_tables(self, text: str) -> str:

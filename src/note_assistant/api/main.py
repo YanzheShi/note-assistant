@@ -179,6 +179,8 @@ async def ask(req: AskRequest):
             raw_table=s.raw_table or None,
             raw_mermaid=s.raw_mermaid or None,
             img_path=s.img_path or None,
+            render_hint=s.render_hint or None,
+            diagram_type=s.diagram_type or None,
         ))
     timing_dict = {"total_ms": (t1-t0) * 1000}
 
@@ -235,6 +237,8 @@ async def ask_stream(req: AskRequest):
                             raw_table=s.get("raw_table") or None,
                             raw_mermaid=s.get("raw_mermaid") or None,
                             img_path=s.get("img_path") or None,
+                            render_hint=s.get("render_hint") or None,
+                            diagram_type=s.get("diagram_type") or None,
                         ).model_dump(mode="json"))
                     yield f"data: {_json.dumps({'type': 'sources', 'content': schema_sources, 'graph_expansion': graph_exp})}\n\n"
 

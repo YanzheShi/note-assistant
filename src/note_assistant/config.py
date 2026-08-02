@@ -40,6 +40,22 @@ class Settings(BaseSettings):
     agent_base_url: str
     agent_model: str
 
+    # === VLM / 多模态理解（P1-c，OpenAI 兼容视觉通道）===
+    # 注意：字段名与 AGENT_* 完全独立，避免纯文本 LLM 与视觉模型互相串台。
+    vlm_api_key: str = ""          # 为空 → 不启用 VLM 理解（索引降级为 alt+上下文）
+    vlm_base_url: str = ""         # 视觉模型网关（如 https://api.agnes-ai.cn/v1）
+    vlm_model: str = ""            # 视觉模型名（如 agnes-2.5-flash）
+
+    # === 图片理解护栏（设计文档 5.1 / 5.4 / 5.5）===
+    image_understand_enabled: bool = True     # 总开关：关闭则图片只走 alt+上下文（零 VLM 调用）
+    image_allow_remote_fetch: bool = True     # 隐私开关：关闭则只处理本地资产，不下载远程图
+    image_max_bytes: int = 10 * 1024 * 1024   # 单图大小护栏（>10MB 跳过 VLM，省 token）
+    image_vlm_max_calls_per_run: int = 500    # 单次索引 VLM 调用上限，超限剩余标记 pending
+    image_vlm_concurrency: int = 4            # 并发上限（asyncio.Semaphore）
+    vlm_prompt_version: str = "v1"            # 改 prompt 必须 bump，缓存据此失效重跑
+    assets_dir: Path = Path("./data/assets")          # 远程图/资产本地缓存目录
+    vision_cache_path: Path = Path("./data/vision_cache.sqlite")  # VLM 结果缓存
+
     # === LangSmith (Tracing) ===
     langsmith_tracing_enabled: bool = True
     langsmith_api_key: str = ""

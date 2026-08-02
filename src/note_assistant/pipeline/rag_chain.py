@@ -89,6 +89,8 @@ class SourceInfo:
     img_path: str = ""
     raw_table: str = ""
     raw_mermaid: str = ""
+    render_hint: str = ""        # "mermaid:inline" 等：标记前端可原生渲染（非幻觉）
+    diagram_type: str = ""       # graph TD / sequenceDiagram / classDiagram ...
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -108,6 +110,8 @@ class SourceInfo:
             img_path=rich["img_path"],
             raw_table=rich["raw_table"],
             raw_mermaid=rich["raw_mermaid"],
+            render_hint=rich["render_hint"],
+            diagram_type=rich["diagram_type"],
         )
 
 

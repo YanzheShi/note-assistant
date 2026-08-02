@@ -39,3 +39,44 @@ def test_required_field_missing(monkeypatch):
     monkeypatch.setenv("EMBED_DIM", "not_a_number")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_vlm_settings_from_env(monkeypatch):
+    """P1-c：VLM_* 与 AGENT_* 完全独立，能从 env 加载且类型正确。
+
+    不依赖真实 .env（避免泄露/耦合密钥），纯测字段契约。
+    """
+    monkeypatch.setenv("VLM_API_KEY", "sk-test-vlm")
+    monkeypatch.setenv("VLM_BASE_URL", "https://api.example.cn/v1")
+    monkeypatch.setenv("VLM_MODEL", "vlm-test")
+    monkeypatch.setenv("IMAGE_UNDERSTAND_ENABLED", "false")
+    monkeypatch.setenv("IMAGE_VLM_MAX_CALLS_PER_RUN", "100")
+    monkeypatch.setenv("IMAGE_MAX_BYTES", "5242880")
+
+    s = Settings(_env_file=None)
+    assert s.vlm_api_key == "sk-test-vlm"
+    assert s.vlm_base_url == "https://api.example.cn/v1"
+    assert s.vlm_model == "vlm-test"
+    # 护栏默认值可覆盖
+    assert s.image_understand_enabled is False
+    assert s.image_vlm_max_calls_per_run == 100
+    assert s.image_max_bytes == 5242880
+    # 与 AGENT_* 不串台：AGENT 字段不受影响（默认仍按 .env 之外无值，这里仅确认字段存在）
+    assert isinstance(s.agent_api_key, str)
+
+
+def test_vlm_defaults_off_when_unset(monkeypatch):
+    """VLM_* 未配置时默认为空串 + 总开关默认开启。
+
+    注意：config.py 导入时 load_dotenv 已把真实 .env 灌进 os.environ，
+    pydantic-settings 即使 _env_file=None 仍读 os.environ，所以这里必须
+    delenv 掉真实 VLM_*（同 test_env_override 的坑）。
+    """
+    for var in ("VLM_API_KEY", "VLM_BASE_URL", "VLM_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    s = Settings(_env_file=None)
+    assert s.vlm_api_key == ""
+    assert s.vlm_base_url == ""
+    assert s.vlm_model == ""
+    assert s.image_understand_enabled is True
+    assert s.vlm_prompt_version == "v1"

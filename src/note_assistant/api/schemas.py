@@ -66,6 +66,8 @@ class SourceSchema(BaseModel):
 
     # 仅 mermaid 类型
     raw_mermaid: Optional[str] = None
+    render_hint: Optional[str] = None        # "mermaid:inline"：前端可原生渲染（非幻觉）
+    diagram_type: Optional[str] = None       # graph TD / sequenceDiagram / classDiagram ...
 
     # 仅 image 类型
     img_path: Optional[str] = None           # 图片在 Obsidian vault 中的路径

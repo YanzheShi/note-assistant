@@ -127,7 +127,13 @@ class Ingestor:
             return {"files": 0, "chunks": 0}
 
         hs, cs = make_splitters()
-        preprocessor = RichPreprocessor()
+        # P1-c/P1-d：注入图片 enricher（取图→分级路由→SVG 原生解析 / VLM 结构化理解）。
+        # enricher 内部对取不到图 / 装饰图 / 关闭开关 / 预算耗尽 / 解析失败 都降级为默认摘要，
+        # 绝不因图片失败中断整库索引。
+        from note_assistant.indexing.understanding import make_image_enricher
+        preprocessor = RichPreprocessor(
+            image_enricher=make_image_enricher(vault_path or settings.vault_path)
+        )
         total_chunks = 0
         is_v2b = settings.chunking_strategy == "v2b"
         # v2b：父块存 docstore（不参与 embedding/BM25），检索命中子块后回退整节
