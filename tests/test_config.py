@@ -13,13 +13,15 @@ def test_env_override(monkeypatch):
     """monkeypatch 能覆盖 .env，字段类型正确"""
     monkeypatch.setenv("VAULT_PATH", "/tmp/test_vault")
     monkeypatch.setenv("EMBED_DIM", "768")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-dummy")
+    # 主 LLM 通道走 AGENT_API_KEY，需能被 env 覆盖。
+    # 必须显式 setenv：config.py 导入时 load_dotenv 已把真实 .env 灌进 os.environ，
+    # 只靠 _env_file=None 隔离不掉（同 test_chunking_strategy 的坑）。
+    monkeypatch.setenv("AGENT_API_KEY", "sk-dummy-agent")
 
     s = Settings(_env_file=None)  # 忽略真实 .env，纯测 env
     assert s.vault_path == Path("/tmp/test_vault")
     assert s.embed_dim == 768          # str->int 自动转
-    # deepseek_api_key 在 config 中定义为普通 str 字段（非 SecretStr）
-    assert s.agent_api_key == "sk-dummy"
+    assert s.agent_api_key == "sk-dummy-agent"
 
 
 def test_defaults_without_env():

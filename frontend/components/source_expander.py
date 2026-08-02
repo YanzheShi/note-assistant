@@ -9,11 +9,47 @@
     image   — 展开显示图片路径 + 上下文描述（V1 不支持图片显示）
 """
 
+import os
 import re
 from itertools import count
+from pathlib import Path
+
 import streamlit as st
 
 _render_counter = count()
+
+
+def _render_image(img_path: str, caption: str = "") -> None:
+    """
+    渲染来源图片。
+
+    三种形态分别处理：
+      - 远程 URL（本 vault 的主力形态）→ 直接交给 st.image，无需落盘
+      - vault 内相对路径 → 拼 VAULT_PATH 再判断存在性。历史实现直接
+        `os.path.exists(相对路径)`，是相对 Streamlit 进程 cwd 解析的，必然为 false
+      - Obsidian 短名（`Pasted image xxx.png`）→ 需要全库附件索引才能定位，
+        属 P1 的 AttachmentIndex 范畴，此处只做友好降级提示
+    """
+    st.markdown(f"**图片：** `{img_path}`")
+
+    if img_path.startswith(("http://", "https://", "data:")):
+        st.image(img_path, caption=caption or "参考图片")
+        return
+
+    candidates = [Path(img_path)]
+    vault_root = os.environ.get("VAULT_PATH", "")
+    if vault_root:
+        candidates.append(Path(vault_root) / img_path)
+
+    for c in candidates:
+        try:
+            if c.is_file():
+                st.image(str(c), caption=caption or "参考图片")
+                return
+        except OSError:
+            continue
+
+    st.caption("图片文件不可见（vault 内短名引用需附件索引解析，见 P1）")
 
 
 def render_sources(sources: list[dict]):
@@ -78,30 +114,24 @@ def render_sources(sources: list[dict]):
                 # Agentic RAG 来源可能只有 title 没有 preview
                 st.markdown(f"**标题：** {src['title']}")
 
-                # ── 按类型额外渲染 ──
-                if src_type == "table" and src.get("raw_table"):
-                    st.markdown("**表格内容：**")
-                    st.markdown(src["raw_table"])
+            # ── 按类型额外渲染 ──
+            # 注意：这一段必须与 preview 渲染**平级**。历史实现把它缩进进了
+            # `elif src.get("title")` 内部，只有「preview 为空且有 title」才可能进入，
+            # 事实上是死代码——table/mermaid/image 三个分支从来没有被执行过。
+            if src.get("raw_table"):
+                st.markdown("**表格内容：**")
+                st.markdown(src["raw_table"])
 
-                elif src_type == "mermaid" and src.get("raw_mermaid"):
-                    st.markdown("**Mermaid 图：**")
-                    # 尝试用 streamlit-mermaid 渲染
-                    raw = src["raw_mermaid"]
-                    match = re.search(r"```mermaid\s*\n(.*?)```", raw, re.DOTALL)
-                    if match:
-                        try:
-                            from streamlit_mermaid import st_mermaid
-                            st_mermaid(match.group(1))
-                        except ImportError:
-                            st.code(match.group(1), language="mermaid")
-                    else:
-                        st.code(raw, language="markdown")
+            if src.get("raw_mermaid"):
+                st.markdown("**Mermaid 图：**")
+                raw = src["raw_mermaid"]
+                match = re.search(r"```mermaid\s*\n(.*?)```", raw, re.DOTALL)
+                mermaid_src = match.group(1) if match else raw
+                try:
+                    from streamlit_mermaid import st_mermaid
+                    st_mermaid(mermaid_src)
+                except ImportError:
+                    st.code(mermaid_src, language="mermaid")
 
-                elif src_type == "image" and src.get("img_path"):
-                    img_path = src["img_path"]
-                    st.markdown(f"**图片路径：** `{img_path}`")
-                    import os
-                    if os.path.exists(img_path):
-                        st.image(img_path, caption=preview or "参考图片")
-                    else:
-                        st.caption("图片文件不可见（路径不存在或未挂载）")
+            if src.get("img_path"):
+                _render_image(src["img_path"], caption=preview)

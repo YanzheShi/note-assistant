@@ -1,4 +1,5 @@
 import chromadb
+from dataclasses import replace
 from pathlib import Path
 from typing import List
 
@@ -142,15 +143,19 @@ class Ingestor:
             cleaned, fm_chunks = preprocessor.process_with_meta(node)
 
             # 2. 切分（启动前可按 chunking_strategy 切换 v1/v2/v2b；结构检索横切其上）
+            #    切分必须吃 cleaned 而不是 node.raw_md——否则占位符保护机制整体空转：
+            #    restore() 找不到任何占位符（恒 no-op），has_code/has_table/has_image
+            #    等 metadata 永远写不进 ChromaDB。用 dataclasses.replace 造副本，不改原 node。
+            node_for_split = replace(node, raw_md=cleaned)
             if settings.chunking_strategy == "v1":
-                chunks = split_v1(node, cs)
+                chunks = split_v1(node_for_split, cs)
                 parents: List[Chunk] = []
             elif settings.chunking_strategy == "v2b":
-                split_res = split_v2b(node, hs, cs)
+                split_res = split_v2b(node_for_split, hs, cs)
                 chunks = split_res["children"]
                 parents = split_res["parents"]
             else:  # v2
-                chunks = split_v2(node, hs, cs)
+                chunks = split_v2(node_for_split, hs, cs)
                 parents = []
 
             # 3. restore 还原占位符（parents 通常无占位符，restore 为安全 no-op）

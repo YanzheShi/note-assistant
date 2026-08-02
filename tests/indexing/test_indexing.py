@@ -610,3 +610,181 @@ def retrieve(query):
 
         # 验证 collection 有数据
         assert ingestor.collection.count() == n
+
+
+# ================================================================
+# P0 修复点 1：cleaned 必须喂给 splitter（占位符保护机制空转回归）
+# ================================================================
+class TestCleanedFedToSplitter:
+    """历史 bug：preprocessor 算出的 cleaned 没喂给 splitter（splitter 吃了 node.raw_md），
+    导致占位符从未进入 chunk，restore() 恒为 no-op，has_code/has_table/has_image 等
+    metadata 永远写不进 ChromaDB。修复用 dataclasses.replace(node, raw_md=cleaned)。"""
+
+    @staticmethod
+    def _split_on_cleaned(tmp_path, content):
+        from dataclasses import replace
+        node = _make_node(tmp_path, "doc.md", content)
+        pp = RichPreprocessor()
+        cleaned, _ = pp.process_with_meta(node)
+        hs, cs = make_splitters()
+        node_for_split = replace(node, raw_md=cleaned)
+        chunks = split_v2(node_for_split, hs, cs)
+        return pp, chunks
+
+    def test_split_on_cleaned_carries_placeholders(self, tmp_path):
+        content = """---
+title: T
+---
+
+## 代码段
+
+```python
+def f(): return 1
+```
+
+## 图片
+
+![[photo.png]]
+"""
+        pp, chunks = self._split_on_cleaned(tmp_path, content)
+        # restore 前：切分后 chunk 应含占位符（证明走的是 cleaned 而非 raw）
+        assert any("<CODE_UID_" in c.page_content or "[IMAGE_UID_" in c.page_content
+                   for c in chunks)
+        restored = pp.restore(chunks)
+        # restore 后：metadata 标记位应被写回
+        assert any(c.metadata.get("has_code") for c in restored)
+        assert any(c.metadata.get("has_image") for c in restored)
+        # 且正文里还原出真实代码与图片语法
+        joined = "\n".join(c.page_content for c in restored)
+        assert "def f()" in joined
+        assert "![[photo.png]]" in joined
+
+    def test_split_on_raw_loses_flags(self, tmp_path):
+        """回归守卫：若有人把 splitter 改回吃 node.raw_md，restore 找不到占位符，
+        has_code/has_image 永远丢失。此测试锁定修复不可回退。"""
+        content = """---
+title: T
+---
+
+## 代码段
+
+```python
+def f(): return 1
+```
+
+## 图片
+
+![[photo.png]]
+"""
+        node = _make_node(tmp_path, "doc2.md", content)
+        pp = RichPreprocessor()
+        pp.process_with_meta(node)  # 确保 self.extracted 已填充占位符
+        hs, cs = make_splitters()
+        chunks = split_v2(node, hs, cs)  # 故意复现旧 bug：切 raw node
+        restored = pp.restore(chunks)
+        assert all("has_code" not in c.metadata for c in restored)
+        assert all("has_image" not in c.metadata for c in restored)
+
+
+# ================================================================
+# P0 修复点 2/3：ExtractedChunk.raw 存完整 markdown 语法 + context 洗占位符
+# ================================================================
+class TestExtractedChunkRaw:
+    def test_image_raw_is_full_markdown_embed(self, tmp_path):
+        node = _make_node(tmp_path, "img.md", """---
+title: T
+---
+
+# 标题
+
+![[photo.png]]
+
+正文。
+""")
+        pp = RichPreprocessor()
+        pp.process_with_meta(node)
+        img = pp.get_extracted("image")[0]
+        assert img.raw == "![[photo.png]]"          # 完整语法，不是裸路径
+        assert img.meta.get("src") == "photo.png"
+        assert "IMAGE_UID" in img.placeholder
+
+    def test_image_raw_is_full_markdown_link(self, tmp_path):
+        node = _make_node(tmp_path, "img2.md", """---
+title: T
+---
+
+# 标题
+
+![架构图](assets/arch.png)
+
+正文。
+""")
+        pp = RichPreprocessor()
+        pp.process_with_meta(node)
+        img = pp.get_extracted("image")[0]
+        assert img.raw == "![架构图](assets/arch.png)"
+        assert img.meta.get("src") == "assets/arch.png"
+        assert img.meta.get("alt") == "架构图"
+
+    def test_image_raw_keeps_dim_suffix_in_meta(self, tmp_path):
+        node = _make_node(tmp_path, "img3.md", """---
+title: T
+---
+
+![[photo.png|300x200]]
+""")
+        pp = RichPreprocessor()
+        pp.process_with_meta(node)
+        img = pp.get_extracted("image")[0]
+        assert img.raw == "![[photo.png|300x200]]"
+        assert img.meta.get("src") == "photo.png"
+        assert img.meta.get("dims") == "300x200"
+
+    def test_image_context_has_no_code_placeholder(self, tmp_path):
+        """图片紧邻 code fence 时，其 context 窗口会盖到 code 占位符；
+        strip_placeholders 必须洗掉它，否则噪声串会污染 summary / VLM prompt。"""
+        node = _make_node(tmp_path, "ctx.md", """---
+title: T
+---
+
+```python
+def f(): return 1
+```
+
+![[near.png]]
+""")
+        pp = RichPreprocessor()
+        pp.process_with_meta(node)
+        img = pp.get_extracted("image")[0]
+        assert "<CODE_UID_" not in img.context
+        assert "near.png" in img.context      # 真实邻近文本应保留
+
+
+# ================================================================
+# P0 修复点 8：summary chunk 回填 heading_path + img_src
+# ================================================================
+class TestSummaryHeadingPath:
+    def test_image_summary_has_heading_path_and_src(self, tmp_path):
+        from dataclasses import replace
+        node = _make_node(tmp_path, "sumhp.md", """---
+title: T
+---
+
+## 图表章节
+
+![[diagram.png]]
+
+正文。
+""")
+        pp = RichPreprocessor()
+        cleaned, _ = pp.process_with_meta(node)
+        hs, cs = make_splitters()
+        node_for_split = replace(node, raw_md=cleaned)
+        pp.restore(split_v2(node_for_split, hs, cs))   # restore 反查 placeholder → heading
+        summaries = pp.generate_summaries()
+        img_sums = [s for s in summaries if s.metadata.get("kind") == "image"]
+        assert img_sums, "应生成 image summary chunk"
+        s = img_sums[0]
+        assert s.metadata.get("heading_path"), "summary 应带回填的 heading_path"
+        assert "图表章节" in s.metadata["heading_path"]
+        assert s.metadata.get("img_src") == "diagram.png"

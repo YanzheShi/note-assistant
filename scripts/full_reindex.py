@@ -22,6 +22,7 @@
 import sys
 import time
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 # Windows GBK 编码兼容
@@ -113,8 +114,8 @@ def main():
         preprocessor.__init__()  # 重置 extracted
         cleaned, fm_chunks = preprocessor.process_with_meta(node)
 
-        # 4b. 切分
-        chunks = split_v2(node, hs, cs)
+        # 4b. 切分（必须吃 cleaned，否则 restore/占位符保护整体空转，见 ingestor.index_vault 注释）
+        chunks = split_v2(replace(node, raw_md=cleaned), hs, cs)
 
         # 4c. 还原占位符
         chunks = preprocessor.restore(chunks)

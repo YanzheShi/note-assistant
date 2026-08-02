@@ -22,6 +22,7 @@ from typing import AsyncIterator, List
 
 from langchain_core.messages import HumanMessage
 from note_assistant.llm.client import get_llm
+from note_assistant.pipeline.source_kind import classify_source
 from note_assistant.retrieval.types import RetrievalResult
 
 logger = logging.getLogger(__name__)
@@ -68,15 +69,46 @@ def _parse_routing_result(result) -> bool:
 
 @dataclass
 class SourceInfo:
-    """单个来源片段的信息。"""
-    type: str                       # "direct" | "graph"
+    """
+    单个来源片段的信息。
+
+    `origin` 与 `kind` 是两套正交语义，历史上被挤在同一个 `type` 字段里，
+    导致 API 层把「来源渠道」当「内容类型」透传给前端，前端的 table/mermaid/image
+    渲染分支永远进不去（详见 pipeline/source_kind.py 模块注释）：
+
+        origin — 来源渠道：direct（检索直接命中） | graph（双链扩展带出）
+        kind   — 内容类型：text | table | mermaid | image
+    """
+    origin: str                     # "direct" | "graph"
     filepath: str
     heading: str
     preview: str
     score: float
+    kind: str = "text"              # "text" | "table" | "mermaid" | "image"
+    # 渲染载荷：能抽就抽，不受 kind 约束（一个 chunk 可能同时含表格与图片）
+    img_path: str = ""
+    raw_table: str = ""
+    raw_mermaid: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_result(cls, r: RetrievalResult, origin: str = "direct") -> "SourceInfo":
+        """从检索结果组装来源信息，内容类型与渲染载荷交给 classify_source 判定。"""
+        meta = getattr(r, "metadata", None) or {}
+        rich = classify_source(r.page_content, meta)
+        return cls(
+            origin=origin,
+            filepath=meta.get("filepath", ""),
+            heading=meta.get("heading_path", ""),
+            preview=r.page_content[:200],
+            score=r.score,
+            kind=rich["kind"],
+            img_path=rich["img_path"],
+            raw_table=rich["raw_table"],
+            raw_mermaid=rich["raw_mermaid"],
+        )
 
 
 @dataclass
@@ -236,15 +268,7 @@ class RAGChain:
             answer = self.generator.generate(question, merge_chunks, history=history)
             logger.info("rag_chain.generate", extra={"answer_len": len(answer)})
 
-        sources = []
-        for r in rerank_result:
-            sources.append(SourceInfo(
-                type="direct",
-                filepath=r.metadata.get("filepath", ""),
-                heading=r.metadata.get("heading_path", ""),
-                preview=r.page_content[:200],
-                score=r.score,
-            ))
+        sources = [SourceInfo.from_result(r, origin="direct") for r in rerank_result]
 
         return AskResponse(
             answer=answer,
@@ -302,15 +326,7 @@ class RAGChain:
             merge_chunks = rerank_result + graph_expand_chunks
 
             # 组装 sources
-            sources = []
-            for r in rerank_result:
-                sources.append(SourceInfo(
-                    type="direct",
-                    filepath=r.metadata.get("filepath", ""),
-                    heading=r.metadata.get("heading_path", ""),
-                    preview=r.page_content[:200],
-                    score=r.score,
-                ))
+            sources = [SourceInfo.from_result(r, origin="direct") for r in rerank_result]
 
             return merge_chunks, sources, len(graph_expand_chunks)
 
@@ -448,15 +464,7 @@ class RAGChain:
         t_retrieval = time.time()
 
         # ── 组装 sources ──
-        sources = []
-        for r in rerank_result:
-            sources.append(SourceInfo(
-                type="direct",
-                filepath=r.metadata.get("filepath", ""),
-                heading=r.metadata.get("heading_path", ""),
-                preview=r.page_content[:200],
-                score=r.score,
-            ))
+        sources = [SourceInfo.from_result(r, origin="direct") for r in rerank_result]
 
         # ── yield meta ──
         yield {

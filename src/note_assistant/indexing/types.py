@@ -24,8 +24,10 @@ class ExtractedChunk:
     uid: str
     kind: str          # "table" | "mermaid" | "image" | "code"
     placeholder: str   # 在原文中的占位符
-    raw: str           # 原始内容
-    context: str       # 前后文（用于生成描述/summary）
+    raw: str           # 原始内容（图片为完整 markdown 语法，如 "![alt](path)"，供 restore 还原渲染）
+    context: str       # 前后文（用于生成描述/summary），已剔除占位符噪声
+    # 结构化附加信息，避免继续往 context 字符串里拼接（如 image 的 src/alt/dims）
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

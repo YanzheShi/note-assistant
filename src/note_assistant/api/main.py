@@ -170,11 +170,15 @@ async def ask(req: AskRequest):
     source_list: list[SourceSchema] = []
     for s in ask_response.sources:
         source_list.append(SourceSchema(
-            type=s.type,
+            type=s.kind,             # 内容类型（此前误传 origin，前端永远收到 "direct"）
+            origin=s.origin,         # 来源渠道
             filepath=s.filepath,
             heading=s.heading,
             preview=s.preview,
             score=s.score,
+            raw_table=s.raw_table or None,
+            raw_mermaid=s.raw_mermaid or None,
+            img_path=s.img_path or None,
         ))
     timing_dict = {"total_ms": (t1-t0) * 1000}
 
@@ -222,11 +226,15 @@ async def ask_stream(req: AskRequest):
                     schema_sources = []
                     for s in raw_sources:
                         schema_sources.append(SourceSchema(
-                            type=s.get("type", "text"),
+                            type=s.get("kind", "text"),        # 内容类型，非来源渠道
+                            origin=s.get("origin", "direct"),
                             filepath=s.get("filepath", ""),
                             heading=s.get("heading", ""),
                             preview=s.get("preview", ""),
                             score=s.get("score"),
+                            raw_table=s.get("raw_table") or None,
+                            raw_mermaid=s.get("raw_mermaid") or None,
+                            img_path=s.get("img_path") or None,
                         ).model_dump(mode="json"))
                     yield f"data: {_json.dumps({'type': 'sources', 'content': schema_sources, 'graph_expansion': graph_exp})}\n\n"
 

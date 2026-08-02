@@ -18,8 +18,8 @@ def _make_mock_rag_chain():
     chain.ask.return_value = AskResponse(
         answer="这是测试答案",
         sources=[
-            SourceInfo(type="direct", filepath="test.md", heading="标题", preview="预览", score=0.9),
-            SourceInfo(type="direct", filepath="other.md", heading="其他", preview="预览", score=0.7),
+            SourceInfo(origin="direct", filepath="test.md", heading="标题", preview="预览", score=0.9),
+            SourceInfo(origin="direct", filepath="other.md", heading="其他", preview="预览", score=0.7),
         ],
         graph_expansion=0,
         retrieved=2,

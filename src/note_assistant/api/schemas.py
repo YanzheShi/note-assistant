@@ -41,13 +41,21 @@ class SourceSchema(BaseModel):
     """
     单个来源片段，按类型区分渲染字段。
 
-    type 取值：
+    type 取值（内容类型）：
         text    — 普通文本段落（preview 即可）
         table   — Markdown 表格（preview + raw_table）
         mermaid — Mermaid 流程图（preview + raw_mermaid）
         image   — 图片（preview + img_path）
+
+    origin 取值（来源渠道，与 type 正交）：
+        direct  — 检索直接命中
+        graph   — 双链扩展带出
+
+    注意：内部 `SourceInfo` 的对应字段叫 `kind`（内容类型）/ `origin`（来源渠道）。
+    两者曾同名为 `type` 且被直接透传，前端因此永远收到 "direct"，四个渲染分支全是死代码。
     """
     type: str = "text"                       # text | table | mermaid | image
+    origin: str = "direct"                   # direct | graph
     filepath: str = ""                       # 来源笔记路径（相对 vault 根）
     heading: str = ""                        # 标题路径，如 "二、RAG > 2.1 定义"
     preview: str = ""                        # 摘要预览（所有类型都有）

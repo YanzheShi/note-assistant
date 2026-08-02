@@ -6,9 +6,32 @@ from typing import Optional
 from note_assistant.indexing.types import DocNode, ExtractedChunk, Chunk
 
 
+# 所有占位符的统一形态（uuid4().hex[:8] → 8 位十六进制）。
+# 用于把 context 窗口里混入的占位符洗掉：抽取是分阶段的（code → table → mermaid → image），
+# 后一阶段取上下文时看到的文本已被前一阶段替换过，不清洗会把 "<CODE_UID_a3f2b1c8>"
+# 这类噪声串当成语义上下文喂给 summary / 下游 VLM prompt。
+_PLACEHOLDER_RE = re.compile(
+    r"<CODE_UID_[0-9a-f]{8}>"
+    r"|\[TABLE_UID_[0-9a-f]{8}\]"
+    r"|\[MERMAID_UID_[0-9a-f]{8}\]"
+    r"|\[IMAGE_UID_[0-9a-f]{8}\]"
+)
+
+
+def strip_placeholders(text: str) -> str:
+    """剔除文本中的富结构占位符，并压掉因此产生的多余空白。"""
+    if not text:
+        return ""
+    return re.sub(r"[ \t]{2,}", " ", _PLACEHOLDER_RE.sub(" ", text)).strip()
+
+
 class RichPreprocessor:
     def __init__(self):
         self.extracted: list[ExtractedChunk] = []
+        # placeholder → heading_path，在 restore() 阶段回填。
+        # 富结构被抽走时还不知道它落在哪一节，只有切分后的 chunk 才带 heading_path，
+        # 因此由 restore() 反查，供 generate_summaries() 给 summary chunk 补章节定位。
+        self._placeholder_heading: dict[str, str] = {}
 
     # ──────────────────────────────────────────────
     # 主入口
@@ -17,6 +40,7 @@ class RichPreprocessor:
     def process(self, md_text: str) -> str:
         """将富结构替换为占位符，返回清洗后的文本"""
         self.extracted = []
+        self._placeholder_heading = {}
         text = md_text
 
         # P1: code fence 保护（必须在最前面，防 MarkdownHeaderTextSplitter 误解析）
@@ -73,6 +97,13 @@ class RichPreprocessor:
                 metadata["has_table"] = any(e.kind == "table" for e in found)
                 metadata["has_mermaid"] = any(e.kind == "mermaid" for e in found)
                 metadata["has_image"] = any(e.kind == "image" for e in found)
+
+                # 回填 placeholder → heading_path（首次记录优先：children 先于 parents
+                # 调用 restore，子块的 heading_path 更精确，不被父块的粗粒度路径覆盖）
+                hp = metadata.get("heading_path") or ""
+                if hp:
+                    for ext in found:
+                        self._placeholder_heading.setdefault(ext.placeholder, hp)
 
                 # 还原占位符 → 原始内容
                 for ext in found:
@@ -131,8 +162,12 @@ class RichPreprocessor:
                 summary = f"Mermaid {graph_type} 图: {ext.context or '流程图'}"
 
             elif ext.kind == "image":
-                # Image：保留路径 + alt + 上下文
-                summary = f"图片: {ext.raw} ({ext.context})"
+                # Image：路径 + alt + 上下文。src/alt 走 ext.meta（结构化），
+                # 不再依赖把 alt 拼进 context 字符串的旧反模式。
+                src = ext.meta.get("src") or ext.raw
+                alt = ext.meta.get("alt") or ""
+                desc = " | ".join(p for p in (alt, ext.context) if p)
+                summary = f"图片: {src} ({desc})" if desc else f"图片: {src}"
 
             elif ext.kind == "code":
                 # Code：取语言标记 + 前几行
@@ -144,13 +179,27 @@ class RichPreprocessor:
             else:
                 summary = ext.raw[:200]
 
+            meta = {
+                "kind": ext.kind,
+                "source": "extracted_summary",
+                "placeholder": ext.placeholder,
+            }
+            # 章节定位：由 restore() 回填。缺失时留空，build_structural_prefix 会退化到文档级。
+            hp = self._placeholder_heading.get(ext.placeholder)
+            if hp:
+                meta["heading_path"] = hp
+            # 图片专用：把源地址带进 metadata，供 API 层组装 img_path / 前端渲染
+            if ext.kind == "image":
+                src = ext.meta.get("src")
+                if src:
+                    meta["img_src"] = src
+                alt = ext.meta.get("alt")
+                if alt:
+                    meta["img_alt"] = alt
+
             summary_chunks.append(Chunk(
                 page_content=summary,
-                metadata={
-                    "kind": ext.kind,
-                    "source": "extracted_summary",
-                    "placeholder": ext.placeholder,
-                },
+                metadata=meta,
                 kind="extracted_summary",
             ))
         return summary_chunks
@@ -218,10 +267,12 @@ class RichPreprocessor:
         def replace_fn(m):
             uid = f"[TABLE_UID_{uuid.uuid4().hex[:8]}]"
             raw_table = m.group(0)
-            # 尝试提取表格前一行作为 caption
+            # 尝试提取表格前一行作为 caption（洗掉可能混入的 code 占位符）
             start = m.start()
             preceding = text[max(0, start-200):start].strip().split('\n')[-1] if start > 0 else ""
-            self.extracted.append(ExtractedChunk(uid, "table", uid, raw_table, preceding))
+            self.extracted.append(
+                ExtractedChunk(uid, "table", uid, raw_table, strip_placeholders(preceding))
+            )
             return uid
         # Markdown 表格正则：至少两行，含分隔符行
         return re.sub(r'(?:^|\n)((?:\|.*\n){2,})', replace_fn, text)
@@ -231,23 +282,38 @@ class RichPreprocessor:
         def replace_fn(m):
             uid = f"[MERMAID_UID_{uuid.uuid4().hex[:8]}]"
             start = m.start()
-            # 取 mermaid 块前面一行作为上下文（caption）
+            # 取 mermaid 块前面一行作为上下文（caption），洗掉占位符噪声
             preceding = text[max(0, start-200):start].strip().split('\n')[-1] if start > 0 else ""
-            self.extracted.append(ExtractedChunk(uid, "mermaid", uid, m.group(0), preceding))
+            self.extracted.append(
+                ExtractedChunk(uid, "mermaid", uid, m.group(0), strip_placeholders(preceding))
+            )
             return uid
         return re.sub(r'```mermaid\s*\n(.*?)```', replace_fn, text, flags=re.DOTALL)
 
     def _extract_images(self, text: str, context_window: int = 80) -> str:
-        """抽取图片，保留上下文作为描述"""
+        """
+        抽取图片，保留上下文作为描述。
+
+        两个关键约定（P0 修复）：
+        1. `raw` 存**完整 markdown 语法**（`![alt](path)` / `![[embed]]`），而不是裸路径——
+           否则 restore() 还原出来是一段孤零零的路径字符串，渲染语法永久丢失。
+        2. 占位符**独立成 token**（不再拼 `": {alt}"` 尾巴），否则 restore 后会变成
+           `![alt](path): alt` 的重复文本。alt 已通过 `meta` 结构化承载。
+        """
         def replace_fn(m):
             uid = f"[IMAGE_UID_{uuid.uuid4().hex[:8]}]"
-            img_path = m.group(1) or m.group(3)  # ![[img]] 或 ![alt](path)
-            alt = m.group(2) or ""
-            # 取前后 context_window 字符作为上下文
-            start = m.start()
-            end = m.end()
-            context = text[max(0, start-context_window):end+context_window]
-            self.extracted.append(ExtractedChunk(uid, "image", uid, img_path, alt + " | " + context))
-            return f"{uid}: {alt or img_path}"
+            embed, alt, link = m.group(1), m.group(2), m.group(3)
+            raw_target = embed or link or ""
+            # Obsidian 尺寸后缀：![[img.png|300]] / ![[img.png|300x200]]
+            src, _, dims = raw_target.partition("|")
+            meta = {"src": src.strip(), "alt": (alt or "").strip()}
+            if dims.strip():
+                meta["dims"] = dims.strip()
+            # 前后 context_window 字符作为上下文；洗掉前序阶段留下的 code/table/mermaid 占位符
+            context = text[max(0, m.start() - context_window): m.end() + context_window]
+            self.extracted.append(
+                ExtractedChunk(uid, "image", uid, m.group(0), strip_placeholders(context), meta=meta)
+            )
+            return uid
         # 匹配 ![[embed]] 和 ![alt](path)
         return re.sub(r'!\[\[([^\]]+)\]\]|!\[([^\]]*)\]\(([^)]+)\)', replace_fn, text)
