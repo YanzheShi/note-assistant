@@ -222,6 +222,11 @@ def _initial_state(
         "condense_candidates": list(sig.candidates),
         "just_clarified": just_clarified,
         "clarified": False,
+        # 收敛闸门 / 反向放宽（2026-08-02 修复同文档空转）
+        "doc_count_at_last_reflect": 0,
+        "no_new_doc_streak": 0,
+        "widen_context": False,
+        "gate_overrode": False,
     }
 
 

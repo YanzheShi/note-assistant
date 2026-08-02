@@ -142,8 +142,18 @@ class Settings(BaseSettings):
     # last_entity 槽位记录的竞争主题条数上限
     agent_clarify_max_candidates: int = 3
     # 给 Judge 的证据片段条数 / 每条正文摘要字数（P0 盲判修复）
-    agent_judge_evidence_top_n: int = 5
+    # top_n 从 5 放宽到 8：既是兜底，也让 Judge 正文视图多覆盖几条低分但相关的片段；
+    # 真正治本靠「覆盖概览」（见 agent.py::_format_judge_evidence）。
+    agent_judge_evidence_top_n: int = 8
     agent_judge_evidence_chars: int = 200
+
+    # === Agent 收敛闸门（防同文档空转，确定性停止）===
+    # 连续多少轮改写后「新增独特文档数 = 0」就强制 sufficient 进生成，
+    # 不再靠 LLM 自觉，直接切断「对同一篇文档换同义词反复重检」的死循环。
+    agent_convergence_streak: int = 2
+    # 生成窗口反向放宽：当靠覆盖视图 / 收敛闸门提前放行时，
+    # 生成上下文从 top_k_rerank 放宽到该值，避免低分但相关的内容在生成端被裁掉。
+    agent_generate_widen_top_k: int = 10
 
 
 settings = Settings()

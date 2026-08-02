@@ -10,12 +10,17 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from note_assistant.agent import agent as agent_mod
 from note_assistant.agent.agent import (
     _agent_branch,
+    _coverage_has_extra_topics,
+    _coverage_view,
     _extract_json,
+    _format_judge_evidence,
     _norm_verdict,
     _reflect_branch,
     _route_branch,
     _top_k_context,
     agent_node,
+    generate_node,
+    reflect,
     tools_node,
 )
 from note_assistant.agent.runner import _initial_state, _log_task_exception
@@ -327,6 +332,215 @@ def test_rerank_exit_disabled_returns_empty():
     import asyncio
     result = asyncio.run(rerank_exit({"accumulated": [], "condensed_question": "q"}))
     assert result == {}
+
+
+# ──────────────────────────────────────────────
+# ① 覆盖概览（治本修复 Judge 盲判）
+# ──────────────────────────────────────────────
+
+def test_coverage_view_lists_titles_and_headings():
+    """覆盖概览应去重列出文档标题 + 各级 heading，供 Judge 做广度判断。"""
+    results = [
+        _mk(0.9, "a.md", "一、背景 > 检索方法"),
+        _mk(0.8, "a.md", "一、背景 > 检索方法"),  # 同 heading 去重
+        _mk(0.7, "a.md", "二、实现 > 接口设计"),
+        _mk(0.6, "b.md", "SFT 原理"),
+    ]
+    view = _coverage_view(results)
+    assert "《T》" in view              # 标题（_mk 默认 title="T"）
+    assert "一、背景 > 检索方法" in view
+    assert "二、实现 > 接口设计" in view
+    assert "SFT 原理" in view
+    # 重复的 heading 只出现一次
+    assert view.count("一、背景 > 检索方法") == 1
+
+
+def test_coverage_has_extra_topics_true_and_false():
+    """top-N 正文未覆盖的 heading 存在 → True；全覆盖 → False。"""
+    results = [
+        _mk(0.9, "a.md", "A1"),   # 高分
+        _mk(0.8, "a.md", "A2"),   # 高分
+        _mk(0.1, "a.md", "A-low"),  # 低分、heading 不在 top-N 正文里
+    ]
+    # top_n=2 时 top 正文只覆盖 A1/A2，A-low 在概览里 → True
+    assert _coverage_has_extra_topics(results, top_n=2) is True
+    # top_n 覆盖全部 heading → False
+    assert _coverage_has_extra_topics(results, top_n=3) is False
+    # 空结果 → False
+    assert _coverage_has_extra_topics([], top_n=2) is False
+
+
+def test_format_judge_evidence_appends_coverage(monkeypatch):
+    """_format_judge_evidence 末尾应附『知识库覆盖概览』。"""
+    monkeypatch.setattr(settings, "agent_judge_evidence_top_n", 2)
+    results = [_mk(0.9, "a.md", "A1"), _mk(0.8, "b.md", "B1")]
+    text = _format_judge_evidence(results)
+    assert "【知识库覆盖概览】" in text
+    assert "A1" in text and "B1" in text
+
+
+# ──────────────────────────────────────────────
+# ④ 生成窗口反向放宽（top_k 覆盖）
+# ──────────────────────────────────────────────
+
+def test_top_k_context_override_top_k():
+    results = [_mk(s) for s in (0.2, 0.9, 0.5, 0.1, 0.8, 0.7, 0.3)]
+    # 默认截断到 top_k_rerank（默认 5）
+    assert len(_top_k_context(results)) == settings.top_k_rerank
+    # 显式覆盖到 10
+    assert len(_top_k_context(results, top_k=10)) == 7
+
+
+# ──────────────────────────────────────────────
+# ③④ 收敛闸门 + 反向放宽 + 诚实声明（reflect / generate_node）
+# ──────────────────────────────────────────────
+
+class _JsonLLM(BaseChatModel):
+    """返回固定 JSON 内容的假 LLM（供 reflect 的 Judge 调用）。"""
+    content: str = ""
+
+    def __init__(self, content: str = "", **kwargs):
+        super().__init__()
+        self.content = content
+
+    @property
+    def _llm_type(self):
+        return "json"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=self.content))])
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        return self._generate(messages, stop, run_manager, **kwargs)
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+def _judge_json(verdict: str, rewritten: str = "q") -> str:
+    return (
+        f'{{"verdict": "{verdict}", "relevance_score": 0.5, '
+        f'"reason": "x", "rewritten_query": "{rewritten}", "clarify_question": ""}}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_reflect_convergence_gate_forces_sufficient_after_streak(monkeypatch):
+    """连续 agent_convergence_streak 轮改写后『新增独特文档=0』→ 强制 sufficient（gate_overrode）。"""
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _JsonLLM(_judge_json("need_rewrite")))
+    monkeypatch.setattr(settings, "agent_convergence_streak", 2)
+
+    # 单文档，多 chunk（模拟「同文档换同义词空转」）
+    def _state(iter_val, prev_count, prev_streak):
+        return {
+            "iteration": iter_val,
+            "accumulated": [
+                _mk(0.9, "a.md", f"h{i}") for i in range(8)
+            ],
+            "condensed_question": "大模型训练有哪些方法？",
+            "question": "大模型训练有哪些方法？",
+            "doc_count_at_last_reflect": prev_count,
+            "no_new_doc_streak": prev_streak,
+        }
+
+    # iter1: 1 文档 > 基线 0 → streak 归零
+    out1 = await reflect(_state(1, 0, 0))
+    assert out1["judge_verdict"] == "need_rewrite"
+    assert out1["no_new_doc_streak"] == 0
+    assert out1["gate_overrode"] is False
+
+    # iter2: 仍 1 文档，streak=1，未达阈值 → 继续
+    out2 = await reflect(_state(2, out1["doc_count_at_last_reflect"], out1["no_new_doc_streak"]))
+    assert out2["judge_verdict"] == "need_rewrite"
+    assert out2["no_new_doc_streak"] == 1
+    assert out2["gate_overrode"] is False
+
+    # iter3: 仍 1 文档，streak=2 达阈值 → 强制 sufficient + gate_overrode
+    out3 = await reflect(_state(3, out2["doc_count_at_last_reflect"], out2["no_new_doc_streak"]))
+    assert out3["judge_verdict"] == "sufficient"
+    assert out3["gate_overrode"] is True
+    assert out3["widen_context"] is True
+
+
+@pytest.mark.asyncio
+async def test_reflect_convergence_gate_new_doc_resets_streak(monkeypatch):
+    """改写轮次若检索到新文档，streak 应重置（不误杀有价值的重检）。"""
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _JsonLLM(_judge_json("need_rewrite")))
+    monkeypatch.setattr(settings, "agent_convergence_streak", 2)
+
+    # iter1: 单文档 → streak 0, doc_count=1
+    s1 = {"iteration": 1, "accumulated": [_mk(0.9, "a.md", "h1")],
+          "condensed_question": "q", "question": "q",
+          "doc_count_at_last_reflect": 0, "no_new_doc_streak": 0}
+    o1 = await reflect(s1)
+    assert o1["no_new_doc_streak"] == 0 and o1["doc_count_at_last_reflect"] == 1
+
+    # iter2: 出现新文档 b.md（2 文档 > 1）→ streak 重置 0
+    s2 = {"iteration": 2, "accumulated": [_mk(0.9, "a.md", "h1"), _mk(0.8, "b.md", "h2")],
+          "condensed_question": "q", "question": "q",
+          "doc_count_at_last_reflect": o1["doc_count_at_last_reflect"], "no_new_doc_streak": o1["no_new_doc_streak"]}
+    o2 = await reflect(s2)
+    assert o2["no_new_doc_streak"] == 0
+    assert o2["judge_verdict"] == "need_rewrite"  # 未强制
+
+
+@pytest.mark.asyncio
+async def test_reflect_widen_context_set_when_coverage_extra(monkeypatch):
+    """覆盖概览存在 top-N 正文未覆盖的章节 → widen_context=True（④ 触发条件之一）。"""
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _JsonLLM(_judge_json("sufficient")))
+    # 缩小 top_n 到 2：top 正文只覆盖 hiA/hiB，低分 chunk 的 low-heading 不在其中 → widen=True
+    monkeypatch.setattr(settings, "agent_judge_evidence_top_n", 2)
+    results = [_mk(0.9, "a.md", "hiA"), _mk(0.8, "a.md", "hiB"), _mk(0.1, "a.md", "low-heading")]
+    s = {"iteration": 1, "accumulated": results,
+         "condensed_question": "q", "question": "q",
+         "doc_count_at_last_reflect": 0, "no_new_doc_streak": 0}
+    out = await reflect(s)
+    assert out["judge_verdict"] == "sufficient"
+    assert out["widen_context"] is True
+
+
+@pytest.mark.asyncio
+async def test_generate_node_widen_includes_extra_chunks(monkeypatch):
+    """widen_context=True 时生成上下文应放宽到 agent_generate_widen_top_k，纳入低分但相关的 chunk。"""
+    _CaptureLLM.captured = []
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
+    # 8 条 chunk，分数从 0.8 到 0.1 递减，page_content 各不相同
+    results = [_mk(round(0.8 - i * 0.1, 2), "a.md", f"h{i}") for i in range(8)]
+
+    # 不放宽：top-5，仅前 5 条进上下文
+    await generate_node({"accumulated": results, "iteration": 1, "judge_verdict": "sufficient",
+                          "widen_context": False, "gate_overrode": False,
+                          "question": "q", "condensed_question": "q",
+                          "history": [], "history_messages": []})
+    ctx_narrow = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, HumanMessage))
+    narrow_count = sum(1 for i in range(8) if f"content-{round(0.8 - i*0.1,2)}" in ctx_narrow)
+
+    # 放宽：top-10，全部 8 条进上下文
+    await generate_node({"accumulated": results, "iteration": 1, "judge_verdict": "sufficient",
+                          "widen_context": True, "gate_overrode": False,
+                          "question": "q", "condensed_question": "q",
+                          "history": [], "history_messages": []})
+    ctx_wide = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, HumanMessage))
+    wide_count = sum(1 for i in range(8) if f"content-{round(0.8 - i*0.1,2)}" in ctx_wide)
+
+    assert narrow_count == settings.top_k_rerank
+    assert wide_count == 8
+
+
+@pytest.mark.asyncio
+async def test_generate_node_honest_disclosure_on_gate_overrode(monkeypatch):
+    """③ 诚实声明：gate_overrode 时，生成 prompt 末尾应附『知识库已穷尽』提示，且不缩小上下文。"""
+    _CaptureLLM.captured = []
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
+    await generate_node({"accumulated": [_mk(0.9, "a.md", "h1")], "iteration": 2,
+                          "judge_verdict": "need_rewrite", "widen_context": True, "gate_overrode": True,
+                          "question": "q", "condensed_question": "q",
+                          "history": [], "history_messages": []})
+    ctx = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, HumanMessage))
+    assert "可能未涵盖" in ctx
+    # 上下文仍包含已检索片段（未被缩小）
+    assert "content-0.9" in ctx
 
 # ──────────────────────────────────────────────
 # Graph Expand 节点测试

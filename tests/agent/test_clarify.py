@@ -307,10 +307,14 @@ def test_format_judge_evidence_sorts_and_truncates(monkeypatch):
     ]
     text = _format_judge_evidence(results)
     assert "A" in text and "B" in text
-    assert "C" not in text                     # top_n=2 截断掉最低分
+    # 正文按 top_n 截断：最低分 C 的正文不应出现在证据正文里
+    assert "低分内容" not in text
     assert text.index("A") < text.index("B")   # 按分降序
     assert "一、背景" in text                   # heading_path 参与判定
     assert len(text) < 200                     # 正文按 chars 截断
+    # 末尾附『知识库覆盖概览』：列出全部已命中笔记标题（含低分 C）→ 支撑 Judge 广度判定
+    assert "【知识库覆盖概览】" in text
+    assert "《C》" in text
 
 
 def test_format_judge_evidence_empty():

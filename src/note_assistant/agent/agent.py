@@ -69,6 +69,11 @@ class AgentState(TypedDict):
     condense_candidates: List[str]               # 上一轮召回的竞争主题，供澄清时作选项
     just_clarified: bool                         # 上一轮刚反问过 → 本轮禁止再反问
     clarified: bool                              # 本轮答案是澄清问句（runner 据此跳过缓存收录）
+    # === 收敛闸门 / 反向放宽（2026-08-02 修复同文档空转）===
+    doc_count_at_last_reflect: int               # 上一次 reflect 时的独特文档数（收敛闸门基线）
+    no_new_doc_streak: int                       # 连续「新增独特文档 = 0」的轮数
+    widen_context: bool                          # 生成窗口是否反向放宽（覆盖视图/闸门放行时置 True）
+    gate_overrode: bool                          # 收敛闸门是否覆盖了 Judge 的 need_* 判定（诚实声明用）
 
 
 # ──────────────────────────────────────────────
@@ -154,7 +159,12 @@ JUDGE_SYSTEM = (
     "\n"
     "关键原则：\n"
     "- 只要片段的标题或内容与问题的核心实体/主题直接匹配，且包含了回答问题所需的关键信息（如阶段、步骤、列表），就必须判 >= 1.0。\n"
+    "- 证据末尾附有『知识库覆盖概览』：列出所有已命中笔记的标题与各章节（heading）。"
+    "这是**广度判断**依据——若问题的某个子主题在概览中有对应章节标题，即视为该主题已被知识库覆盖，"
+    "可判 sufficient，不必要求该片段正文完整出现在 top 正文里。覆盖即足够，不要求逐字精读。\n"
     "- 不要因为'希望找到更详细/更完整的资料'就判 need_rewrite。sufficient 不代表完美，代表'足够回答'。\n"
+    "- 若多次改写检索后『知识库覆盖概览』始终没有新文档/新章节出现，说明知识库已穷尽，"
+    "此时即使内容不完全也应判 sufficient（生成阶段会如实提示用户），不要继续空转。\n"
     "- 检索次数已达上限时，即使觉得不够也判 give_up，不要无限循环。\n"
     "\n"
     "只输出 JSON 对象：\n"
@@ -215,6 +225,57 @@ def _norm_verdict(v: str) -> str:
     return v
 
 
+def _coverage_view(results: List[RetrievalResult]) -> str:
+    """生成『知识库覆盖概览』：去重后的文档标题 + 各级 heading 清单（① 治本修复 Judge 盲判）。
+
+    Judge 判断「某子主题在库里有没有被覆盖」本质是**广度问题**，不需要逐条读正文。
+    给 heading 树，Judge 用极低 token 即可确认主题覆盖，不会被低分正文带偏——
+    这正是「第一轮其实已命中预训练章节，却因正文排第 6 被 top-N 截断而误判 need_rewrite」的根因解法。
+    """
+    if not results:
+        return "（无覆盖概览）"
+    # 按文档标题聚合并去重 heading（heading_path 形如「一、背景 > 检索方法」）
+    by_title: dict[str, list[str]] = {}
+    for r in results:
+        meta = r.metadata if isinstance(r.metadata, dict) else {}
+        title = meta.get("title", "未知笔记") or "未知笔记"
+        heading = (meta.get("heading_path", "") or "").strip()
+        by_title.setdefault(title, [])
+        if heading and heading not in by_title[title]:
+            by_title[title].append(heading)
+    lines = [
+        "【知识库覆盖概览】以下为已检索笔记的标题与章节（用于判断主题是否已覆盖，"
+        "不要求正文完整）："
+    ]
+    for title, headings in by_title.items():
+        lines.append(f"· 《{title}》")
+        for h in headings:
+            lines.append(f"    - {h}")
+    return "\n".join(lines)
+
+
+def _coverage_has_extra_topics(results: List[RetrievalResult], top_n: int) -> bool:
+    """覆盖概览里的 heading 是否超出 top-N 正文所覆盖的 heading（即存在低分但相关的章节）。
+
+    返回 True 表示：Judge 可能基于覆盖概览放行，但生成若只取 top-N 正文会把这些
+    低分相关内容裁掉——此时需要反向放宽生成窗口（④）。
+    """
+    if not results:
+        return False
+    ranked = sorted(results, key=lambda r: r.score, reverse=True)[:top_n]
+    top_headings = {
+        (r.metadata.get("heading_path", "") if isinstance(r.metadata, dict) else "")
+        for r in ranked
+    }
+    all_headings = {
+        (r.metadata.get("heading_path", "") if isinstance(r.metadata, dict) else "")
+        for r in results
+    }
+    extra = all_headings - top_headings
+    extra.discard("")
+    return len(extra) > 0
+
+
 def _format_judge_evidence(results: List[RetrievalResult]) -> str:
     """把已检索片段格式化成 Judge 的证据清单（P0：修复 Judge 盲判）。
 
@@ -223,7 +284,9 @@ def _format_judge_evidence(results: List[RetrievalResult]) -> str:
     Judge 一直在盲判，``relevance_score`` 全靠猜，这也是原 prompt 不得不用
     极重措辞去压 need_rewrite 的根因。
 
-    这里按分数降序取 top-N，每条给出「标题 + heading_path + 正文摘要」。
+    这里按分数降序取 top-N 正文，每条给出「标题 + heading_path + 正文摘要」；
+    末尾附「知识库覆盖概览」（① 治本）：去重后的文档标题 + 各级 heading 树，
+    让 Judge 即使 top-N 正文没覆盖某主题，也能从 heading 确认其已被库覆盖。
     正文按 ``agent_judge_evidence_chars`` 截断，避免撑爆 Judge 的上下文
     （Judge 只需判断相关性，不需要读全文）。
     """
@@ -240,7 +303,8 @@ def _format_judge_evidence(results: List[RetrievalResult]) -> str:
         head = f"[{i}] 《{title}》" + (f" — {heading}" if heading else "")
         body = (r.page_content or "").strip().replace("\n", " ")[:limit]
         parts.append(f"{head}\n{body}")
-    return "\n\n".join(parts)
+    coverage = _coverage_view(results)
+    return "\n\n".join(parts) + "\n\n" + coverage
 
 
 def _format_context(results: List[RetrievalResult]) -> str:
@@ -254,12 +318,16 @@ def _format_context(results: List[RetrievalResult]) -> str:
     return "\n\n".join(parts)
 
 
-def _top_k_context(results: List[RetrievalResult]) -> List[RetrievalResult]:
-    """生成前 Top-K 裁剪：按分数降序，截断到 top_k_rerank，防止超窗口。"""
+def _top_k_context(results: List[RetrievalResult], top_k: int = None) -> List[RetrievalResult]:
+    """生成前 Top-K 裁剪：按分数降序，截断到 top_k（默认 top_k_rerank），防止超窗口。
+
+    ``top_k`` 可被调用方覆盖（④ 反向放宽：覆盖视图/闸门放行时放宽到 agent_generate_widen_top_k）。
+    """
     if not results:
         return []
+    k = top_k if top_k is not None else settings.top_k_rerank
     ranked = sorted(results, key=lambda r: r.score, reverse=True)
-    return ranked[: settings.top_k_rerank]
+    return ranked[: k]
 
 
 def _fmt_history(history: list) -> List[BaseMessage]:
@@ -423,6 +491,39 @@ async def reflect(state: AgentState) -> dict:
             "evidence_items": len(state["accumulated"]),
         },
     )
+
+    # ── ① 反向放宽判定：覆盖概览里存在 top-N 正文未覆盖的章节（低分但相关的片段）──
+    # 若 Judge 据此放行，生成时必须放宽窗口，否则这些内容会在生成端被裁掉（④ 的触发条件之一）。
+    widen_context = _coverage_has_extra_topics(
+        state["accumulated"], settings.agent_judge_evidence_top_n
+    )
+
+    # ── ③④ 收敛闸门：连续 streak 轮改写后「新增独特文档数 = 0」→ 确定性强制 sufficient ──
+    # 直接切断「对同一篇文档换同义词反复重检」的死循环，不靠 LLM 自觉。
+    # 仅在 Judge 本想 need_rewrite / need_more（继续检索）时才评估；sufficient/give_up 直接放行。
+    gate_overrode = False
+    current_docs = {r.filepath for r in state["accumulated"] if r.filepath}
+    current_doc_count = len(current_docs)
+    prev_doc_count = state.get("doc_count_at_last_reflect", 0)
+    streak = state.get("no_new_doc_streak", 0)
+    if verdict in ("need_rewrite", "need_more") and state["iteration"] >= 1:
+        if current_doc_count <= prev_doc_count:
+            streak += 1
+        else:
+            streak = 0  # 本轮检索到了新文档 → 重置，给 Judge 更多机会
+        if streak >= settings.agent_convergence_streak:
+            verdict = "sufficient"
+            gate_overrode = True
+            logger.info(
+                "convergence.gate.forced",
+                extra={"streak": streak, "unique_docs": current_doc_count},
+            )
+    else:
+        streak = 0
+
+    # 闸门覆盖（Judge 本想继续但被强制停）或覆盖视图有额外章节 → 都需反向放宽生成窗口
+    widen_context = widen_context or gate_overrode
+
     return {
         "judge_verdict": verdict,
         "rewritten_query": rewritten,
@@ -434,6 +535,10 @@ async def reflect(state: AgentState) -> dict:
             "rewritten_query": rewritten,
             "clarify_question": clarify_q,
         }],
+        "doc_count_at_last_reflect": current_doc_count,
+        "no_new_doc_streak": streak,
+        "widen_context": widen_context,
+        "gate_overrode": gate_overrode,
     }
 
 
@@ -500,6 +605,8 @@ async def rerank_exit(state: AgentState) -> dict:
     """Rerank ②：出口总安检。Judge 判定通过后，对多轮累积做全局精排。
 
     关闭时直接透传，不加载 reranker 模型。
+    ④ 反向放宽：若 ``widen_context`` 为真（覆盖视图/闸门放行），保留条数放宽到
+    ``agent_generate_widen_top_k``，避免低分但相关的内容在生成端被裁掉。
     """
     if not settings.agent_reranker_exit_enabled:
         return {}
@@ -507,7 +614,8 @@ async def rerank_exit(state: AgentState) -> dict:
         return {}
     reranker = get_reranker()
     question = state.get("condensed_question") or state["question"]
-    results = reranker.rerank(question, state["accumulated"], top_k=settings.top_k_rerank)
+    top_k = settings.agent_generate_widen_top_k if state.get("widen_context") else settings.top_k_rerank
+    results = reranker.rerank(question, state["accumulated"], top_k=top_k)
     return {"accumulated": results}
 
 
@@ -515,14 +623,25 @@ async def generate_node(state: AgentState) -> dict:
     """生成节点：用累积去重 + Top-K 裁剪后的上下文生成带引用的答案。
 
     若 Judge 判 give_up 或达到 max_iter 仍证据不足，提示用户「部分信息可能不全」。
+    ④ 反向放宽：``widen_context`` 为真时生成窗口放宽到 ``agent_generate_widen_top_k``，
+    确保覆盖视图/闸门放行所依赖的低分相关内容真正进入生成上下文（不被裁掉）。
+    ③ 诚实声明：仅当收敛闸门覆盖了 Judge 的 need_* 判定（gate_overrode）时，
+    在末尾追加一句「知识库已穷尽」提示——绝因此缩小生成上下文。
     """
     llm = get_llm(temperature=0.6, max_tokens=2048)
-    context = _format_context(_top_k_context(state["accumulated"]))
+    top_k = settings.agent_generate_widen_top_k if state.get("widen_context") else settings.top_k_rerank
+    context = _format_context(_top_k_context(state["accumulated"], top_k=top_k))
     degraded = (
         state.get("judge_verdict") == "give_up"
         or (state["iteration"] >= MAX_ITER and not state["accumulated"])
     )
-    if degraded:
+    if state.get("gate_overrode"):
+        # ③ 诚实声明：检索已穷尽但 Judge 本想继续 → 如实提示，不缩小上下文（④ 已放宽）
+        note = (
+            "\n\n（注：已多次检索但知识库未出现新的相关笔记，以上基于现有最相关内容作答，"
+            "可能未涵盖该主题的全部方面。）\n"
+        )
+    elif degraded:
         note = "\n\n（注：已多次检索但知识库中相关信息有限，以下回答可能不完整。）\n"
     else:
         note = ""
