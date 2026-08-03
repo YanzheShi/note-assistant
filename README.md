@@ -372,7 +372,8 @@ uv run ruff check .           # Lint
 
 - **Vault / 索引**：`vault_path`、`chunk_size`(800)、`chunk_overlap`(150)、`chunking_strategy`(`v1`/`v2`/`v2b`)、`top_k_retrieve`(20)
 - **Embedding / 向量**：`ollama_base_url`、`embed_model`(bge-m3:latest)、`embed_dim`(1024)、`chroma_persist_dir`、`collection_name`
-- **Reranker**：`reranker_model`（本地路径）、`reranker_top_k`(10)、`top_k_rerank`(5)
+- **Reranker**：`reranker_model`（本地路径）、`top_k_rerank`(5)
+- **图扩展护栏**：`graph_expand_max_files`(8)、`graph_expand_max_chunks`(24)
 - **检索融合**：`bm25_weight`(0.3)、`dense_weight`(0.7)
 - **结构优先**：`structure_weight`(0.25)、`structural_min_score`(0.5)、`title_hit_bonus`(0.15)
 - **v2b 父子双存**：`parent_chunk_size`(2000)、`parent_chunk_overlap`(200)、`parent_docstore_path`

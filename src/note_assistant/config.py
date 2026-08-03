@@ -27,7 +27,6 @@ class Settings(BaseSettings):
 
     # === Reranker ===
     reranker_model: str = str(PROJECT_ROOT / "models" / "BAAI" / "bge-reranker-v2-m3")
-    reranker_top_k: int = 10
 
     # === RAGAS ===
     ragas_base_url: str = "http://localhost:11434/v1"
@@ -130,6 +129,10 @@ class Settings(BaseSettings):
     # === Agent Graph Expand（自动图扩展，默认关闭）===
     agent_graph_expand_enabled: bool = False     # 每轮检索后自动沿 [[wikilinks]] 扩展关联笔记
     agent_graph_expand_hop: int = 1              # 扩展跳数
+
+    # === 图扩展扇出护栏（审计修复：背链多的高连接笔记曾导致 context 膨胀/延迟失控）===
+    graph_expand_max_files: int = 8              # 单次扩展最多取几个邻居文件（按扩展分取 top）
+    graph_expand_max_chunks: int = 24            # 单次扩展返回的 chunk 总数上限
 
     # === Agent Reranker（双层精排，可独立开关对比）===
     agent_reranker_loop_enabled: bool = True    # Rerank ①：循环内闸门（tools→reflect）

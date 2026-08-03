@@ -97,6 +97,12 @@ def graph_expand_impl(filepaths: List[str], hop: int = 1) -> List[RetrievalResul
     neighbors = g.expand(set(filepaths), hop=hop)
     if not neighbors:
         return []
+    # 扇出护栏（审计修复）：背链多的高连接笔记在 hop>=2 时会让邻居集爆炸，
+    # 每个邻居再拉全量 chunks → context 膨胀 + 延迟失控。
+    # 双上限：邻居文件数（按扩展分取 top）+ 返回 chunk 总数。
+    neighbors = sorted(neighbors, key=lambda x: x[1], reverse=True)[
+        : settings.graph_expand_max_files
+    ]
     chunks: List[RetrievalResult] = []
     collection = _hybrid_retriever().ingestor.collection
     for filepath, score in neighbors:
@@ -117,6 +123,8 @@ def graph_expand_impl(filepaths: List[str], hop: int = 1) -> List[RetrievalResul
                         metadata=meta or {},
                     )
                 )
+                if len(chunks) >= settings.graph_expand_max_chunks:
+                    return chunks
         except Exception:
             continue
     return chunks

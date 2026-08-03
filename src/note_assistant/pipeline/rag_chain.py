@@ -446,7 +446,9 @@ class RAGChain:
         - 每个检索步骤单独 await asyncio.to_thread，确保事件循环不被阻塞
         - 前端可在收到 trace 事件后立即展示，实现"边检索边显示"
         """
-        top_k = top_k or self.retriever.top_k
+        # 候选池与精排截断分离（审计修复）：旧实现 top_k 误取 retriever.top_k(20)
+        # 并直接作为 rerank 截断 → 上下文塞 20 条 chunk，偏离 ask() 的 top_k_rerank 路径
+        rerank_top_k = top_k if top_k is not None else settings.top_k_rerank
         t_global = time.time()
 
         # ── 检索路由 ──
@@ -485,7 +487,7 @@ class RAGChain:
         # ── 4. 融合排序 ──
         t0 = time.time()
         merged = await asyncio.to_thread(self.retriever._merge_results, dense_results, sparse_results)
-        merged = merged[:top_k]
+        merged = merged[: self.retriever.top_k]  # 候选池同 ask()（top_k_retrieve）
         yield {
             "type": "trace", "step": "hybrid_fusion", "ms": int((time.time() - t0) * 1000),
             "results": len(merged), "status": "done",
@@ -497,7 +499,7 @@ class RAGChain:
         full_ranked = await asyncio.to_thread(
             self.reranker.rerank, question, merged, max(1, len(merged))
         )
-        rerank_result = ensure_image_selected(question, full_ranked, full_ranked[:top_k])
+        rerank_result = ensure_image_selected(question, full_ranked, full_ranked[:rerank_top_k])
         yield {
             "type": "trace", "step": "rerank", "ms": int((time.time() - t0) * 1000),
             "results": len(rerank_result), "status": "done",
@@ -619,11 +621,12 @@ class RAGChain:
         neighbors: List[tuple[str, float]]
     ) -> List[RetrievalResult]:
         """
-        【核心逻辑待实现】从邻居文件中获取 chunks 内容。
+        从邻居文件中获取 chunks 内容。
 
         策略：
         - stub 节点（"[[xxx]]"）跳过
-        - 每个邻居最多取 2 个 chunk（取最前面的）
+        - 扇出护栏：邻居文件数与 chunk 总数双上限（与 graph_expand_impl 同源配置），
+          防背链多的高连接笔记把 context 撑爆
         - 返回 chunk 文本列表
 
         Args:
@@ -632,6 +635,9 @@ class RAGChain:
         Returns:
             [RetrievalResult, ...]
         """
+        neighbors = sorted(neighbors, key=lambda x: x[1], reverse=True)[
+            : settings.graph_expand_max_files
+        ]
         chunks = []
         for filepath, score in neighbors:
             if filepath.startswith("[["):
@@ -653,6 +659,8 @@ class RAGChain:
                                 metadata=meta,
                             )
                         )
+                        if len(chunks) >= settings.graph_expand_max_chunks:
+                            return chunks
 
             except Exception as e:
                 logging.error(e)
