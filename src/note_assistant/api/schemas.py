@@ -71,6 +71,8 @@ class SourceSchema(BaseModel):
 
     # 仅 image 类型
     img_path: Optional[str] = None           # 图片在 Obsidian vault 中的路径
+    asset_id: Optional[str] = None           # 图片资产内容哈希 id（供 /assets 端点定位）
+    img_url: Optional[str] = None            # 图片服务 URL（/assets/{asset_id}），前端优先用此渲染
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -124,11 +126,18 @@ class ConfigResponse(BaseModel):
 # ═══════════════════════════════════════════════════
 
 class AgentSource(BaseModel):
-    """Agent 去重后的单个来源（来自 Context Accumulator）。"""
+    """Agent 去重后的单个来源（来自 Context Accumulator）。
+
+    设计 9.2 /agent 适配项：补齐图片渲染字段，使 Agent 主链路也能把命中图片
+    透传给前端（/ask 路径已在 P0 修好，此处补齐 Agent 路径）。
+    """
     filepath: str = ""
     title: str = ""
     heading: str = ""
     score: Optional[float] = None
+    kind: str = "text"                       # text | table | mermaid | image
+    img_url: Optional[str] = None            # 图片服务 URL（/assets/{asset_id}）
+    render_hint: Optional[str] = None        # mermaid:inline / svg:inline / image:...
 
 
 class AgentTrajectoryItem(BaseModel):

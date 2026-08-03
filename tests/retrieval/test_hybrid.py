@@ -244,6 +244,38 @@ class TestMergeResults:
         scores = [r.score for r in merged]
         assert scores == sorted(scores, reverse=True)
 
+    def test_dense_hit_not_punished_by_sparse_miss(self):
+        """dense 高分但 sparse 未命中的文档，不应被归一化成负分而挤出前列。
+
+        回归：旧实现把 raw_sparse=0 直接代入 (0-min_s)/s_rng，当 min_s>0 时
+        sparse_norm 为负数，导致 dense=1.0 的文档 final 为负。修复后未命中
+        的 sparse_norm 应为 0，dense 高分的文档应排在首位。
+        """
+        corpus = _make_corpus(3)
+        retriever = HybridRetriever(alpha=0.7)
+
+        # dense 高度自信地命中 doc_0
+        dense = [
+            RetrievalResult(score=1.0, page_content=corpus[0].page_content, metadata=corpus[0].metadata),
+        ]
+        # sparse 只命中 doc_1/doc_2，且分数都 > 0（这是触发旧 bug 的条件）
+        sparse = [
+            RetrievalResult(score=10.0, page_content=corpus[1].page_content, metadata=corpus[1].metadata),
+            RetrievalResult(score=5.0, page_content=corpus[2].page_content, metadata=corpus[2].metadata),
+        ]
+
+        merged = retriever._merge_results(dense, sparse)
+        # doc_0 应排第一
+        assert merged[0].page_content == corpus[0].page_content
+        assert merged[0].dense_score == 1.0
+        assert merged[0].sparse_score == 0.0
+        assert merged[0].score > 0.0
+
+        # doc_1 的 sparse_norm=1.0，final=0.3；doc_0 的 final=0.7
+        doc0 = next(r for r in merged if r.page_content == corpus[0].page_content)
+        doc1 = next(r for r in merged if r.page_content == corpus[1].page_content)
+        assert doc0.score > doc1.score
+
 
 # ================================================================
 # search (integration)

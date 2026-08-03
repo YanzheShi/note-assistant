@@ -6,7 +6,7 @@
     text    — 展开显示预览片段（preview）
     table   — 展开显示 preview + raw_table（Markdown 表格）
     mermaid — 展开显示 preview + raw_mermaid（流程图源码或渲染）
-    image   — 展开显示图片路径 + 上下文描述（V1 不支持图片显示）
+    image   — 展开显示图片（P2 起支持；经 /assets 端点 + 后端地址渲染）
 """
 
 import os
@@ -19,11 +19,13 @@ import streamlit as st
 _render_counter = count()
 
 
-def _render_image(img_path: str, caption: str = "") -> None:
+def _render_image(img_path: str, caption: str = "", base_url: str = "") -> None:
     """
     渲染来源图片。
 
     三种形态分别处理：
+      - /assets/{id} 相对 URL（P2 统一资产端点）→ 拼后端地址（由 render_sources 透传，
+        或回退到 BACKEND_BASE_URL 环境变量）后交给 st.image
       - 远程 URL（本 vault 的主力形态）→ 直接交给 st.image，无需落盘
       - vault 内相对路径 → 拼 VAULT_PATH 再判断存在性。历史实现直接
         `os.path.exists(相对路径)`，是相对 Streamlit 进程 cwd 解析的，必然为 false
@@ -31,6 +33,18 @@ def _render_image(img_path: str, caption: str = "") -> None:
         属 P1 的 AttachmentIndex 范畴，此处只做友好降级提示
     """
     st.markdown(f"**图片：** `{img_path}`")
+
+    # P2：统一资产端点 /assets/{id}（内容哈希，前端零路径猜测）
+    if img_path.startswith("/assets/"):
+        base = (base_url or os.environ.get("BACKEND_BASE_URL", "")).rstrip("/")
+        if base:
+            st.image(base + img_path, caption=caption or "参考图片")
+            return
+        st.caption(
+            "图片无法渲染：未提供后端地址。请在侧边栏填写 API 地址，"
+            "或启动 Streamlit 时设置 BACKEND_BASE_URL 环境变量。"
+        )
+        return
 
     if img_path.startswith(("http://", "https://", "data:")):
         st.image(img_path, caption=caption or "参考图片")
@@ -52,7 +66,7 @@ def _render_image(img_path: str, caption: str = "") -> None:
     st.caption("图片文件不可见（vault 内短名引用需附件索引解析，见 P1）")
 
 
-def render_sources(sources: list[dict]):
+def render_sources(sources: list[dict], backend_base_url: str = ""):
     """
     来源折叠展示，按类型区分渲染。
 
@@ -80,7 +94,9 @@ def render_sources(sources: list[dict]):
     # ── 来源统计徽章 ──
     type_counts = {}
     for s in sources:
-        t = s.get("type", "text")
+        # /ask 链路发 type 字段；/agent 链路（runner._sources_from_results）发 kind 字段。
+        # 前端统一兼容两种键名，避免图片来源被误标成 text、徽章统计失真。
+        t = s.get("type") or s.get("kind") or "text"
         type_counts[t] = type_counts.get(t, 0) + 1
 
     badges = " ".join(f"`{t}`×{c}" for t, c in type_counts.items())
@@ -92,7 +108,7 @@ def render_sources(sources: list[dict]):
     type_icons = {"text": "📝", "table": "📊", "mermaid": "🔀", "image": "🖼️"}
 
     for i, src in enumerate(sources):
-        src_type = src.get("type", "text")
+        src_type = src.get("type") or src.get("kind") or "text"
         icon = type_icons.get(src_type, "📄")
         filepath = src.get("filepath", "未知")
         heading = src.get("heading", "")
@@ -140,5 +156,10 @@ def render_sources(sources: list[dict]):
                 except ImportError:
                     st.code(mermaid_src, language="mermaid")
 
-            if src.get("img_path"):
-                _render_image(src["img_path"], caption=preview)
+            if src.get("img_url") or src.get("img_path"):
+                # P2：优先用 /assets 统一 URL，其次退回原始 img_path（远程/本地）
+                _render_image(
+                    src.get("img_url") or src["img_path"],
+                    caption=preview,
+                    base_url=backend_base_url,
+                )

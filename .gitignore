@@ -9,6 +9,8 @@ build/
 
 # === 虚拟环境 & 密钥（重中之重）===
 .venv/
+.testvenv/
+.uvcache/
 .env
 .env.local
 
@@ -21,6 +23,9 @@ build/
 # === 工具缓存 ===
 .ruff_cache/
 .pytest_cache/
+# pytest --basetemp 产物 / 本地跑测试的日志
+.pytest_tmp*/
+pytest_*.log
 
 # === 项目运行时产物 ===
 # 向量库（代码默认路径）

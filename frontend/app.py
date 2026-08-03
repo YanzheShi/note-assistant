@@ -18,6 +18,7 @@ if str(_root) not in sys.path:
 import streamlit as st  # noqa: E402
 import httpx  # noqa: E402
 from frontend.components import render_sources  # noqa: E402
+from frontend.utils import rewrite_asset_urls  # noqa: E402
 
 # ─── 页面配置 ───
 st.set_page_config(page_title="Obsidian RAG", layout="wide", page_icon="📚")
@@ -25,7 +26,7 @@ st.set_page_config(page_title="Obsidian RAG", layout="wide", page_icon="📚")
 # ─── 状态 ───
 for key, default in [
     ("messages", []),
-    ("trace_mode", False), ("session_id", str(uuid.uuid4())),
+    ("trace_mode", True), ("session_id", str(uuid.uuid4())),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -35,7 +36,7 @@ with st.sidebar:
     st.markdown("## 🔧 设置")
     API_URL = st.text_input("API 地址", value="http://localhost:8005")
     st.session_state.trace_mode = st.checkbox(
-        "追踪模式（显示推理过程）", value=False,
+        "追踪模式（显示推理过程）", value=True,
         help="实时展示：路由判定 → 工具调用 → 观察结果 → 反思判定 → 答案")
     st.markdown("---")
     if st.button("🗑️ 清空对话"):
@@ -72,9 +73,10 @@ def _typewriter(placeholder, text: str, chunk: int = 4, delay: float = 0.008):
 # ─── 聊天历史 ───
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+        # 渲染时重写 /assets/ 相对 URL（存原文，API 地址变更后历史仍可渲染图片）
+        st.markdown(rewrite_asset_urls(msg["content"], API_URL))
         if msg["role"] == "assistant" and "sources" in msg:
-            render_sources(msg["sources"])
+            render_sources(msg["sources"], backend_base_url=API_URL)
 
 # ─── 输入 ───
 question = st.chat_input("问我你的笔记里有什么...")
@@ -157,14 +159,17 @@ with st.chat_message("assistant"):
 
             elif etype == "answer":
                 answer_text = event.get("content", "")
+                # 答案正文的图片 URL 是 /assets/{id} 相对路径，必须拼后端地址，
+                # 否则浏览器向 Streamlit 端口请求 → 404，图不可见（来源面板不受影响）
+                render_text = rewrite_asset_urls(answer_text, API_URL)
                 if trace_container is not None:
                     # 答案嵌进流程：显示在「信息充足，生成答案」之后、「✅ 完成」之前
                     with trace_container:
                         with st.expander("📝 答案", expanded=True):
                             _aw = st.empty()
-                            _typewriter(_aw, answer_text)
+                            _typewriter(_aw, render_text)
                 else:
-                    _typewriter(streaming_placeholder, answer_text)
+                    _typewriter(streaming_placeholder, render_text)
 
             elif etype == "sources":
                 sources_list = event.get("sources", []) or []
@@ -197,7 +202,7 @@ with st.chat_message("assistant"):
                 st.markdown("✅ 完成")
 
         if sources_list:
-            render_sources(sources_list)
+            render_sources(sources_list, backend_base_url=API_URL)
 
         full_answer = answer_text
         result["run_id"] = run_id

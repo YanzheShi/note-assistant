@@ -41,6 +41,7 @@ from note_assistant.retrieval.reranker import get_reranker
 from note_assistant.config import settings
 from note_assistant.llm.client import get_llm
 from note_assistant.retrieval.types import RetrievalResult
+from note_assistant.pipeline.image_answer import ensure_image_selected, expand_image_neighbors
 
 MAX_ITER = settings.agent_max_iter
 
@@ -190,6 +191,10 @@ GENERATE_SYSTEM = (
     "1. 基于下面的「参考笔记」回答，不要编造笔记中不存在的内容。\n"
     "2. 如果参考笔记为空，说明知识库中缺少相关信息，请如实告知用户。\n"
     "3. 回答要简洁、结构化，使用 Markdown，并标注引用笔记标题。\n"
+    "4. 参考笔记中标注【图片】的条目来自笔记里的插图，其内容由视觉模型解析得到。\n"
+    "   - 引用图片信息时，说明\"根据笔记中的架构图/流程图\"，不要说\"根据文档描述\"\n"
+    "   - 如果图片信息对回答有帮助，在相应位置插入 [[IMG:asset_id]] 标记，系统会自动替换为图片\n"
+    "   - 严禁描述图片解析结果中不存在的细节\n"
 )
 
 CHAT_SYSTEM = (
@@ -311,9 +316,16 @@ def _format_context(results: List[RetrievalResult]) -> str:
     """把去重/裁剪后的结果格式化为生成上下文。"""
     if not results:
         return "（无参考笔记）"
+    from note_assistant.pipeline.image_answer import render_image_block
+
     parts = []
     for i, r in enumerate(results, 1):
         title = r.metadata.get("title", "未知笔记")
+        block = render_image_block(r)
+        if block is not None:
+            # image chunk：结构化渲染 + [[IMG:asset_id]] 引用标记
+            parts.append(f"### [{i}] {title}\n{block}")
+            continue
         parts.append(f"### [{i}] {title}\n{r.page_content}")
     return "\n\n".join(parts)
 
@@ -413,8 +425,10 @@ async def tools_node(state: AgentState) -> dict:
     cm = get_context_manager()
     new_messages: list[BaseMessage] = []
     accumulated = list(state["accumulated"])
-    # 确定性去重：用 (filepath, heading) 作 key
-    seen = {(r.filepath, r.metadata.get("heading_path", "")) for r in accumulated}
+    # 确定性去重：用 identity_key（filepath, heading, kind, placeholder）。
+    # 不能只用 (filepath, heading)——image summary chunk 与同节正文/父块共享
+    # heading，旧键会让二者按分数竞速二选一，图片常被长文本挤掉（图不显示的根因之一）。
+    seen = {r.identity_key() for r in accumulated}
     new_before = len(accumulated)
     for tc in last.tool_calls:
         # 工具调用可能含同步 LLM（query_rewrite），放到线程避免阻塞事件循环
@@ -423,7 +437,7 @@ async def tools_node(state: AgentState) -> dict:
         )
         obs_text = cm.truncate_observation(obs_text, settings.agent_obs_token_budget)
         for r in results:
-            key = (r.filepath, r.metadata.get("heading_path", ""))
+            key = r.identity_key()
             if key not in seen:
                 seen.add(key)
                 accumulated.append(r)
@@ -571,12 +585,12 @@ async def graph_expand_node(state: AgentState) -> dict:
     new_chunks = graph_expand_impl(filepaths, hop=settings.agent_graph_expand_hop)
     if not new_chunks:
         return {}
-    # 去重合并：按 (filepath, heading) 去重
+    # 去重合并：与 tools_node 同一 identity_key（富结构 chunk 不因同章节被挤掉）
     accumulated = list(state["accumulated"])
-    seen = {(r.filepath, r.metadata.get("heading_path", "")) for r in accumulated}
+    seen = {r.identity_key() for r in accumulated}
     added = 0
     for r in new_chunks:
-        key = (r.filepath, r.metadata.get("heading_path", ""))
+        key = r.identity_key()
         if key not in seen:
             seen.add(key)
             accumulated.append(r)
@@ -590,6 +604,10 @@ async def rerank_loop(state: AgentState) -> dict:
     """Rerank ①：循环内闸门。每轮工具调用后，对 accumulated 做精排，保留 top-k。
 
     关闭时直接透传，不加载 reranker 模型。
+
+    图片保位：图意图 query 的精排 top-k 里没有 image chunk 时，从全量精排结果
+    里把最高分的图片补进（ensure_image_selected）——融合阶段的图意图 boost
+    会被交叉编码器清零，不加护栏图片常被长正文挤出窗口。
     """
     if not settings.agent_reranker_loop_enabled:
         return {}
@@ -597,7 +615,9 @@ async def rerank_loop(state: AgentState) -> dict:
         return {}
     reranker = get_reranker()
     question = state.get("condensed_question") or state["question"]
-    results = reranker.rerank(question, state["accumulated"], top_k=settings.agent_reranker_loop_top_k)
+    full = reranker.rerank(question, state["accumulated"], top_k=len(state["accumulated"]))
+    selected = full[: settings.agent_reranker_loop_top_k]
+    results = ensure_image_selected(question, full, selected)
     return {"accumulated": results}
 
 
@@ -607,6 +627,8 @@ async def rerank_exit(state: AgentState) -> dict:
     关闭时直接透传，不加载 reranker 模型。
     ④ 反向放宽：若 ``widen_context`` 为真（覆盖视图/闸门放行），保留条数放宽到
     ``agent_generate_widen_top_k``，避免低分但相关的内容在生成端被裁掉。
+    图片保位：同 rerank_loop——图意图 query 的 top-k 里没有 image chunk 时，
+    从全量精排结果补入最高分图片，保证生成/来源端至少能看到一张相关图。
     """
     if not settings.agent_reranker_exit_enabled:
         return {}
@@ -615,8 +637,31 @@ async def rerank_exit(state: AgentState) -> dict:
     reranker = get_reranker()
     question = state.get("condensed_question") or state["question"]
     top_k = settings.agent_generate_widen_top_k if state.get("widen_context") else settings.top_k_rerank
-    results = reranker.rerank(question, state["accumulated"], top_k=top_k)
+    full = reranker.rerank(question, state["accumulated"], top_k=len(state["accumulated"]))
+    selected = full[:top_k]
+    results = ensure_image_selected(question, full, selected)
     return {"accumulated": results}
+
+
+def _fetch_text_neighbors_by_heading(heading_paths: List[str]) -> List[RetrievalResult]:
+    """从 ChromaDB 取同 heading_path 的文本 chunk（图片邻居扩展用，与 rag_chain 同源）。
+
+    取不到 / 越界 / 异常 → 返回空列表，绝不中断生成。
+    """
+    from note_assistant.agent import tools as agent_tools
+
+    try:
+        collection = agent_tools._hybrid_retriever().ingestor.collection
+        res = collection.get(
+            where={"heading_path": {"$in": heading_paths}},
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return []
+    out: List[RetrievalResult] = []
+    for doc, meta in zip(res.get("documents") or [], res.get("metadatas") or []):
+        out.append(RetrievalResult(score=0.0, page_content=doc, metadata=meta or {}))
+    return out
 
 
 async def generate_node(state: AgentState) -> dict:
@@ -627,10 +672,16 @@ async def generate_node(state: AgentState) -> dict:
     确保覆盖视图/闸门放行所依赖的低分相关内容真正进入生成上下文（不被裁掉）。
     ③ 诚实声明：仅当收敛闸门覆盖了 Judge 的 need_* 判定（gate_overrode）时，
     在末尾追加一句「知识库已穷尽」提示——绝因此缩小生成上下文。
+    #4 图片邻居扩展（设计 7.3）：命中 image chunk 时带出同章节文本邻居，
+    防图片脱离上下文被误解。邻居只进生成上下文、不回写 ``state["accumulated"]``
+    （不污染 sources / Judge 证据），与 rag_chain 行为对齐。
     """
     llm = get_llm(temperature=0.6, max_tokens=2048)
     top_k = settings.agent_generate_widen_top_k if state.get("widen_context") else settings.top_k_rerank
-    context = _format_context(_top_k_context(state["accumulated"], top_k=top_k))
+    # #4：先 Top-K 裁剪，再把图片邻居补在末尾（邻居 score=0，确保不被截断出局）
+    top_results = _top_k_context(state["accumulated"], top_k=top_k)
+    expanded = expand_image_neighbors(state["accumulated"], _fetch_text_neighbors_by_heading)
+    context = _format_context(top_results + expanded)
     degraded = (
         state.get("judge_verdict") == "give_up"
         or (state["iteration"] >= MAX_ITER and not state["accumulated"])

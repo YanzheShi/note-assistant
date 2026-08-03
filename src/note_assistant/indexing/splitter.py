@@ -189,47 +189,82 @@ def split_v2b(
         return " > ".join(p for p in parts if p) or "无标题"
 
     def _top_header(meta: dict) -> str:
-        """取文档中最高（最浅）层级的标题，作为父块分段依据。
+        """取文档中最高（最浅）层级的『章节』标题，作为父块分段依据。
 
-        无 h1 时回退到 h2/h3/h4，避免从 `##` 起手的笔记把所有章节
-        合并进同一个父块（原实现只看 h1，缺 h1 时换段条件恒为假）。
+        跳过 h1（通常是文档标题，所有章节共享），优先用 h1 之下的第一级
+        标题（h2/h3/h4）做换段键——否则带 h1 的文档所有章节会因共享同一个
+        h1 而被合并进同一个父块，父段 heading_path 塌缩成只剩文档标题。
+        无 h2/h3/h4 时才回退到 h1。
         """
-        for k in ["h1", "h2", "h3", "h4"]:
+        for k in ["h2", "h3", "h4", "h1"]:
             v = meta.get(k, "")
             if v:
                 return v
         return ""
 
-    # 2. 同「最高层级标题」内、按预算合并成父段
-    parent_segments: List[Dict[str, str]] = []
-    run: List[Dict[str, str]] = []
-    run_len = 0
+    def _common_prefix_hp(hps: List[str]) -> str:
+        """取若干 heading_path 的公共前缀（按 ' > ' 切分），作为合并父段的章节标题。
 
-    def _flush(r: List[Dict[str, str]]) -> None:
-        if not r:
-            return
-        seg_text = "\n\n".join(x["text"] for x in r)
-        hp = r[0]["hp"]
-        # 合并后仍超预算 → 用 parent_sp 再切成 bounded 段
-        if len(seg_text) <= settings.parent_chunk_size:
-            parent_segments.append({"hp": hp, "text": seg_text})
-        else:
-            for p in parent_sp.split_text(seg_text):
-                parent_segments.append({"hp": hp, "text": p})
+        例：['A > 二、关键设计点 > 2.1 X', 'A > 二、关键设计点 > 2.2 Y']
+        → 'A > 二、关键设计点'（整节标题），而不是只取首个子节的标题。
 
+        这是修复「同一 ## 下多个 ### 子节被合并成一个父段时，父段 heading_path
+        只取首个子节、其余子节标题永久丢失」的根因：每个 child 仍保留自身子节
+        heading_path（见下），父段则用公共前缀表示「整节」。
+        """
+        if not hps:
+            return "无标题"
+        splits = [h.split(" > ") for h in hps]
+        prefix = splits[0]
+        for s in splits[1:]:
+            i = 0
+            while i < len(prefix) and i < len(s) and prefix[i] == s[i]:
+                i += 1
+            prefix = prefix[:i]
+        return " > ".join(prefix) if prefix else "无标题"
+
+    # 2. 预切：每个 section 先细分成 child（各自带自身子节 heading_path），
+    #    同时保留整节正文用于后续合并父段。
+    section_data: List[Dict[str, Any]] = []
     for s in sections:
         hp = _hp(s.metadata)
         key = _top_header(s.metadata)
-        rec = {"hp": hp, "text": s.page_content, "key": key}
-        if run and (key != run[0]["key"] or run_len + len(rec["text"]) > settings.parent_chunk_size):
+        kids = [{"hp": hp, "text": cd} for cd in child_sp.split_text(s.page_content)]
+        section_data.append({"hp": hp, "key": key, "text": s.page_content, "kids": kids})
+
+    # 3. 同「最高层级标题」内、按预算合并成父段
+    parent_segments: List[Dict[str, Any]] = []
+    run: List[Dict[str, Any]] = []
+    run_len = 0
+
+    def _flush(r: List[Dict[str, Any]]) -> None:
+        if not r:
+            return
+        seg_text = "\n\n".join(x["text"] for x in r)   # 整节正文拼接 → 父块
+        seg_hp = _common_prefix_hp([x["hp"] for x in r])
+        kids = []
+        for x in r:
+            kids.extend(x["kids"])
+        # 合并后仍超预算 → 用 parent_sp 再切成 bounded 段（丢弃子节粒度，回退整段 hp）
+        if len(seg_text) <= settings.parent_chunk_size:
+            parent_segments.append({"hp": seg_hp, "text": seg_text, "kids": kids})
+        else:
+            for p in parent_sp.split_text(seg_text):
+                p_kids = [{"hp": seg_hp, "text": cd} for cd in child_sp.split_text(p)]
+                parent_segments.append({"hp": seg_hp, "text": p, "kids": p_kids})
+
+    for sd in section_data:
+        if run and (sd["key"] != run[0]["key"] or run_len + len(sd["text"]) > settings.parent_chunk_size):
             _flush(run)
             run = []
             run_len = 0
-        run.append(rec)
-        run_len += len(rec["text"])
+        run.append(sd)
+        run_len += len(sd["text"])
     _flush(run)
 
-    # 3. 每个父段 → 1 个 parent Chunk + N 个 child Chunk
+    # 4. 每个父段 → 1 个 parent Chunk + N 个 child Chunk
+    #    parent 用整节公共前缀标题；child 各自保留自身子节 heading_path
+    #    （结构优先 boost / 图片邻居扩展都依赖 child 的精确子节标题）。
     children: List[Chunk] = []
     parents: List[Chunk] = []
     safe_fp = node.filepath.replace("/", "_").replace("\\", "_")
@@ -244,13 +279,13 @@ def split_v2b(
                 "heading_path": seg["hp"],
             },
         ))
-        for cd in child_sp.split_text(seg["text"]):
+        for kid in seg["kids"]:
             children.append(Chunk(
-                page_content=cd,
+                page_content=kid["text"],
                 metadata={
                     "parent_id": pid,
                     "kind": "text",
-                    "heading_path": seg["hp"],
+                    "heading_path": kid["hp"],
                 },
             ))
 

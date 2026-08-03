@@ -601,3 +601,163 @@ def test_graph_expand_node_dedup(monkeypatch):
     assert len(result["accumulated"]) == 2  # existing + new_unique，new_dup 被去重
     fps = {(r.filepath, r.metadata.get("heading_path", "")) for r in result["accumulated"]}
     assert fps == {("a.md", "h1"), ("b.md", "h2")}
+
+
+# ──────────────────────────────────────────────
+# 去重：图片与同节文本/父块共存（identity_key）
+# ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_tools_node_image_and_parent_coexist(monkeypatch):
+    """同 (filepath, heading) 的 image summary chunk 与父块必须都进 accumulated。
+
+    旧去重键 (filepath, heading) 让二者按分数竞速二选一——图意图 query 图赢、
+    普通 query 长文赢，这是「有的 case 图进 sources、有的不进」的直接原因。
+    """
+    from note_assistant.agent.context import ContextManager, set_context_manager_for_test
+
+    set_context_manager_for_test(ContextManager(embed_fn=None))
+    try:
+        parent = RetrievalResult(score=0.9, page_content="整节正文", metadata={
+            "filepath": "n.md", "heading_path": "H1", "kind": "parent", "title": "T"})
+        img = RetrievalResult(score=0.5, page_content="图片理解：三层架构", metadata={
+            "filepath": "n.md", "heading_path": "H1", "kind": "image",
+            "placeholder": "[IMAGE_UID_aaaaaaaa]", "title": "T"})
+
+        # 父块在前（分数高）——旧实现在这里就把图片丢了
+        monkeypatch.setattr(agent_mod, "run_tool_call",
+                            lambda name, args: ("obs", [parent, img]))
+        state = {
+            "messages": [_ai_with_tools({"name": "hybrid_search", "args": {"query": "架构图"}})],
+            "accumulated": [],
+            "iteration": 0,
+        }
+        out = await tools_node(state)
+        kinds = {r.metadata.get("kind") for r in out["accumulated"]}
+        assert kinds == {"parent", "image"}
+    finally:
+        set_context_manager_for_test(None)
+
+
+@pytest.mark.asyncio
+async def test_tools_node_image_first_parent_still_kept(monkeypatch):
+    """图片在前、父块在后：两者同样共存（顺序无关）。"""
+    from note_assistant.agent.context import ContextManager, set_context_manager_for_test
+
+    set_context_manager_for_test(ContextManager(embed_fn=None))
+    try:
+        img = RetrievalResult(score=0.9, page_content="图片理解：三层架构", metadata={
+            "filepath": "n.md", "heading_path": "H1", "kind": "image",
+            "placeholder": "[IMAGE_UID_aaaaaaaa]", "title": "T"})
+        parent = RetrievalResult(score=0.5, page_content="整节正文", metadata={
+            "filepath": "n.md", "heading_path": "H1", "kind": "parent", "title": "T"})
+        monkeypatch.setattr(agent_mod, "run_tool_call",
+                            lambda name, args: ("obs", [img, parent]))
+        state = {
+            "messages": [_ai_with_tools({"name": "hybrid_search", "args": {"query": "架构图"}})],
+            "accumulated": [],
+            "iteration": 0,
+        }
+        out = await tools_node(state)
+        kinds = {r.metadata.get("kind") for r in out["accumulated"]}
+        assert kinds == {"parent", "image"}
+    finally:
+        set_context_manager_for_test(None)
+
+
+@pytest.mark.asyncio
+async def test_tools_node_text_same_heading_still_deduped(monkeypatch):
+    """普通正文 chunk 之间仍按 (filepath, heading) 去重——旧行为零回归。"""
+    from note_assistant.agent.context import ContextManager, set_context_manager_for_test
+
+    set_context_manager_for_test(ContextManager(embed_fn=None))
+    try:
+        a = RetrievalResult(score=0.9, page_content="正文A", metadata={
+            "filepath": "n.md", "heading_path": "H1", "title": "T"})
+        b = RetrievalResult(score=0.8, page_content="正文B", metadata={
+            "filepath": "n.md", "heading_path": "H1", "title": "T"})
+        monkeypatch.setattr(agent_mod, "run_tool_call",
+                            lambda name, args: ("obs", [a, b]))
+        state = {
+            "messages": [_ai_with_tools({"name": "hybrid_search", "args": {"query": "x"}})],
+            "accumulated": [],
+            "iteration": 0,
+        }
+        out = await tools_node(state)
+        assert len(out["accumulated"]) == 1
+    finally:
+        set_context_manager_for_test(None)
+
+
+# ──────────────────────────────────────────────
+# rerank 图片保位（ensure_image_selected 接入点）
+# ──────────────────────────────────────────────
+
+class _FakeCutReranker:
+    """模拟交叉编码器：文本分 > 图片分，top_k 截断时图片被挤出。"""
+
+    def rerank(self, q, results, top_k=None):
+        scored = []
+        for r in results:
+            s = 0.1 if r.metadata.get("kind") == "image" else 0.9
+            scored.append(RetrievalResult(score=s, page_content=r.page_content, metadata=r.metadata))
+        scored.sort(key=lambda r: r.score, reverse=True)
+        return scored[:top_k] if top_k is not None else scored
+
+
+def _img_result(heading="h-img"):
+    return RetrievalResult(score=0.8, page_content="图片理解：三层架构", metadata={
+        "filepath": "a.md", "heading_path": heading, "kind": "image",
+        "asset_id": "abc123def4567890", "img_url": "/assets/abc123def4567890",
+        "title": "T"})
+
+
+def test_rerank_exit_pins_image_on_image_intent(monkeypatch):
+    """图意图 query：rerank top-k 裁掉图片时，从全量精排补回最高分图片。"""
+    import asyncio
+    from note_assistant.agent.agent import rerank_exit
+
+    monkeypatch.setattr(agent_mod, "get_reranker", lambda *a, **k: _FakeCutReranker())
+    monkeypatch.setattr(settings, "agent_reranker_exit_enabled", True)
+
+    acc = [_mk(0.9, heading=f"h{i}") for i in range(settings.top_k_rerank)]
+    acc.append(_img_result())
+    state = {"accumulated": acc, "question": "架构图长什么样",
+             "condensed_question": "", "widen_context": False}
+    out = asyncio.run(rerank_exit(state))
+    kinds = [r.metadata.get("kind") for r in out["accumulated"]]
+    assert "image" in kinds
+    assert len(out["accumulated"]) == settings.top_k_rerank  # 预算不变，替换末位
+
+
+def test_rerank_exit_no_pin_without_intent(monkeypatch):
+    """非图意图 query：图片被精排裁掉就不强塞（避免无关图干扰）。"""
+    import asyncio
+    from note_assistant.agent.agent import rerank_exit
+
+    monkeypatch.setattr(agent_mod, "get_reranker", lambda *a, **k: _FakeCutReranker())
+    monkeypatch.setattr(settings, "agent_reranker_exit_enabled", True)
+
+    acc = [_mk(0.9, heading=f"h{i}") for i in range(settings.top_k_rerank)]
+    acc.append(_img_result())
+    state = {"accumulated": acc, "question": "RAG 的检索流程是什么",
+             "condensed_question": "", "widen_context": False}
+    out = asyncio.run(rerank_exit(state))
+    assert all(r.metadata.get("kind") != "image" for r in out["accumulated"])
+
+
+def test_rerank_loop_pins_image_on_image_intent(monkeypatch):
+    """循环内闸门同样保位：否则图片在 reflect 前就丢了，Judge 证据也看不到图。"""
+    import asyncio
+    from note_assistant.agent.agent import rerank_loop
+
+    monkeypatch.setattr(agent_mod, "get_reranker", lambda *a, **k: _FakeCutReranker())
+    monkeypatch.setattr(settings, "agent_reranker_loop_enabled", True)
+
+    acc = [_mk(0.9, heading=f"h{i}") for i in range(settings.agent_reranker_loop_top_k)]
+    acc.append(_img_result())
+    state = {"accumulated": acc, "question": "架构图长什么样", "condensed_question": ""}
+    out = asyncio.run(rerank_loop(state))
+    kinds = [r.metadata.get("kind") for r in out["accumulated"]]
+    assert "image" in kinds
+    assert len(out["accumulated"]) == settings.agent_reranker_loop_top_k

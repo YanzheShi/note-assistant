@@ -97,7 +97,11 @@ class TestSplitV2b:
         parents_by_id = {p.metadata["parent_id"]: p for p in res["parents"]}
         for c in res["children"]:
             pid = c.metadata["parent_id"]
-            assert c.metadata["heading_path"] == parents_by_id[pid].metadata["heading_path"]
+            parent_hp = parents_by_id[pid].metadata["heading_path"]
+            child_hp = c.metadata["heading_path"]
+            # child 保留自身子节标题，parent 用整节公共前缀；二者应同源（互为子串）
+            assert parent_hp in child_hp or child_hp in parent_hp, \
+                f"child 与 parent heading_path 应同源：child={child_hp!r} parent={parent_hp!r}"
 
     def test_overlong_section_is_split_into_multiple_parents(self, monkeypatch):
         """单 h2 章节超 parent_chunk_size 时，应被递归切成多个父段。"""
@@ -136,3 +140,112 @@ class TestSplitV2b:
         # 修复后：每个 ## 独立，不存在同时含两段的父块
         merged = [t for t in texts if "背景" in t and "另一话题" in t]
         assert not merged, "无 h1 不能把不同 ## 章节合并进同一父块"
+
+
+# 单 ## 下挂多个 ### 子节（复现「查询侧检索链路」漏检根因：
+# 合并父段时父段 heading_path 只取首个子节，3.2/3.3/3.4 永久丢失）
+_MULTI_SUBSECTION = """# 多模态 RAG 与传统 RAG 对比
+
+## 3. 核心做法
+### 3.1 编码器选型
+编码器选型说明内容，用于演示合并后第一个子节的标题如何保留。
+
+### 3.2 索引策略
+索引策略说明内容，补充字数以便构成独立子节。
+
+### 3.3 重排设计
+重排设计说明内容，继续补充描述文字让这一段也具备一定长度。
+
+### 3.4 查询侧检索链路
+查询侧检索链路（双塔 + RRF + VLM 重排）的详细说明，这是需要被正确命中 heading_path 的子节。
+"""
+
+
+class TestSplitV2bSubsectionHeading:
+    def test_each_child_keeps_own_subsection(self):
+        """根因回归：合并父段后，每个 child 必须携带自身子节标题，末级子节不能丢。"""
+        hs, cs = make_splitters()
+        res = split_v2b(_make_node(_MULTI_SUBSECTION), hs, cs)
+        child_hps = [c.metadata["heading_path"] for c in res["children"]]
+        # 末级子节 3.4 必须出现在某个 child 的 heading_path 中
+        assert any("3.4 查询侧检索链路" in hp for hp in child_hps), \
+            "合并父段后最后一个子节的标题不能丢失：" + str(child_hps)
+        # 3.1/3.2/3.3 也应各自出现
+        for sub in ["3.1 编码器选型", "3.2 索引策略", "3.3 重排设计"]:
+            assert any(sub in hp for hp in child_hps), \
+                f"子节 {sub} 未出现在任何 child heading_path：" + str(child_hps)
+
+    def test_parent_heading_is_section_not_first_subsection(self):
+        """父段标题应为整节「3. 核心做法」，不应错标成首个子节「3.1 编码器选型」。"""
+        hs, cs = make_splitters()
+        res = split_v2b(_make_node(_MULTI_SUBSECTION), hs, cs)
+        parent_hps = [p.metadata["heading_path"] for p in res["parents"]]
+        assert any("3. 核心做法" in hp for hp in parent_hps), \
+            "父段标题应含整节标题：" + str(parent_hps)
+        # 回归：原 bug 下父段被标成首个子节，且后续子节永久丢失
+        assert not any(
+            hp.strip().endswith("3.1 编码器选型") for hp in parent_hps
+        ), "父段不应只标首个子节而丢失后续子节：" + str(parent_hps)
+
+
+# 带 h1、含多个 ## 章节（复现「_top_header 取 h1 导致所有章节被合并、
+# 父块 heading_path 塌缩成只剩文档标题」的分组 bug）
+_MULTI_H2_WITH_H1 = """# 多模态 RAG 总览
+
+## 1. 背景
+背景说明内容，用于演示第一个二级章节。补充一些字数以便构成独立章节。
+
+## 2. 定义
+定义说明内容，补充字数以便构成独立章节。
+
+## 3. 核心做法
+### 3.1 编码器选型
+编码器选型说明内容。
+
+### 3.2 索引策略
+索引策略说明内容。
+
+### 3.3 重排设计
+重排设计说明内容。
+
+### 3.4 查询侧检索链路
+查询侧检索链路（双塔 + RRF + VLM 重排）的详细说明，这是需要被正确命中 heading_path 的子节。
+
+## 4. 落地注意
+落地注意事项说明内容，补充字数以便构成独立章节。
+"""
+
+
+class TestSplitV2bH1SectionGrouping:
+    def test_h1_doc_splits_by_h2_section(self):
+        """带 h1 的文档：每个 ## 章节应成为独立父段，不能因共享 h1 全合并。"""
+        hs, cs = make_splitters()
+        res = split_v2b(_make_node(_MULTI_H2_WITH_H1), hs, cs)
+        # 4 个 ## 章节 → 至少 4 个父段（而非混成 1 个）
+        assert len(res["parents"]) >= 4, "带 h1 文档应按 ## 独立分段：" + str(
+            [p.metadata["heading_path"] for p in res["parents"]]
+        )
+        # 不应存在同时含「背景」和「落地注意」的父块（说明被错误合并）
+        texts = [p.page_content for p in res["parents"]]
+        merged = [t for t in texts if "背景" in t and "落地注意" in t]
+        assert not merged, "带 h1 不能把所有 ## 章节合并进同一父块"
+
+    def test_h1_doc_parent_hp_keeps_section_not_title_only(self):
+        """带 h1 文档的父块 heading_path 应保留 ## 章节，而非塌缩成仅文档标题。"""
+        hs, cs = make_splitters()
+        res = split_v2b(_make_node(_MULTI_H2_WITH_H1), hs, cs)
+        parent_hps = [p.metadata["heading_path"] for p in res["parents"]]
+        # §3 父块应含「3. 核心做法」，且不应只是文档标题
+        assert any("3. 核心做法" in hp for hp in parent_hps), \
+            "§3 父块应保留章节标题：" + str(parent_hps)
+        # 回归：原 bug 下所有父块 heading_path 只剩文档标题
+        title_only = [hp for hp in parent_hps if hp.strip() == "多模态 RAG 总览"]
+        assert not title_only, "父块 heading_path 不应塌缩成只剩文档标题：" + str(parent_hps)
+
+    def test_h1_doc_child_keeps_subsection(self):
+        """带 h1 文档：§3.4 子节标题必须出现在某个 child 的 heading_path 中。"""
+        hs, cs = make_splitters()
+        res = split_v2b(_make_node(_MULTI_H2_WITH_H1), hs, cs)
+        child_hps = [c.metadata["heading_path"] for c in res["children"]]
+        assert any("3.4 查询侧检索链路" in hp for hp in child_hps), \
+            "合并父段后末级子节不能丢失：" + str(child_hps)

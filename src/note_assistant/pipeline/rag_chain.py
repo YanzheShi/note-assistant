@@ -21,8 +21,16 @@ from dataclasses import dataclass, asdict
 from typing import AsyncIterator, List
 
 from langchain_core.messages import HumanMessage
+from note_assistant.config import settings
 from note_assistant.llm.client import get_llm
 from note_assistant.pipeline.source_kind import classify_source
+from note_assistant.pipeline.image_answer import (
+    ImageMarkerStreamer,
+    ensure_image_selected,
+    expand_image_neighbors,
+    finalize_answer_images,
+    missing_images_block,
+)
 from note_assistant.retrieval.types import RetrievalResult
 
 logger = logging.getLogger(__name__)
@@ -91,6 +99,9 @@ class SourceInfo:
     raw_mermaid: str = ""
     render_hint: str = ""        # "mermaid:inline" 等：标记前端可原生渲染（非幻觉）
     diagram_type: str = ""       # graph TD / sequenceDiagram / classDiagram ...
+    # P2：图片资产定位，供 /assets 端点与 [[IMG:]] 渲染
+    asset_id: str = ""
+    img_url: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -112,6 +123,8 @@ class SourceInfo:
             raw_mermaid=rich["raw_mermaid"],
             render_hint=rich["render_hint"],
             diagram_type=rich["diagram_type"],
+            asset_id=rich["asset_id"],
+            img_url=rich["img_url"],
         )
 
 
@@ -256,7 +269,11 @@ class RAGChain:
 
         # ── 需要检索：正常流程 ──
         hybrid_result = self.retriever.search(question, top_k=top_k)
-        rerank_result = self.reranker.rerank(question, hybrid_result, top_k=top_k)
+        # 图片保位：全量精排 → 截断 → 图意图 query 的 top-k 无图时补入最高分图片
+        # （融合阶段的图意图 boost 会被交叉编码器 rerank 清零，需要这道确定性护栏）
+        k = top_k if top_k is not None else settings.top_k_rerank
+        full_ranked = self.reranker.rerank(question, hybrid_result, top_k=max(1, len(hybrid_result)))
+        rerank_result = ensure_image_selected(question, full_ranked, full_ranked[:k])
 
         hit_files_paths = [doc.metadata.get("filepath", "") for doc in rerank_result if doc.metadata.get("filepath")]
 
@@ -265,11 +282,17 @@ class RAGChain:
             expand_file_paths = self.graph.expand(hit_files_paths)
             graph_expand_chunks = self._fetch_neighbor_chunks(expand_file_paths)
 
-        merge_chunks = rerank_result + graph_expand_chunks
+        # P2：命中图片时带出同章节文本邻居，防止图片脱离上下文被误解
+        image_neighbor_chunks = self._expand_image_neighbors(rerank_result)
+
+        merge_chunks = rerank_result + graph_expand_chunks + image_neighbor_chunks
 
         answer = ""
         if self.generator:
             answer = self.generator.generate(question, merge_chunks, history=history)
+            # P2：把答案里的 [[IMG:asset_id]] 替换为真实图片 markdown；
+            # LLM 未引用的 context 图片确定性补在末尾（有图且相关就尽量显示）
+            answer = finalize_answer_images(answer, merge_chunks)
             logger.info("rag_chain.generate", extra={"answer_len": len(answer)})
 
         sources = [SourceInfo.from_result(r, origin="direct") for r in rerank_result]
@@ -319,7 +342,10 @@ class RAGChain:
         # ── 同步检索（放到线程池，避免阻塞 async generator 的事件循环） ──
         def _do_retrieval():
             hybrid_result = self.retriever.search(question, top_k=top_k)
-            rerank_result = self.reranker.rerank(question, hybrid_result, top_k=top_k)
+            # 图片保位（与 ask() 同源）：图意图 query 的 top-k 无图时补入最高分图片
+            k = top_k if top_k is not None else settings.top_k_rerank
+            full_ranked = self.reranker.rerank(question, hybrid_result, top_k=max(1, len(hybrid_result)))
+            rerank_result = ensure_image_selected(question, full_ranked, full_ranked[:k])
             hit_files_paths = [doc.metadata.get("filepath", "") for doc in rerank_result if doc.metadata.get("filepath")]
 
             graph_expand_chunks = []
@@ -327,12 +353,15 @@ class RAGChain:
                 expand_file_paths = self.graph.expand(hit_files_paths)
                 graph_expand_chunks = self._fetch_neighbor_chunks(expand_file_paths)
 
-            merge_chunks = rerank_result + graph_expand_chunks
+            # P2：命中图片时带出同章节文本邻居
+            image_neighbor_chunks = self._expand_image_neighbors(rerank_result)
+
+            merge_chunks = rerank_result + graph_expand_chunks + image_neighbor_chunks
 
             # 组装 sources
             sources = [SourceInfo.from_result(r, origin="direct") for r in rerank_result]
 
-            return merge_chunks, sources, len(graph_expand_chunks)
+            return merge_chunks, sources, len(graph_expand_chunks) + len(image_neighbor_chunks)
 
         merge_chunks, sources, graph_exp_count = await asyncio.to_thread(_do_retrieval)
         t1 = time.time()
@@ -346,15 +375,32 @@ class RAGChain:
         }
 
         # ── 流式生成（含历史） ──
-        answer_text = ""
+        # P2：用标记感知流式器边流边替换 [[IMG:asset_id]]，
+        # 既不破坏流式体验，也不会因 token 切分导致标记跨边界漏替换。
+        # 流末再做确定性补图：LLM 未引用的 context 图片补在答案末尾。
+        streamer = ImageMarkerStreamer(merge_chunks)
+        answer_parts: List[str] = []
         if self.generator:
             try:
                 async for token in self.generator.generate_stream(question, merge_chunks, history=history):
-                    answer_text += token
-                    yield {"type": "char", "content": token}
+                    piece = streamer.feed(token)
+                    if piece:
+                        answer_parts.append(piece)
+                        yield {"type": "char", "content": piece}
             except Exception as e:
                 logging.error(f"流式生成失败: {e}")
+                tail = streamer.flush()
+                if tail:
+                    yield {"type": "char", "content": tail}
                 yield {"type": "char", "content": f"\n\n[生成中断: {e}]"}
+            else:
+                tail = streamer.flush()
+                if tail:
+                    answer_parts.append(tail)
+                    yield {"type": "char", "content": tail}
+                extra = missing_images_block("".join(answer_parts), merge_chunks)
+                if extra:
+                    yield {"type": "char", "content": extra}
 
         # ── 最后 yield sources ──
         yield {
@@ -443,7 +489,11 @@ class RAGChain:
 
         # ── 5. Rerank ──
         t0 = time.time()
-        rerank_result = await asyncio.to_thread(self.reranker.rerank, question, merged, top_k)
+        # 图片保位（与 ask() 同源）：图意图 query 的 top-k 无图时补入最高分图片
+        full_ranked = await asyncio.to_thread(
+            self.reranker.rerank, question, merged, max(1, len(merged))
+        )
+        rerank_result = ensure_image_selected(question, full_ranked, full_ranked[:top_k])
         yield {
             "type": "trace", "step": "rerank", "ms": int((time.time() - t0) * 1000),
             "results": len(rerank_result), "status": "done",
@@ -464,7 +514,16 @@ class RAGChain:
                 "results": graph_exp_count, "status": "done",
             }
 
-        merge_chunks = rerank_result + graph_expand_chunks
+        # P2：命中图片时带出同章节文本邻居
+        image_neighbor_chunks = self._expand_image_neighbors(rerank_result)
+        image_neighbor_count = len(image_neighbor_chunks)
+        if image_neighbor_count:
+            yield {
+                "type": "trace", "step": "image_neighbor_expansion", "ms": 0,
+                "results": image_neighbor_count, "status": "done",
+            }
+
+        merge_chunks = rerank_result + graph_expand_chunks + image_neighbor_chunks
         t_retrieval = time.time()
 
         # ── 组装 sources ──
@@ -479,13 +538,31 @@ class RAGChain:
         }
 
         # ── 流式生成（含历史） ──
+        # P2：与 ask_stream 一致，用标记感知流式器边流边替换 [[IMG:asset_id]]；
+        # 流末再做确定性补图（LLM 未引用的 context 图片补在答案末尾）。
+        streamer = ImageMarkerStreamer(merge_chunks)
+        answer_parts: List[str] = []
         if self.generator:
             try:
                 async for token in self.generator.generate_stream(question, merge_chunks, history=history):
-                    yield {"type": "char", "content": token}
+                    piece = streamer.feed(token)
+                    if piece:
+                        answer_parts.append(piece)
+                        yield {"type": "char", "content": piece}
             except Exception as e:
                 logging.error(f"流式生成失败: {e}")
+                tail = streamer.flush()
+                if tail:
+                    yield {"type": "char", "content": tail}
                 yield {"type": "char", "content": f"\n\n[生成中断: {e}]"}
+            else:
+                tail = streamer.flush()
+                if tail:
+                    answer_parts.append(tail)
+                    yield {"type": "char", "content": tail}
+                extra = missing_images_block("".join(answer_parts), merge_chunks)
+                if extra:
+                    yield {"type": "char", "content": extra}
 
         # ── 最后 yield sources ──
         yield {
@@ -493,6 +570,40 @@ class RAGChain:
             "content": [s.to_dict() for s in sources],
             "graph_expansion": graph_exp_count,
         }
+
+    # ------------------------------------------------------------------
+    # 图片邻居扩展（设计 7.3）
+    # ------------------------------------------------------------------
+
+    def _expand_image_neighbors(
+        self,
+        rerank_results: List[RetrievalResult],
+        fetch_fn=None,
+        budget: int = 6,
+    ) -> List[RetrievalResult]:
+        """命中 image chunk 时，把同 heading_path 的文本 chunk 补进上下文（防脱离上下文误导）。
+
+        与 graph_expansion 并列、走同一套预算控制；邻居只进生成上下文，不进 sources 列表。
+        DB 抓取通过 fetch_fn 注入，便于离线测试（默认走 ChromaDB）。
+        图片 chunk 判定走共享 ``expand_image_neighbors``（覆盖真实 VLM 图，见 image_answer）。
+        """
+        if fetch_fn is None:
+            fetch_fn = self._fetch_text_by_heading
+        return expand_image_neighbors(rerank_results, fetch_fn, budget=budget)
+
+    def _fetch_text_by_heading(self, heading_paths: List[str]) -> List[RetrievalResult]:
+        """从 ChromaDB 取同 heading_path 的文本 chunk（注入式便于测试）。"""
+        try:
+            res = self.retriever.ingestor.collection.get(
+                where={"heading_path": {"$in": heading_paths}},
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            return []
+        out = []
+        for doc, meta in zip(res.get("documents") or [], res.get("metadatas") or []):
+            out.append(RetrievalResult(score=0.0, page_content=doc, metadata=meta or {}))
+        return out
 
     # ------------------------------------------------------------------
     # 图扩展辅助

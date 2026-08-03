@@ -35,6 +35,7 @@
 | Reranker（双层） | 本地 BGE-Reranker-v2-m3：循环内闸门（tools→reflect）+ 出口总安检（reflect→generate），可独立开关 |
 | Query 改写 | LLM 将口语化问题改写为"笔记中可能出现的陈述句" |
 | 双链关联扩展 | 基于 `[[wikilink]]` 构建 NetworkX 有向图，命中后沿一跳邻居扩展关联笔记（默认关闭，可配） |
+| 图片多模态理解 / 图片问答 | 索引期对笔记插图做 VLM 结构化理解（描述/OCR/实体/类型），与文本同池检索；query 含图意图时加权；命中图时带出同章节文本邻居防误导；答案里直接渲染 `[[IMG:asset_id]]` 原图（设计文档 G6 总开关默认关、可显式开） |
 | 增量索引 | 按 mtime + sha256 增量更新 ChromaDB 与 BM25 索引，不需全量重跑 |
 | Agentic RAG | 自写 LangGraph 状态图：Router → 多轮检索 → Reflection Judge →（改写/换策略/澄清）→ 带引用生成；闲聊直接对话不检索 |
 | 澄清 / 反问 | Judge 判 `need_clarify` 且多道守卫通过时，返回带具体选项的澄清问句（而非空泛反问），跨轮靠历史自然消解 |
@@ -181,7 +182,7 @@ query ─┬─ embedding → ChromaDB(dense) ─┐
 
 ### 4.4 Naive RAG 管线（`pipeline/rag_chain.py`）
 
-生产路径（被 `/ask`、`/ask_stream`、`/ask_trace` 调用）：`HybridRetriever → Reranker → WikiGraph 扩展 → Generator`。支持非流式、SSE 流式、以及带检索步骤 trace 的流式（`/ask_trace`）。`rag_chain` 是活代码，不是死代码。
+生产路径（被 `/ask`、`/ask_stream`、`/ask_trace` 调用）：`HybridRetriever → Reranker → WikiGraph 扩展 → 图文邻居扩展 → Generator`。支持非流式、SSE 流式、以及带检索步骤 trace 的流式（`/ask_trace`）。`rag_chain` 是活代码，不是死代码。命中 image chunk 时会按 §4.11 带出同章节文本邻居（图文邻居扩展）。
 
 ### 4.5 Agentic RAG（自写 LangGraph 状态图）
 
@@ -213,6 +214,7 @@ flowchart TD
 - **Context Accumulator**：每轮 Tools 按 `(filepath, heading_path)` 确定性去重后追加，生成前按 rerank 分数 Top-K 裁剪，既保多跳信息完整又防超窗口。
 - **Reflection Judge**：生成前用 `temperature=0.0` 的 LLM 当裁判，输出五态 verdict：`sufficient` / `need_rewrite` / `need_more` / `give_up` / `need_clarify`。`iteration >= MAX_ITER`（默认 3）时强制生成防死循环。**P0 修复**：Judge 现在收到的是真实片段内容（含标题+正文摘要），而非改造前只传"片段数量"导致的盲判。
 - **工具集（7 个原子工具）**：`hybrid_search` / `graph_expand` / `vector_search` / `bm25_search` / `filtered_search` / `get_note` / `query_rewrite`，统一入口带重试/降级/兜底三层防护。
+- **图片邻居扩展（与 `/ask` 对称）**：`generate_node` 在 Top-K 截断之后，按 §4.11 把同章节文本邻居补进生成上下文（`expand_image_neighbors` 共享逻辑），只进生成上下文、不回写 `state["accumulated"]`（不污染 sources / Judge 证据）。图片来源经 `AgentSource.kind`/`img_url`/`render_hint` 透传给前端渲染。
 
 ### 4.6 澄清 / 反问（clarify-as-terminal）
 
@@ -255,6 +257,21 @@ flowchart TD
 
 ---
 
+### 4.11 图片多模态理解 / 图片问答
+
+笔记插图在**索引期**即被结构化理解，与文本 chunk 同池检索、同套融合+rerank，回答时可直接渲染原图。整套能力由设计文档 `docs/图片多模态理解与检索设计方案.md` 定义，关键链路：
+
+- **索引期理解**（`indexing/understanding.py`）：`make_image_enricher` 注入 `RichPreprocessor`，对每张图分级路由——
+  - SVG/Mermaid 原生解析（`SVGParser`/`MermaidParser`，**零 VLM 调用**）；
+  - 装饰图（尺寸/比例/文件名命中）→ 只留 alt，不调 VLM；
+  - 其余送本地 VLM 做结构化理解（描述 / OCR 文字 / 实体 / 类型 / 置信度），结果写进 chunk metadata（`asset_id` + `image_description`/`image_ocr_text`）。
+  - **G6 总开关**：`image_understand_enabled` 默认 `False`（关闭时 `enricher` 直接短路为 no-op，不下载远程图、不调 VLM、不解析 SVG，与未启用前逐字节等价）；本部署在 `.env.local` 钉 `True` 以启用图片理解。
+- **检索期加权**：query 命中图意图正则（`图|架构图|流程图|diagram|chart|…`）时，image chunk 融合分 `× (1 + image_intent_boost)`（默认 0.15），正则判定、零延迟。
+- **图文邻居扩展（双链路对称）**：命中 image chunk 时，自动把同 `heading_path` 的文本 chunk 补进生成上下文（防"图中三层架构"脱离正文被编造）。该逻辑抽成共享纯函数 `expand_image_neighbors`（`pipeline/image_answer.py`），**`/ask`（rag_chain）与 `/agent`（generate_node）两条链路共用**，保证对称；邻居**只进生成上下文、不回写累积结果**，不污染 sources / Judge 证据。图片 chunk 判定用 `_is_image_chunk`（先认 `kind=="image"`，兜底 `asset_id` + `image_description`/`image_ocr_text`，更鲁棒）。
+- **生成 / 展示**：`render_image_block` 渲染结构化图片上下文；答案中的 `[[IMG:asset_id]]` 标记经 `postprocess_answer` 替换为 `![title](img_url)`；`GET /assets/{asset_id}` 端点返回图片二进制（ETag 不可变缓存，404 兜底占位图）；前端 `source_expander` 渲染图片来源缩略图。流式场景用 `ImageMarkerStreamer` 处理 `[[IMG:]]` 跨 token 边界。
+
+> 设计文档里的配置字段写作 `image_understanding_enabled`，**实际代码字段为 `image_understand_enabled`**（命名漂移，仅文档层面，不影响功能）。
+
 ## 五、API 与前端
 
 ### 5.1 接口一览
@@ -271,6 +288,7 @@ flowchart TD
 | GET | `/health` | 健康检查（ChromaDB chunk 数 + 模型名），供 Docker/前端就绪检测 |
 | GET | `/config` | 当前系统配置快照 |
 | POST | `/reindex` | 增量索引（只更新变更文件） |
+| GET | `/assets/{asset_id}` | 图片资产端点：返回图片二进制（ETag 不可变缓存，404 兜底占位图），供 `[[IMG:]]` 渲染与前端缩略图 |
 
 > 旧 `/ask*` 端点保留指向 Naive RAG，与 `/agent/*` 并存作对比/降级通道。
 
@@ -303,15 +321,18 @@ cp .env.example .env   # 或编辑 .env / .env.local（.env.local 覆盖 .env）
 ### 6.3 索引
 
 ```bash
-# 全量索引（首次）
+# 全量索引（首次 / 配置或切分策略变更后必须 wipe 重建）
 uv run python -m note_assistant.indexing.ingestor
 
-# 增量索引（新增/修改笔记后）
+# 增量索引（新增/修改笔记后，仅动变更文件）
 uv run python scripts/reindex.py
 
 # 对比不同切分策略
 uv run python -m note_assistant.indexing.splitter   # 加载 vault，对比 v1 vs v2
 ```
+
+> **图片理解开关**：`image_understand_enabled` 默认 `False`（G6 零回归）。要启用笔记插图理解，在 `.env.local` 钉 `IMAGE_UNDERSTAND_ENABLED=true`（`.env.local` 覆盖 `.env`），再全量重建索引——已建索引不会自动变。
+> **重建入口唯一性**：`scripts/full_reindex.py` 与 `scripts/reindex.py` 均已委托 `Ingestor.index_vault`（唯一会注入图片 enricher、遵守 `chunking_strategy`、写 v2b 父块 docstore 的路径）。不要自写 upsert 逻辑，否则会静默丢掉图片富化 chunk。
 
 ### 6.4 运行服务
 
@@ -358,6 +379,7 @@ uv run ruff check .           # Lint
 - **LLM（统一通道）**：`agent_api_key`、`agent_base_url`、`agent_model`；备选 `deepseek_*`、`llm_model`
 - **Agentic RAG**：`agent_max_iter`(3)、`agent_graph_expand_enabled`(默认关)、`agent_reranker_loop_enabled`/`agent_reranker_exit_enabled`、`agent_clarify_enabled`(默认开) 及澄清/凝练/摘要/相关性裁剪各项阈值
 - **缓存 / 持久化**：`agent_cache_enabled`、`agent_cache_ttl`、`agent_session_enabled`、`agent_db_path`、`agent_run_orphan_ttl`
+- **图片多模态理解**：`image_understand_enabled`（默认 `False`，G6 零回归；本部署 `.env.local` 钉 `True`）、`image_allow_remote_fetch`(默认 `True`)、`image_intent_boost`(0.15)、`image_neighbor_expand`(默认 `True`)、`image_vlm_max_calls_per_run`(预算护栏)、`vlm_model`/`vlm_prompt_version`、`image_max_bytes`(10MB)、`image_min_area`(装饰图阈值)
 - **Ragas**：`ragas_base_url`、`ragas_api_key`、`ragas_llm_model`
 - **LangSmith（可选追踪）**：`langsmith_tracing_enabled`、`langsmith_api_key`、`langsmith_endpoint`、`langsmith_project`
 

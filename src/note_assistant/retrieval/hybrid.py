@@ -14,6 +14,7 @@ from note_assistant.retrieval.sparse_retriever import BM25Retriever
 from note_assistant.retrieval.structural import structural_score
 from note_assistant.retrieval.types import RetrievalResult
 from note_assistant.retrieval.docstore import ParentDocstore
+from note_assistant.pipeline.image_answer import has_image_intent
 
 logger = logging.getLogger(__name__)
 
@@ -208,21 +209,24 @@ class HybridRetriever:
         dense_by_content = {r.page_content: r for r in dense_results}
         sparse_by_content = {r.page_content: r for r in sparse_results}
 
-        # 归一化 sparse 分数
-        sparse_scores = [r.score for r in sparse_results]
-        if sparse_scores:
-            min_s, max_s = min(sparse_scores), max(sparse_scores)
+        # 归一化 sparse 分数：只对 BM25 命中的文档做 min-max；
+        # 未命中的文档 raw_sparse 为 0，若直接用全局 min_s 会归成负数，
+        # 导致 dense 高分但 sparse 未命中的正确文档被错误惩罚。
+        sparse_hit_scores = [r.score for r in sparse_results]
+        if sparse_hit_scores:
+            min_s, max_s = min(sparse_hit_scores), max(sparse_hit_scores)
             s_rng = max_s - min_s if max_s != min_s else 1.0
         else:
-            min_s, s_rng = 0.0, 1.0
+            min_s, max_s, s_rng = 0.0, 1.0, 1.0
 
         # 并集融合
         all_contents = dense_by_content.keys() | sparse_by_content.keys()
         merged = []
         for content in all_contents:
             dense_score = dense_by_content[content].score if content in dense_by_content else 0.0
-            raw_sparse = sparse_by_content[content].score if content in sparse_by_content else 0.0
-            sparse_norm = (raw_sparse - min_s) / s_rng
+            in_sparse = content in sparse_by_content
+            raw_sparse = sparse_by_content[content].score if in_sparse else 0.0
+            sparse_norm = (raw_sparse - min_s) / s_rng if in_sparse else 0.0
 
             final_score = self.alpha * dense_score + (1 - self.alpha) * sparse_norm
 
@@ -243,6 +247,11 @@ class HybridRetriever:
                 if title_hit:
                     boost += settings.title_hit_bonus
                 final_score += boost
+
+            # 图意图 boost（设计 7.2）：query 命中图意图且 chunk 为 image 类型时，
+            # 融合分 ×(1+image_intent_boost)，让图片在图意图问题中更易进入 rerank 候选。
+            if query and metadata.get("kind") == "image" and has_image_intent(query):
+                final_score *= (1.0 + settings.image_intent_boost)
 
             merged.append(RetrievalResult(
                 score=final_score,

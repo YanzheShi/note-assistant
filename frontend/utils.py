@@ -23,6 +23,25 @@ import json
 import httpx
 
 
+def rewrite_asset_urls(text: str, api_url: str) -> str:
+    """把答案正文里的相对资产 URL ``](/assets/…)`` 重写为后端全地址。
+
+    背景：后端图片闭环产出的 markdown 是 ``![title](/assets/{asset_id})``——
+    相对路径。来源面板渲染时会拼后端地址，但答案正文直接进 ``st.markdown``，
+    相对 URL 会解析到 Streamlit 自己的端口（如 8501）而非后端（8005），
+    图片 404 不可见——这正是「标记替换成功了图却不显示」的最后一公里断点。
+
+    - 存原文、渲染时重写：用户在侧边栏改 API 地址后历史消息依然可渲染。
+    - api_url 为空（未配置）时原样返回，行为不劣于改造前。
+    """
+    if not text or "/assets/" not in text:
+        return text
+    base = (api_url or "").rstrip("/")
+    if not base:
+        return text
+    return text.replace("](/assets/", f"]({base}/assets/")
+
+
 def _post_json(api_url: str, endpoint: str, body: dict, timeout: float) -> dict:
     resp = httpx.post(f"{api_url}/{endpoint}", json=body, timeout=timeout)
     resp.raise_for_status()

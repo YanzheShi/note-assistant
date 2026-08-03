@@ -78,5 +78,5 @@ def test_vlm_defaults_off_when_unset(monkeypatch):
     assert s.vlm_api_key == ""
     assert s.vlm_base_url == ""
     assert s.vlm_model == ""
-    assert s.image_understand_enabled is True
+    assert s.image_understand_enabled is False
     assert s.vlm_prompt_version == "v1"

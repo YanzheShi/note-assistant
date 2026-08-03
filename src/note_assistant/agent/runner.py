@@ -23,6 +23,7 @@ from note_assistant.agent.cache import SemanticCache
 from note_assistant.agent.context import CondenseSignal, get_context_manager
 from note_assistant.agent.store import AgentStore
 from note_assistant.config import settings
+from note_assistant.pipeline.image_answer import append_missing_images, postprocess_answer
 from note_assistant.retrieval.types import RetrievalResult
 
 OBS_TRUNCATE = 500  # observation 文本截断长度，避免轨迹过大
@@ -117,11 +118,16 @@ def _sources_from_results(results: List[RetrievalResult]) -> List[dict]:
     ranked = sorted(results, key=lambda r: r.score, reverse=True)[: settings.top_k_rerank]
     out = []
     for r in ranked:
+        meta = r.metadata if isinstance(r.metadata, dict) else {}
         out.append({
             "filepath": r.filepath,
             "title": r.metadata.get("title", ""),
             "heading": r.metadata.get("heading_path", ""),
             "score": round(r.score, 4),
+            # 设计 9.2 /agent 适配项：把图片渲染字段透传给前端
+            "kind": str(meta.get("kind") or "text"),
+            "img_url": meta.get("img_url") or None,
+            "render_hint": meta.get("render_hint") or None,
         })
     return out
 
@@ -357,11 +363,19 @@ async def ainvoke(
     )
     elapsed = (time.perf_counter() - _t0) * 1000
     traj = _trajectory_from_state(final)
-    sources = _sources_from_results(final.get("accumulated", seed))
+    acc = final.get("accumulated", seed)
+    sources = _sources_from_results(acc)
     traj.append({"type": "sources", "sources": sources})
-    contexts = _contexts_from_results(final.get("accumulated", seed)) if return_contexts else []
+    contexts = _contexts_from_results(acc) if return_contexts else []
+    # P2：把答案里的 [[IMG:asset_id]] 替换为真实图片 markdown；
+    # 再确定性补齐 context 里 LLM 未引用的图片。
+    # 仅检索生成路径补图：澄清问句与闲聊（direct_chat）不补，
+    # 避免闲聊轮带着上一轮 seed 里的图片乱入。
+    ans = postprocess_answer(final.get("answer", ""), acc)
+    if not final.get("clarified") and final.get("route") != "chat":
+        ans = append_missing_images(ans, acc)
     result = AgentRunResult(
-        answer=final.get("answer", ""),
+        answer=ans,
         sources=sources,
         trajectory=traj,
         contexts=contexts,
@@ -584,6 +598,11 @@ async def astream(
                 # generate / direct_chat 完全同构，前端零改动即可渲染澄清问句。
                 ans = update.get("answer", "")
                 if ans:
+                    # P2：把答案里的 [[IMG:asset_id]] 替换为真实图片 markdown
+                    ans = postprocess_answer(ans, accumulated)
+                    if node == "generate":
+                        # 确定性补图：LLM 没写标记时，context 里的相关图片也尽量显示
+                        ans = append_missing_images(ans, accumulated)
                     final_answer = ans
                     if update.get("clarified"):
                         clarified = True

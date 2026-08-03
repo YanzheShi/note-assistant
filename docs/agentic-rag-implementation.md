@@ -98,13 +98,25 @@ flowchart TD
 - 上下文来自 `_format_context(_top_k_context(accumulated))`：
   - **Top-K 裁剪**：按 `score` 降序截到 `settings.top_k_rerank`，防超窗口。
   - 空上下文 → 如实告知"知识库中缺少相关信息"。
+- **图文邻居扩展（与 `/ask` 对称）**：若 `accumulated` 命中 image chunk，在 Top-K 截断**之后**用 `expand_image_neighbors`（共享自 `pipeline/image_answer.py`）把同 `heading_path` 的文本 chunk 补到末尾（`score=0`），只进生成上下文、**不回写 `state["accumulated"]`**（不污染 sources / Judge 证据）。图片 chunk 判定走 `_is_image_chunk`（`kind=="image"` 或 `asset_id` + `image_description`/`image_ocr_text`）。详见 §3.8。
 - 追加 `history`（最近 20 轮，`_fmt_history` 转成 Human/AI 消息）。
-- **降级提示**：`judge_verdict == "give_up"` 或（达上限且无累积）→ 答案末尾加"（注：已多次检索但知识库中相关信息有限…）"。
+- **降级提示**：`judge_verdict == "give_up"` 或（达上限且无累积）→ 答案末尾加"（注：已多次检索但知识库中相关信息有限…）」。
 
 ### 3.7 DirectChat（闲聊）
 - `temperature=0.6, max_tokens=1024`，`CHAT_SYSTEM` 友好回复，**完全不检索**，省 token。
 
 ---
+
+### 3.8 图片多模态理解（与 `/ask` 对称）
+
+Agent 链路与 Naive RAG（`/ask`，`pipeline/rag_chain.py`）在图片多模态上完全对称，能力由 `docs/图片多模态理解与检索设计方案.md` 定义：
+
+- **索引期理解**（`indexing/understanding.py`）：`make_image_enricher` 注入 `RichPreprocessor`，对每张图分级路由——SVG/Mermaid 原生解析（零 VLM）、装饰图只留 alt、其余送本地 VLM 做结构化理解（描述/OCR/实体/类型），结果写进 chunk metadata（`asset_id` + `image_description`/`image_ocr_text`）。**G6 总开关 `image_understand_enabled` 默认 `False`**（关闭时 `enricher` 短路为 no-op，与未启用前逐字节等价）；本部署 `.env.local` 钉 `True`。
+- **检索期加权**：query 含图意图时 image chunk 融合分 `× (1 + image_intent_boost)`（默认 0.15），正则判定、零延迟。
+- **图文邻居扩展**：见 §3.6 —— `generate_node` 在 Top-K 截断后补同章节文本邻居，共享 `expand_image_neighbors`，不污染 `accumulated`。
+- **生成 / 展示**：`render_image_block` 渲染图片上下文；`[[IMG:asset_id]]` 标记经 `postprocess_answer` 替换为图片 URL；`GET /assets/{asset_id}` 端点返回图片；`AgentSource` 已含 `kind`/`img_url`/`render_hint`，前端渲染图片来源。
+
+图片 chunk 判定统一用 `pipeline/image_answer.py::_is_image_chunk`（先 `kind=="image"`，兜底 `asset_id` + `image_description`/`image_ocr_text`），`/ask` 与 `/agent` 共用同一判定，避免两套逻辑漂移。
 
 ## 4. 三个关键逻辑
 
@@ -238,6 +250,12 @@ iteration >= MAX_ITER ? ──是──> 强制 Generate（降级）
 | `agent_session_enabled` | `True` | 持久化总开关（False→无状态） |
 | `agent_db_path` | `data/agent.sqlite` | SQLite 路径（相对/绝对） |
 | `agent_run_orphan_ttl` | `600` | run 未完成超时判 interrupted |
+| `image_understand_enabled` | `False` | 图片理解总开关（G6 零回归）；本部署 `.env.local` 钉 `True` |
+| `image_allow_remote_fetch` | `True` | 隐私开关，关闭则只处理本地图 |
+| `image_intent_boost` | `0.15` | 图意图 query 的 image chunk 融合分加权 |
+| `image_neighbor_expand` | `True` | 命中图片时带出同章节文本邻居 |
+| `image_vlm_max_calls_per_run` | `500` | 单次索引 VLM 预算护栏 |
+| `vlm_model` / `vlm_prompt_version` | — / `v1` | 视觉模型名 / 理解 prompt 版本（参与缓存 key） |
 
 ---
 

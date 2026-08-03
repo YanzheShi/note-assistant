@@ -488,11 +488,15 @@ class ContextManager:
         """运行结束后合并跨轮累积：确定性去重 + token 预算硬截断（双重保险之二）。
 
         ``accumulated`` 通常 = 本轮 seed（已衰减）+ 本轮新检索到的结果。
+
+        去重键用 ``identity_key()``（filepath, heading, kind, placeholder）：
+        与 tools_node 同源。旧键 (filepath, heading) 会让 image summary chunk
+        与同节正文/父块互斥（分数竞速二选一），跨轮累积时图片被长文本挤掉。
         """
         seen: dict[tuple, RetrievalResult] = {}
         merged: List[RetrievalResult] = []
         for r in accumulated:
-            key = (r.filepath, r.metadata.get("heading_path", ""))
+            key = r.identity_key()
             if key in seen:
                 if r.score > seen[key].score:
                     seen[key] = r

@@ -8,6 +8,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from note_assistant.config import settings
+from note_assistant.pipeline.image_answer import render_image_block
 from note_assistant.retrieval.types import RetrievalResult
 
 # 保留的最近对话轮数（再往前可能 context window 撑爆且参考价值低）
@@ -25,7 +26,11 @@ class Generator:
         "   \"抱歉，我的知识库中没有关于该问题的相关内容。请尝试换一个问题。\"\n"
         "3. 诚实回答，不要编造笔记中不存在的内容\n"
         "4. 回答要简洁、结构化，使用 Markdown\n"
-        "5. 引用来源时标注笔记标题"
+        "5. 引用来源时标注笔记标题\n"
+        "6. 参考笔记中标注【图片】的条目来自笔记里的插图，其内容由视觉模型解析得到。\n"
+        "   - 引用图片信息时，说明\"根据笔记中的架构图/流程图\"，不要说\"根据文档描述\"\n"
+        "   - 如果图片信息对回答有帮助，在相应位置插入 [[IMG:asset_id]] 标记，系统会自动替换为图片\n"
+        "   - 严禁描述图片解析结果中不存在的细节"
     )
 
     def __init__(self, llm=None):
@@ -131,6 +136,11 @@ class Generator:
         parts = []
         for i, item in enumerate(context, 1):
             title = item.metadata.get("title", "未知笔记")
+            block = render_image_block(item)
+            if block is not None:
+                # image chunk：结构化渲染 + [[IMG:asset_id]] 引用标记
+                parts.append(f"### [{i}] {title}\n{block}")
+                continue
             content = item.page_content
             parts.append(f"### [{i}] {title}\n{content}")
         return "\n\n".join(parts)

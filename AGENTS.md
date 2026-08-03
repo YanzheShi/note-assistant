@@ -63,7 +63,7 @@ VaultLoader → DocNode → RichPreprocessor → split_v2 → restore → Ingest
 2. **`indexing/preprocessor.py`** — `RichPreprocessor` extracts rich structures (code fences, tables, mermaid, images) into placeholders so the splitter doesn't mangle them. After splitting, `restore()` puts originals back. Also generates "summary chunks" for each extracted structure so they're searchable.
 3. **`indexing/splitter.py`** — Two-layer strategy: `MarkdownHeaderTextSplitter` (preserves `#`/`##`/`###`/`####` hierarchy) → `RecursiveCharacterTextSplitter` (800 char / 150 overlap, Chinese-aware with `。` in separators). Produces chunks with `heading_path` metadata like `"一、背景 > 检索方法"`. `split_v1` (flat Recursive) and `split_v2` are baselines; **`split_v2b` (parent-child dual storage) is fully implemented** — child chunks (800) go to ChromaDB for retrieval, parent blocks (whole section) go to `ParentDocstore` and are expanded back after a hit.
 4. **`indexing/embedder.py`** — Wraps Ollama's `bge-m3:latest` model (1024-dim dense vectors).
-5. **`indexing/ingestor.py`** — `Ingestor.index_vault()` ties it all together: load → preprocess → split → restore → enrich with wikilinks/metadata → upsert into ChromaDB (cosine similarity).
+5. **`indexing/ingestor.py`** — `Ingestor.index_vault()` ties it all together: load → preprocess → split → restore → enrich (wikilinks/metadata **+ 图片 VLM 理解**，受 `image_understand_enabled` 总开关 gate) → upsert into ChromaDB (cosine similarity). This is the **single correct full-reindex entry** (`uv run python -m note_assistant.indexing.ingestor`); `scripts/full_reindex.py` and `scripts/reindex.py` both delegate to it.
 
 ### Key Design Decisions (see DECISIONS.md for full reasoning)
 
@@ -76,7 +76,7 @@ VaultLoader → DocNode → RichPreprocessor → split_v2 → restore → Ingest
 
 ### Configuration
 
-All config is in `src/note_assistant/config.py` via `pydantic-settings`. Reads `.env` and `.env.local` (override). Key settings: `vault_path`, `ollama_base_url`, `embed_model`, `chroma_persist_dir`, `chunking_strategy` (`v1`/`v2`/`v2b`), `agent_base_url`/`agent_api_key`/`agent_model` (unified LLM channel via `llm/client.py::get_llm()`), `deepseek_*` (alternate), `bm25_weight`/`dense_weight`, `top_k_retrieve`, `top_k_rerank`, `agent_max_iter`, `agent_clarify_enabled`, `agent_session_enabled`.
+All config is in `src/note_assistant/config.py` via `pydantic-settings`. Reads `.env` and `.env.local` (override). Key settings: `vault_path`, `ollama_base_url`, `embed_model`, `chroma_persist_dir`, `chunking_strategy` (`v1`/`v2`/`v2b`), `agent_base_url`/`agent_api_key`/`agent_model` (unified LLM channel via `llm/client.py::get_llm()`), `deepseek_*` (alternate), `bm25_weight`/`dense_weight`, `top_k_retrieve`, `top_k_rerank`, `agent_max_iter`, `agent_clarify_enabled`, `agent_session_enabled`. Image/multimodal group: `image_understand_enabled` (default `False`, G6 零回归；本部署 `.env.local` 钉 `True`), `image_allow_remote_fetch`, `image_intent_boost` (0.15), `image_neighbor_expand` (True), `image_vlm_max_calls_per_run`, `vlm_model`, `vlm_prompt_version`.
 
 ### What's a Stub vs. What's Real
 
@@ -89,9 +89,9 @@ All config is in `src/note_assistant/config.py` via `pydantic-settings`. Reads `
 | `indexing/ingestor.py` | ✅ Functional (requires Ollama + vault) |
 | `indexing/sync.py` | ✅ Incremental index (mtime + sha256) |
 | `retrieval/` | ✅ Functional: hybrid (dense+sparse), structural score, ParentDocstore, reranker, query_rewrite, WikiGraph, BM25 |
-| `generation/generator.py` | ✅ Functional (LangChain prompt + streaming) |
-| `pipeline/rag_chain.py` | ✅ Production Naive RAG path (used by `/ask*`) |
-| `agent/` | ✅ Functional: LangGraph StateGraph, 7 tools, ContextManager, SemanticCache, AgentStore (SQLite), runner, clarify/condense |
+| `generation/generator.py` | ✅ Functional (LangChain prompt + streaming); `pipeline/image_answer.py` 负责图片 context 渲染 / `[[IMG:]]` 后处理 / 流式替换 |
+| `pipeline/rag_chain.py` | ✅ Production Naive RAG path (used by `/ask*`); 含图文邻居扩展 `_expand_image_neighbors` |
+| `agent/` | ✅ Functional: LangGraph StateGraph, 7 tools, ContextManager, SemanticCache, AgentStore (SQLite), runner, clarify/condense; **图片邻居扩展（`expand_image_neighbors`）与 `/ask` 对称落地** |
 | `api/main.py` | ✅ Functional: `/ask`, `/ask_stream`, `/ask_trace`, `/agent/ask`, `/agent/ask_stream`, `/agent/runs/{id}`, `/agent/sessions/{id}`, `/health`, `/config`, `/reindex` |
 | `evaluation/` | ✅ Functional: retrieval + generation + Ragas + trajectory metrics |
 | `frontend/app.py` | ✅ Functional Streamlit chat UI (trace mode, source fold) |

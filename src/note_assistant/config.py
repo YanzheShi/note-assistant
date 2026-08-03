@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     vlm_model: str = ""            # 视觉模型名（如 agnes-2.5-flash）
 
     # === 图片理解护栏（设计文档 5.1 / 5.4 / 5.5）===
-    image_understand_enabled: bool = True     # 总开关：关闭则图片只走 alt+上下文（零 VLM 调用）
+    image_understand_enabled: bool = False    # 总开关（设计 G6）：默认关闭 → 零回归/逐字节等价，图片只走 alt+上下文（零 VLM 调用、零副作用）
     image_allow_remote_fetch: bool = True     # 隐私开关：关闭则只处理本地资产，不下载远程图
     image_max_bytes: int = 10 * 1024 * 1024   # 单图大小护栏（>10MB 跳过 VLM，省 token）
     image_vlm_max_calls_per_run: int = 500    # 单次索引 VLM 调用上限，超限剩余标记 pending
@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     vlm_prompt_version: str = "v1"            # 改 prompt 必须 bump，缓存据此失效重跑
     assets_dir: Path = Path("./data/assets")          # 远程图/资产本地缓存目录
     vision_cache_path: Path = Path("./data/vision_cache.sqlite")  # VLM 结果缓存
+
+    # === 图片检索/生成/展示闭环（设计文档 P2）===
+    image_intent_boost: float = 0.15         # 图意图 query 命中时，image chunk 融合分 ×(1+boost)
+    image_neighbor_expand: bool = True       # 命中 image chunk 时带出同 heading_path 的文本邻居（防脱离上下文误导）
 
     # === LangSmith (Tracing) ===
     langsmith_tracing_enabled: bool = True

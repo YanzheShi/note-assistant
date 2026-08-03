@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 import chromadb
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 
 from note_assistant.config import settings
 from note_assistant.logger_util import set_request_id, setup_logging
@@ -179,6 +179,8 @@ async def ask(req: AskRequest):
             raw_table=s.raw_table or None,
             raw_mermaid=s.raw_mermaid or None,
             img_path=s.img_path or None,
+            asset_id=s.asset_id or None,
+            img_url=s.img_url or None,
             render_hint=s.render_hint or None,
             diagram_type=s.diagram_type or None,
         ))
@@ -237,6 +239,8 @@ async def ask_stream(req: AskRequest):
                             raw_table=s.get("raw_table") or None,
                             raw_mermaid=s.get("raw_mermaid") or None,
                             img_path=s.get("img_path") or None,
+                            asset_id=s.get("asset_id") or None,
+                            img_url=s.get("img_url") or None,
                             render_hint=s.get("render_hint") or None,
                             diagram_type=s.get("diagram_type") or None,
                         ).model_dump(mode="json"))
@@ -469,6 +473,45 @@ async def config():
         embed_model=settings.embed_model,
         llm_model=settings.agent_model,
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# /assets/{asset_id} — 图片资产服务端点（设计 9.1）
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/assets/{asset_id}")
+async def get_asset(asset_id: str):
+    """按内容哈希 id 返回图片二进制（设计 9.1）。
+
+    - 从 settings.assets_dir 读 ``<asset_id>.<ext>``（本地/远程图索引时统一落盘到此处）。
+    - 内容哈希天然不可变：ETag=asset_id，Cache-Control 长缓存。
+    - 不存在时 404（前端据此降级为占位/原链接）。
+    """
+    import mimetypes
+
+    assets_dir = settings.assets_dir
+    try:
+        if not assets_dir.exists():
+            raise HTTPException(status_code=404, detail="asset not found")
+        matches = sorted(assets_dir.glob(f"{asset_id}.*"))
+        if not matches:
+            raise HTTPException(status_code=404, detail="asset not found")
+        path = matches[0]
+        mime, _ = mimetypes.guess_type(str(path))
+        media_type = mime or "application/octet-stream"
+        return FileResponse(
+            str(path),
+            media_type=media_type,
+            headers={
+                "ETag": asset_id,
+                "Cache-Control": "public, max-age=31536000, immutable",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"asset serve failed: {e}")
+        raise HTTPException(status_code=404, detail="asset not found")
 
 
 # ═══════════════════════════════════════════════════════════════
