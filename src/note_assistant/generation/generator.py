@@ -10,6 +10,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from note_assistant.config import settings
 from note_assistant.pipeline.image_answer import render_image_block
 from note_assistant.retrieval.types import RetrievalResult
+from note_assistant.security.guardrails import (
+    append_guardrail,
+    wrap_history_tuples,
+    wrap_retrieved_context,
+    wrap_user_question,
+)
 
 # 保留的最近对话轮数（再往前可能 context window 撑爆且参考价值低）
 MAX_HISTORY_TURNS = 10
@@ -82,11 +88,13 @@ class Generator:
             ChatPromptTemplate
         """
         context_text = self._format_context(context)
-        messages = [("system", self.SYSTEM_PROMPT)]
+        messages = [("system", append_guardrail(self.SYSTEM_PROMPT))]
         if history:
-            messages.extend(self._format_history(history))
+            messages.extend(wrap_history_tuples(self._format_history(history)))
         messages.append(("human", "## 参考笔记\n{context_text}\n\n## 问题\n{question}"))
-        return ChatPromptTemplate.from_messages(messages).partial(context_text=context_text)
+        return ChatPromptTemplate.from_messages(messages).partial(
+            context_text=wrap_retrieved_context(context_text)
+        )
 
     def generate(self, question: str, context: list[dict], history: list[dict] | None = None) -> str:
         """
@@ -101,7 +109,7 @@ class Generator:
             完整回答文本
         """
         agent = self.build_prompt(question, context, history) | self.llm | StrOutputParser()
-        answer = agent.invoke({"question": question})
+        answer = agent.invoke({"question": wrap_user_question(question)})
         return answer
 
     async def generate_stream(self, question: str, context: list[dict], history: list[dict] | None = None):
@@ -117,10 +125,14 @@ class Generator:
             每个 token 的文本片段
         """
         context_text = self._format_context(context)
-        messages = [("system", self.SYSTEM_PROMPT)]
+        messages = [("system", append_guardrail(self.SYSTEM_PROMPT))]
         if history:
-            messages.extend(self._format_history(history))
-        messages.append(("human", f"## 参考笔记\n{context_text}\n\n## 问题\n{question}"))
+            messages.extend(wrap_history_tuples(self._format_history(history)))
+        messages.append((
+            "human",
+            f"## 参考笔记\n{wrap_retrieved_context(context_text)}\n\n"
+            f"## 问题\n{wrap_user_question(question)}",
+        ))
 
         async for chunk in self.llm.astream(messages):
             if chunk.content:
@@ -132,15 +144,19 @@ class Generator:
         将检索结果格式化为 LLM 可读的上下文。
 
         每条笔记标注来源标题，方便 LLM 引用。
+        L2：每条内容过注入扫描（默认 flag 只记日志；redact 时遮蔽命中跨度）。
         """
+        from note_assistant.security.sanitize import sanitize_text
+
         parts = []
         for i, item in enumerate(context, 1):
             title = item.metadata.get("title", "未知笔记")
             block = render_image_block(item)
             if block is not None:
                 # image chunk：结构化渲染 + [[IMG:asset_id]] 引用标记
-                parts.append(f"### [{i}] {title}\n{block}")
+                content, _ = sanitize_text(block, source=item.filepath)
+                parts.append(f"### [{i}] {title}\n{content}")
                 continue
-            content = item.page_content
+            content, _ = sanitize_text(item.page_content, source=item.filepath)
             parts.append(f"### [{i}] {title}\n{content}")
         return "\n\n".join(parts)

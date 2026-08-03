@@ -56,7 +56,10 @@ class Ingestor:
     # ──────────────────────────────────────────────
     @staticmethod
     def _make_id(filepath: str, index: int, kind: str) -> str:
-        safe_fp = filepath.replace("/", "_").replace("\\", "_")
+        # 只归一路径分隔符，不做有损替换：把 / 和 \ 替换成 _ 会让
+        # 「a/b.md」与「a_b.md」生成同一 ID，chunks 静默互相覆盖（数据丢失）。
+        # ID 对 ChromaDB 是透明字符串，保留 / 无副作用。
+        safe_fp = filepath.replace("\\", "/")
         return f"{safe_fp}::{index}::{kind}"
 
     # ──────────────────────────────────────────────
@@ -75,8 +78,10 @@ class Ingestor:
             fp = c.metadata.get("filepath", "unknown")
             ids.append(self._make_id(fp, i, c.kind))
 
-        # ChromaDB metadata 校验：空列表不接受；list 元素必须同类型且为 str/int/float/bool。
+        # ChromaDB metadata 校验：空列表/空字符串不接受；list 元素必须同类型且为 str/int/float/bool。
         # front matter 的 tags 可能混入整数（如年份 2026），统一转 str 以满足约束。
+        # 空字符串过滤是 VLM 链路的保险：to_index_payload 的字段（data_points/
+        # mermaid_equivalent 等）经常为空串，ChromaDB 会拒绝，不过滤将炸掉整个 upsert。
         metadatas = []
         for c in chunks:
             clean = {}
@@ -85,6 +90,8 @@ class Ingestor:
                     if len(v) == 0:
                         continue  # ChromaDB 不接受空列表作为 metadata 值
                     clean[k] = [str(x) for x in v]
+                elif isinstance(v, str) and not v:
+                    continue  # ChromaDB 不接受空字符串
                 else:
                     clean[k] = v
             metadatas.append(clean)

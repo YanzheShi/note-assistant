@@ -24,6 +24,7 @@ from note_assistant.agent.context import CondenseSignal, get_context_manager
 from note_assistant.agent.store import AgentStore
 from note_assistant.config import settings
 from note_assistant.pipeline.image_answer import append_missing_images, postprocess_answer
+from note_assistant.security.output_guard import check_prompt_leakage, neutralize_remote_media
 from note_assistant.retrieval.types import RetrievalResult
 
 OBS_TRUNCATE = 500  # observation 文本截断长度，避免轨迹过大
@@ -233,6 +234,9 @@ def _initial_state(
         "no_new_doc_streak": 0,
         "widen_context": False,
         "gate_overrode": False,
+        # 安全（L2/L3）：会话注入命中计数 + 已浮现笔记白名单
+        "allowed_files": set(),
+        "injection_hits": 0,
     }
 
 
@@ -374,6 +378,10 @@ async def ainvoke(
     ans = postprocess_answer(final.get("answer", ""), acc)
     if not final.get("clarified") and final.get("route") != "chat":
         ans = append_missing_images(ans, acc)
+    # L4 输出治理：远程图片中和（防渲染期外泄）+ system prompt 泄露指纹
+    ans, media_hits = neutralize_remote_media(ans)
+    leaked = check_prompt_leakage(ans)
+    guarded = bool(media_hits) or bool(leaked)
     result = AgentRunResult(
         answer=ans,
         sources=sources,
@@ -397,7 +405,8 @@ async def ainvoke(
         # 反问轮：记下 session 标记，下一轮 _should_clarify 直接否决（不连续反问）
         get_context_manager().mark_clarified(session_id)
     # 澄清问句不入缓存：否则同一个模糊问题再问一次会命中缓存里的问句，永远吐反问
-    if cache.enabled and not clarified:
+    # L4 门禁：输出护栏命中（远程图片被中和 / 泄露指纹）的答案不入缓存，防投毒回放
+    if cache.enabled and not clarified and not (guarded and settings.cache_skip_when_guarded):
         cache.put(question, result.answer, result.sources, result.trajectory, ctx_key=ctx_key)
     await _record_run(store, session_id, rid, question, result, effective_history)
     _post_run_context(store, session_id, get_context_manager(), final.get("accumulated", seed), question, result.answer)
@@ -547,6 +556,7 @@ async def astream(
     accumulated: List[RetrievalResult] = []
     final_answer = ""
     clarified = False
+    guarded = False  # L4：输出护栏是否命中（命中则不入缓存，防投毒回放）
 
     async for chunk in graph.astream(state, stream_mode="updates"):
         for node, update in chunk.items():
@@ -603,6 +613,10 @@ async def astream(
                     if node == "generate":
                         # 确定性补图：LLM 没写标记时，context 里的相关图片也尽量显示
                         ans = append_missing_images(ans, accumulated)
+                    # L4 输出治理：远程图片中和 + 泄露指纹（generate 路径计入门禁）
+                    ans, media_hits = neutralize_remote_media(ans)
+                    if node == "generate":
+                        guarded = guarded or bool(media_hits) or bool(check_prompt_leakage(ans))
                     final_answer = ans
                     if update.get("clarified"):
                         clarified = True
@@ -658,7 +672,8 @@ async def astream(
         # 反问轮：置位 session 标记，下一轮 _should_clarify 直接否决（不连续反问）
         get_context_manager().mark_clarified(session_id)
     # 澄清问句不入缓存：否则同一个模糊问题再问会命中缓存里的问句，形成反问死循环
-    if cache.enabled and not clarified:
+    # L4 门禁：输出护栏命中的答案不入缓存，防投毒回放
+    if cache.enabled and not clarified and not (guarded and settings.cache_skip_when_guarded):
         cache.put(question, final_answer, sources, traj, ctx_key=ctx_key)
     elapsed = (time.perf_counter() - _t0) * 1000
     logger.info(

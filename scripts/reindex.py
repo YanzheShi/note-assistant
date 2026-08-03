@@ -12,6 +12,11 @@
     python scripts/reindex.py [vault_path]
 
     vault_path 默认从 config.vault_path 读取
+
+已知缺口:
+    增量索引不重建 BM25（data/bm25.pkl）与 WikiGraph（data/bm25.graph）这两个
+    全量派生产物——长期增量后二者会滞后于 ChromaDB。定期跑一次
+    scripts/full_reindex.py 即可全量刷新（该脚本已内置两步重建）。
 """
 
 import sys

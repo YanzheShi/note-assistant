@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     image_max_bytes: int = 10 * 1024 * 1024   # 单图大小护栏（>10MB 跳过 VLM，省 token）
     image_vlm_max_calls_per_run: int = 500    # 单次索引 VLM 调用上限，超限剩余标记 pending
     image_vlm_concurrency: int = 4            # 并发上限（asyncio.Semaphore）
-    vlm_prompt_version: str = "v1"            # 改 prompt 必须 bump，缓存据此失效重跑
+    vlm_prompt_version: str = "v2"            # 改 prompt 必须 bump，缓存据此失效重跑（v2=抗注入硬化版）
     assets_dir: Path = Path("./data/assets")          # 远程图/资产本地缓存目录
     vision_cache_path: Path = Path("./data/vision_cache.sqlite")  # VLM 结果缓存
 
@@ -100,6 +100,27 @@ class Settings(BaseSettings):
     agent_cache_max_size: int = 1000            # 缓存最大条数（FIFO 淘汰）
     agent_cache_semantic: bool = True           # 是否启用 embedding 近邻命中
     agent_cache_semantic_threshold: float = 0.92  # 近邻命中相似度阈值
+
+    # === 安全防御（docs/prompt-injection-defense-design.md，L0–L4）===
+    # 全部关闭 = 与改造前逐字节等价（G6 式零回归约定）
+    # L1 提示词硬化：system 提示追加安全护栏条款 + 不可信内容分隔符包裹
+    security_guardrail_enabled: bool = True
+    # L2 确定性输入清洗：注入形状启发式检测。flag=只记日志不改写；redact=遮蔽命中跨度
+    prompt_injection_scan_enabled: bool = True
+    prompt_injection_scan_action: Literal["flag", "redact"] = "flag"
+    # L3 工具收敛：get_note / filtered_search 只能读本会话已浮现的笔记
+    get_note_allowlist_enabled: bool = True
+    filtered_search_allowlist_enabled: bool = True
+    injection_escalation_threshold: int = 3     # 单会话注入命中 ≥ 该值 → 禁用读取类工具
+    # L0 索引期供应链：远程图抓取主机策略（block_private 拒绝环回/私网/链路本地/元数据网段）
+    image_remote_fetch_host_policy: Literal["block_private", "allowlist", "all"] = "block_private"
+    image_remote_fetch_allowlist: list = []     # allowlist 模式下的域名白名单
+    vlm_text_field_max_chars: int = 2000        # VLM description/ocr 单字段入库上限
+    # L4 输出治理：远程图片中和（防渲染期外泄）+ system prompt 泄露指纹
+    output_guard_enabled: bool = True
+    output_guard_remote_media: Literal["neutralize", "allow"] = "neutralize"
+    output_guard_media_allowlist: list = []     # 允许保留的远程图片域名（/assets 恒白名单）
+    cache_skip_when_guarded: bool = True        # 输出护栏命中不入语义缓存（防投毒回放）
 
     # === Agentic RAG 持久化（轻量 SQLite）===
     agent_session_enabled: bool = True           # 跨会话记忆 + 运行快照（session_turns / runs 表）

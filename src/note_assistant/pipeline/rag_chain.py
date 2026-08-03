@@ -32,6 +32,7 @@ from note_assistant.pipeline.image_answer import (
     missing_images_block,
 )
 from note_assistant.retrieval.types import RetrievalResult
+from note_assistant.security.output_guard import RemoteMediaStreamer, neutralize_remote_media
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,8 @@ class RAGChain:
             # P2：把答案里的 [[IMG:asset_id]] 替换为真实图片 markdown；
             # LLM 未引用的 context 图片确定性补在末尾（有图且相关就尽量显示）
             answer = finalize_answer_images(answer, merge_chunks)
+            # L4：远程图片中和（防前端渲染期自动拉取外泄）
+            answer, _ = neutralize_remote_media(answer)
             logger.info("rag_chain.generate", extra={"answer_len": len(answer)})
 
         sources = [SourceInfo.from_result(r, origin="direct") for r in rerank_result]
@@ -379,22 +382,23 @@ class RAGChain:
         # 既不破坏流式体验，也不会因 token 切分导致标记跨边界漏替换。
         # 流末再做确定性补图：LLM 未引用的 context 图片补在答案末尾。
         streamer = ImageMarkerStreamer(merge_chunks)
+        media_guard = RemoteMediaStreamer()  # L4：远程图片中和（流式版，与标记替换器串接）
         answer_parts: List[str] = []
         if self.generator:
             try:
                 async for token in self.generator.generate_stream(question, merge_chunks, history=history):
-                    piece = streamer.feed(token)
+                    piece = media_guard.feed(streamer.feed(token))
                     if piece:
                         answer_parts.append(piece)
                         yield {"type": "char", "content": piece}
             except Exception as e:
                 logging.error(f"流式生成失败: {e}")
-                tail = streamer.flush()
+                tail = media_guard.feed(streamer.flush()) + media_guard.flush()
                 if tail:
                     yield {"type": "char", "content": tail}
                 yield {"type": "char", "content": f"\n\n[生成中断: {e}]"}
             else:
-                tail = streamer.flush()
+                tail = media_guard.feed(streamer.flush()) + media_guard.flush()
                 if tail:
                     answer_parts.append(tail)
                     yield {"type": "char", "content": tail}
@@ -541,22 +545,23 @@ class RAGChain:
         # P2：与 ask_stream 一致，用标记感知流式器边流边替换 [[IMG:asset_id]]；
         # 流末再做确定性补图（LLM 未引用的 context 图片补在答案末尾）。
         streamer = ImageMarkerStreamer(merge_chunks)
+        media_guard = RemoteMediaStreamer()  # L4：远程图片中和（流式版，与标记替换器串接）
         answer_parts: List[str] = []
         if self.generator:
             try:
                 async for token in self.generator.generate_stream(question, merge_chunks, history=history):
-                    piece = streamer.feed(token)
+                    piece = media_guard.feed(streamer.feed(token))
                     if piece:
                         answer_parts.append(piece)
                         yield {"type": "char", "content": piece}
             except Exception as e:
                 logging.error(f"流式生成失败: {e}")
-                tail = streamer.flush()
+                tail = media_guard.feed(streamer.flush()) + media_guard.flush()
                 if tail:
                     yield {"type": "char", "content": tail}
                 yield {"type": "char", "content": f"\n\n[生成中断: {e}]"}
             else:
-                tail = streamer.flush()
+                tail = media_guard.feed(streamer.flush()) + media_guard.flush()
                 if tail:
                     answer_parts.append(tail)
                     yield {"type": "char", "content": tail}

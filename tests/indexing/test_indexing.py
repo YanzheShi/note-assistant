@@ -512,13 +512,18 @@ title: Test
 # ================================================================
 class TestIngestorMakeId:
     def test_make_id_format(self):
-        """_make_id 应生成 filepath::index::kind 格式"""
+        """_make_id 应生成 filepath::index::kind 格式（分隔符无损归一为 /）"""
         from note_assistant.indexing.ingestor import Ingestor
 
-        id_ = Ingestor._make_id("folder/file.md", 3, "text")
-        # 替换 / 和 \ 为 _
-        expected = "folder_file.md::3::text" if os.sep == "\\" else "folder/file.md::3::text"
-        assert id_ == expected
+        assert Ingestor._make_id("folder/file.md", 3, "text") == "folder/file.md::3::text"
+        # Windows 分隔符归一化（跨平台一致）
+        assert Ingestor._make_id("folder\\file.md", 3, "text") == "folder/file.md::3::text"
+
+    def test_make_id_no_collision_between_similar_paths(self):
+        """a/b.md 与 a_b.md 不得碰撞（旧实现把 / 替换成 _，两者 ID 相同会互相覆盖）"""
+        from note_assistant.indexing.ingestor import Ingestor
+
+        assert Ingestor._make_id("a/b.md", 0, "text") != Ingestor._make_id("a_b.md", 0, "text")
 
     def test_make_id_kind_variants(self):
         """不同 kind 应体现在 ID 中"""

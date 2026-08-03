@@ -72,11 +72,12 @@ def test_vlm_defaults_off_when_unset(monkeypatch):
     pydantic-settings 即使 _env_file=None 仍读 os.environ，所以这里必须
     delenv 掉真实 VLM_*（同 test_env_override 的坑）。
     """
-    for var in ("VLM_API_KEY", "VLM_BASE_URL", "VLM_MODEL"):
+    for var in ("VLM_API_KEY", "VLM_BASE_URL", "VLM_MODEL", "IMAGE_UNDERSTAND_ENABLED"):
         monkeypatch.delenv(var, raising=False)
     s = Settings(_env_file=None)
     assert s.vlm_api_key == ""
     assert s.vlm_base_url == ""
     assert s.vlm_model == ""
     assert s.image_understand_enabled is False
-    assert s.vlm_prompt_version == "v1"
+    # v2 = 抗注入硬化版 prompt（L0-b）；bump 版本让旧 VisionCache 按既有机制失效
+    assert s.vlm_prompt_version == "v2"

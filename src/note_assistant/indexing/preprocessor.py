@@ -242,6 +242,9 @@ class RichPreprocessor:
             # 其它分支注入的结构化 metadata（mermaid 的 render_hint / diagram_type 等）
             if meta_extra:
                 meta.update(meta_extra)
+            # L0-d 溯源：图片摘要未 enricher 富化时标注兜底来源（vlm/svg 由 enricher 写入，不被覆盖）
+            if ext.kind == "image":
+                meta.setdefault("trust", "alt_fallback")
 
             summary_chunks.append(Chunk(
                 page_content=summary,

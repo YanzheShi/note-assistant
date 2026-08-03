@@ -42,6 +42,14 @@ from note_assistant.config import settings
 from note_assistant.llm.client import get_llm
 from note_assistant.retrieval.types import RetrievalResult
 from note_assistant.pipeline.image_answer import ensure_image_selected, expand_image_neighbors
+from note_assistant.security.guardrails import (
+    append_guardrail,
+    wrap_history_messages,
+    wrap_retrieved_context,
+    wrap_tool_result,
+    wrap_user_question,
+)
+from note_assistant.security.sanitize import sanitize_text
 
 MAX_ITER = settings.agent_max_iter
 
@@ -75,6 +83,9 @@ class AgentState(TypedDict):
     no_new_doc_streak: int                       # 连续「新增独特文档 = 0」的轮数
     widen_context: bool                          # 生成窗口是否反向放宽（覆盖视图/闸门放行时置 True）
     gate_overrode: bool                          # 收敛闸门是否覆盖了 Judge 的 need_* 判定（诚实声明用）
+    # === 安全（docs/prompt-injection-defense-design.md）===
+    allowed_files: set                           # L3：本会话已浮现的 filepath 白名单（get_note/filtered_search 门禁）
+    injection_hits: int                          # L2：会话内注入形状命中累计（升级护栏阈值用）
 
 
 # ──────────────────────────────────────────────
@@ -307,13 +318,15 @@ def _format_judge_evidence(results: List[RetrievalResult]) -> str:
         heading = meta.get("heading_path", "")
         head = f"[{i}] 《{title}》" + (f" — {heading}" if heading else "")
         body = (r.page_content or "").strip().replace("\n", " ")[:limit]
+        # L2：Judge 证据同样是不可信数据，注入命中留痕（flag 默认不改写）
+        body, _ = sanitize_text(body, source=r.filepath)
         parts.append(f"{head}\n{body}")
     coverage = _coverage_view(results)
     return "\n\n".join(parts) + "\n\n" + coverage
 
 
 def _format_context(results: List[RetrievalResult]) -> str:
-    """把去重/裁剪后的结果格式化为生成上下文。"""
+    """把去重/裁剪后的结果格式化为生成上下文（经 L2 注入扫描）。"""
     if not results:
         return "（无参考笔记）"
     from note_assistant.pipeline.image_answer import render_image_block
@@ -324,9 +337,11 @@ def _format_context(results: List[RetrievalResult]) -> str:
         block = render_image_block(r)
         if block is not None:
             # image chunk：结构化渲染 + [[IMG:asset_id]] 引用标记
-            parts.append(f"### [{i}] {title}\n{block}")
+            content, _ = sanitize_text(block, source=r.filepath)
+            parts.append(f"### [{i}] {title}\n{content}")
             continue
-        parts.append(f"### [{i}] {title}\n{r.page_content}")
+        content, _ = sanitize_text(r.page_content, source=r.filepath)
+        parts.append(f"### [{i}] {title}\n{content}")
     return "\n\n".join(parts)
 
 
@@ -397,17 +412,44 @@ async def agent_node(state: AgentState) -> dict:
     保留，供 LLM 连贯决策。
     """
     llm = get_llm(temperature=0.3).bind_tools(AGENT_TOOLS)
-    msgs: list[BaseMessage] = [SystemMessage(AGENT_SYSTEM_PROMPT)]
-    # 接入预算裁剪后的历史，避免失忆
-    msgs.extend(state.get("history_messages") or [])
+    msgs: list[BaseMessage] = [SystemMessage(append_guardrail(AGENT_SYSTEM_PROMPT))]
+    # 接入预算裁剪后的历史，避免失忆（历史是不可信数据，包数据边界）
+    msgs.extend(wrap_history_messages(state.get("history_messages") or []))
     # 当前问题用凝练版（消指代），替换原始未消解问题
     q = state.get("condensed_question") or state["question"]
-    msgs.append(HumanMessage(q))
+    msgs.append(HumanMessage(wrap_user_question(q)))
     # 保留本轮内已有的工具调用 / 观察 / 改写提示（messages[0] 为原始问题，跳过）
     rest = state["messages"][1:] if state["messages"] else []
     msgs.extend(rest)
     resp = await llm.ainvoke(msgs)
     return {"messages": [resp]}
+
+
+def _tool_gate_denied(
+    name: str,
+    args: dict,
+    allowed: set,
+    injection_hits: int,
+) -> str:
+    """L3 工具收敛门禁：返回拒绝原因文本（空串 = 放行）。
+
+    - 升级护栏：会话内注入命中达 ``injection_escalation_threshold`` → 禁用读取类工具；
+    - ``get_note`` / ``filtered_search(filepath=…)`` 只能触及本会话已浮现（被检索命中过）
+      的笔记，切断「注入成功 → 遍历 get_note 整库」的批量泄露路径（设计 S6）。
+    - 其余工具（检索类）不门禁：全局检索是 RAG 本职，单篇内容已有 L1/L2/L4 兜底。
+    """
+    if name not in ("get_note", "filtered_search"):
+        return ""
+    if settings.prompt_injection_scan_enabled and injection_hits >= settings.injection_escalation_threshold:
+        return "（拒绝访问：本会话检测到多次疑似注入指令，读取类工具已禁用）"
+    fp = str(args.get("filepath") or "")
+    if not fp:
+        return ""
+    if name == "get_note" and settings.get_note_allowlist_enabled and fp not in allowed:
+        return "（拒绝访问：该笔记未在本会话检索结果中出现，get_note 只能读取已浮现的笔记）"
+    if name == "filtered_search" and settings.filtered_search_allowlist_enabled and fp not in allowed:
+        return "（拒绝访问：该笔记未在本会话检索结果中出现，filtered_search 只能过滤已浮现的笔记）"
+    return ""
 
 
 async def tools_node(state: AgentState) -> dict:
@@ -430,12 +472,31 @@ async def tools_node(state: AgentState) -> dict:
     # heading，旧键会让二者按分数竞速二选一，图片常被长文本挤掉（图不显示的根因之一）。
     seen = {r.identity_key() for r in accumulated}
     new_before = len(accumulated)
+    # L3 白名单：已浮现 filepath = 历史累积 ∪ 本轮命中；兼容无新字段的旧 state
+    allowed = set(state.get("allowed_files") or set())
+    allowed |= {r.filepath for r in accumulated if r.filepath}
+    injection_hits = int(state.get("injection_hits", 0))
     for tc in last.tool_calls:
-        # 工具调用可能含同步 LLM（query_rewrite），放到线程避免阻塞事件循环
-        obs_text, results = await asyncio.to_thread(
-            run_tool_call, tc["name"], tc.get("args", {})
-        )
+        name = tc["name"]
+        args = tc.get("args", {}) or {}
+        # L3 门禁：读取类工具只能触及本会话已浮现的笔记（先于执行判定）
+        denied = _tool_gate_denied(name, args, allowed, injection_hits)
+        if denied:
+            logger.warning("security.tool_denied", extra={"tool": name, "filepath": str(args.get("filepath") or "")})
+            obs_text, results = denied, []
+        else:
+            # 工具调用可能含同步 LLM（query_rewrite），放到线程避免阻塞事件循环
+            obs_text, results = await asyncio.to_thread(run_tool_call, name, args)
+            # L2：工具返回的 vault 内容做注入扫描并计入会话命中（升级护栏用）；
+            # 命中的 filepath 进入白名单（agent 可深挖已浮现笔记）
+            for r in results:
+                _, n = sanitize_text(r.page_content, source=r.filepath)
+                injection_hits += n
+                if r.filepath:
+                    allowed.add(r.filepath)
         obs_text = cm.truncate_observation(obs_text, settings.agent_obs_token_budget)
+        # 工具返回来自 vault，是最大注入载体：包数据边界（截断后包，闭标记不被切断）
+        obs_text = wrap_tool_result(name, obs_text)
         for r in results:
             key = r.identity_key()
             if key not in seen:
@@ -455,6 +516,8 @@ async def tools_node(state: AgentState) -> dict:
         "messages": new_messages,
         "accumulated": accumulated,
         "iteration": state["iteration"] + 1,
+        "allowed_files": allowed,
+        "injection_hits": injection_hits,
     }
 
 
@@ -476,11 +539,11 @@ async def reflect(state: AgentState) -> dict:
     evidence = _format_judge_evidence(state["accumulated"])
     try:
         msgs: list[BaseMessage] = [
-            SystemMessage(JUDGE_SYSTEM),
+            SystemMessage(append_guardrail(JUDGE_SYSTEM)),
             HumanMessage(
-                f"用户问题：{q}\n\n"
+                f"用户问题：{wrap_user_question(q)}\n\n"
                 f"=== 已检索到的知识库片段（共 {len(state['accumulated'])} 条，"
-                f"以下为分数最高的若干条）===\n{evidence}\n\n"
+                f"以下为分数最高的若干条）===\n{wrap_retrieved_context(evidence)}\n\n"
                 f"已检索轮次：{state['iteration']}/{MAX_ITER}（{label}）\n\n"
                 "请判断信息是否足够回答（输出 JSON）。"
             ),
@@ -696,13 +759,16 @@ async def generate_node(state: AgentState) -> dict:
         note = "\n\n（注：已多次检索但知识库中相关信息有限，以下回答可能不完整。）\n"
     else:
         note = ""
-    msgs: list[BaseMessage] = [SystemMessage(GENERATE_SYSTEM)]
+    msgs: list[BaseMessage] = [SystemMessage(append_guardrail(GENERATE_SYSTEM))]
     # 预算裁剪后的历史（含长程摘要），与 agent/direct_chat 同源，避免重复
     history_msgs = state.get("history_messages") or _fmt_history(state["history"])
-    msgs.extend(history_msgs)
+    msgs.extend(wrap_history_messages(history_msgs))
     q = state.get("condensed_question") or state["question"]
     msgs.append(
-        HumanMessage(f"## 参考笔记\n{context}\n\n## 问题\n{q}{note}")
+        HumanMessage(
+            f"## 参考笔记\n{wrap_retrieved_context(context)}\n\n"
+            f"## 问题\n{wrap_user_question(q)}{note}"
+        )
     )
     resp = await llm.ainvoke(msgs)
     answer = str(resp.content)
@@ -746,10 +812,10 @@ async def clarify_node(state: AgentState) -> dict:
 async def direct_chat(state: AgentState) -> dict:
     """直接对话节点：闲聊/人设类问题，不检索，友好回复。接入历史不再失忆。"""
     llm = get_llm(temperature=0.6, max_tokens=1024)
-    msgs: list[BaseMessage] = [SystemMessage(CHAT_SYSTEM)]
-    msgs.extend(state.get("history_messages") or [])
+    msgs: list[BaseMessage] = [SystemMessage(append_guardrail(CHAT_SYSTEM))]
+    msgs.extend(wrap_history_messages(state.get("history_messages") or []))
     q = state.get("condensed_question") or state["question"]
-    msgs.append(HumanMessage(q))
+    msgs.append(HumanMessage(wrap_user_question(q)))
     resp = await llm.ainvoke(msgs)
     answer = str(resp.content)
     logger.info("direct_chat.summary", extra={"answer_len": len(answer)})

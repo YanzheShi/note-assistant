@@ -17,6 +17,7 @@ FastAPI 入口 —— RAG 对外接口。
         - 错误处理与限流
 """
 
+import re
 import time
 import asyncio
 import logging
@@ -479,15 +480,23 @@ async def config():
 # /assets/{asset_id} — 图片资产服务端点（设计 9.1）
 # ═══════════════════════════════════════════════════════════════
 
+# asset_id 形态强校验（内容哈希 sha256[:16]）：杜绝任何路径形态入参进 glob
+_ASSET_ID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
+
+
 @app.get("/assets/{asset_id}")
 async def get_asset(asset_id: str):
     """按内容哈希 id 返回图片二进制（设计 9.1）。
 
     - 从 settings.assets_dir 读 ``<asset_id>.<ext>``（本地/远程图索引时统一落盘到此处）。
     - 内容哈希天然不可变：ETag=asset_id，Cache-Control 长缓存。
+    - 入参必须是 16 位十六进制哈希，否则 400（防路径形态入参）。
     - 不存在时 404（前端据此降级为占位/原链接）。
     """
     import mimetypes
+
+    if not _ASSET_ID_RE.match(asset_id or ""):
+        raise HTTPException(status_code=400, detail="invalid asset id")
 
     assets_dir = settings.assets_dir
     try:
