@@ -1549,6 +1549,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "watchfiles" },
 ]
 
 [package.dev-dependencies]
@@ -1592,6 +1593,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "transformers", specifier = ">=5.12.1" },
     { name = "uvicorn", extras = ["standard"] },
+    { name = "watchfiles" },
 ]
 
 [package.metadata.requires-dev]

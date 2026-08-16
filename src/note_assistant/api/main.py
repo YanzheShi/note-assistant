@@ -37,6 +37,7 @@ from note_assistant.api.schemas import (
     SourceSchema,
     HealthResponse,
     ReindexResponse,
+    ReindexStatusResponse,
     ConfigResponse,
     AgentAskResponse,
     AgentSource,
@@ -56,6 +57,9 @@ setup_logging(log_file=str(_log_dir / "api.log"))
 # ─── 全局 RAG Chain ──────────────────────────────────────────
 # lifespan 中初始化，启动后常驻内存
 rag_chain = None
+
+# ─── 自动增量索引服务（lifespan 启停；/reindex* 端点共用单飞队列）────
+autoindex_service = None
 
 
 @asynccontextmanager
@@ -78,7 +82,7 @@ async def lifespan(app: FastAPI):
     - 为什么不每次请求新创建？组件（embedder/chroma）内有连接池和缓存，重复创建浪费
     - 重启 API 服务后需要重新 init——冷启动约 3-5s（reranker 加载耗时）
     """
-    global rag_chain
+    global rag_chain, autoindex_service
     
     # LangSmith 链路追踪（通过环境变量，LangChain 自动拾取）
     import os
@@ -113,7 +117,18 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("✅ RAG Chain 初始化完成")
 
+    # ── 自动增量索引（零回归：enabled=False 时不启 watcher，只留手动触发的单飞队列）──
+    from note_assistant.indexing.autoindex import AutoIndexService
+
+    autoindex_service = AutoIndexService()
+    await autoindex_service.start()
+    if not autoindex_service.enabled:
+        logger.info("autoindex: 未启用（autoindex_enabled=False），watcher 不启动；手动 /reindex 仍走单飞队列")
+
     yield
+
+    await autoindex_service.stop()
+    autoindex_service = None
 
 
 app = FastAPI(title="Obsidian RAG", lifespan=lifespan)
@@ -524,7 +539,9 @@ async def get_asset(asset_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════
-# /reindex — 增量索引
+# /reindex — 增量索引（手动触发）
+# /reindex/run — 同上（语义化别名）
+# /reindex/status — 自动索引观测
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/reindex", response_model=ReindexResponse)
@@ -532,13 +549,32 @@ async def reindex():
     """
     增量索引 —— 重新扫描 vault 变化，只更新变更的文件。
 
-    调用 scripts/reindex.py 的 incremental_reindex 函数。
+    汇入 AutoIndexService 的单飞队列串行执行，与 watcher 自动触发互斥，
+    不会并发写 ChromaDB。服务未启动时（异常兜底）同步直接执行。
     """
     try:
-        from scripts.reindex import incremental_reindex
-        result = incremental_reindex(str(settings.vault_path))
+        if autoindex_service is not None:
+            result = await autoindex_service.run_incremental()
+        else:
+            from note_assistant.indexing.reindex import incremental_reindex
+            result = await asyncio.to_thread(incremental_reindex, str(settings.vault_path))
         return ReindexResponse(**result)
-    except ImportError:
-        raise HTTPException(status_code=500, detail="reindex 脚本未找到，请先运行 uv sync 或确认 scripts/reindex.py 存在")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"增量索引失败: {e}")
+
+
+@app.post("/reindex/run", response_model=ReindexResponse)
+async def reindex_run():
+    """手动触发一次增量索引（/reindex 的语义化别名，走同一单飞队列）。"""
+    return await reindex()
+
+
+@app.get("/reindex/status", response_model=ReindexStatusResponse)
+async def reindex_status():
+    """
+    自动索引状态 —— 观测 watcher 是否启用、队列深度、最近执行、错误计数。
+    前端可在调试面板展示索引同步状态。
+    """
+    if autoindex_service is None:
+        return ReindexStatusResponse(enabled=False, queue_len=0, running=False, errors=0)
+    return ReindexStatusResponse(**autoindex_service.stats)

@@ -235,6 +235,20 @@ class Ingestor:
         elif not is_v2b and settings.parent_docstore_path.exists():
             settings.parent_docstore_path.unlink()
 
+        # 收尾：全量索引后刷新 sync.db 全部状态（设计文档附录待办）。
+        # 否则下次增量会把全库当「新文件」重索引一遍（need_reindex 无记录 → True）。
+        # 失败不中断成功索引：只记 warning，后果是下次增量全库重跑（自愈）。
+        try:
+            from note_assistant.indexing.sync import SyncDB
+            sync = SyncDB()
+            try:
+                for node in docs:
+                    sync.update_state(node.filepath, node.abs_path)
+            finally:
+                sync.close()
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ sync.db 刷新失败（下次增量将全库重跑）: {e}")
+
         return {"files": len(docs), "chunks": total_chunks}
 
 

@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     ragas_llm_model: str = "qwen2.5:0.5b"
 
 
+    # === 自动增量索引（docs/自动增量索引（auto-reindex）设计方案.md）===
+    # 笔记保存后自动同步进索引：watchfiles 事件监听（Windows 底层 ReadDirectoryChangesW）
+    # + debounce 合并 + 单飞队列。默认关闭 = 与现状逐字节等价（零回归约定）。
+    autoindex_enabled: bool = False          # 总开关，开启后 uvicorn 启动即在 lifespan 内自启 watcher
+    autoindex_debounce_seconds: float = 3.0  # 事件收集窗口（Obsidian 保存多事件合并）
+    autoindex_batch_fallback_threshold: int = 5  # 单批待处理 ≥ 该值 → 降级整库增量，一次收敛
+    autoindex_full_sync_every: int = 20      # 每累计 N 次增量 → 自动全量校准（重建 BM25/WikiGraph）；0=关闭校准
+
     # === Agent / Generator LLM（统一走 AGENT_*）===
     agent_api_key: str
     agent_base_url: str

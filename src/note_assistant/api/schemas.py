@@ -108,6 +108,17 @@ class ReindexResponse(BaseModel):
     removed: int                             # 删除的文件数
 
 
+class ReindexStatusResponse(BaseModel):
+    """自动索引状态（GET /reindex/status）—— 观测 watcher/队列/最近执行。"""
+    enabled: bool                            # 自动监听开关（autoindex_enabled）
+    queue_len: int                           # 待执行批次
+    running: bool                            # 是否有索引正在执行
+    last_run_at: Optional[str] = None        # 最近一次执行时间（ISO）
+    last_run: dict = Field(default_factory=dict)  # {"reindexed": n, "removed": n, "duration_ms": n}
+    total_runs: int = 0                      # 累计执行批次
+    errors: int = 0                          # 累计失败批次
+
+
 class ConfigResponse(BaseModel):
     """当前系统配置——暴露给前端/调试用。"""
     chunk_size: int

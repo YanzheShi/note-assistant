@@ -24,6 +24,8 @@ dependencies = [
     # API
     "fastapi",
     "uvicorn[standard]",
+    # 自动增量索引（watcher；uvicorn[standard] 已传递引入，显式声明防移除）
+    "watchfiles",
     # Config
     "python-dotenv",
     "pydantic>=2.10,<3",
