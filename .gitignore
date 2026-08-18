@@ -38,11 +38,23 @@ data/*.db
 data/*.pkl
 data/*.graph
 data/eval_report*.json
+data/eval_*.json
+data/*.log
 data/logs/
+# 图片资产缓存 / 运行时 sqlite
+data/assets/
+data/*.sqlite
 # reranker 模型 ~2GB，不进 git
 models/
 # 评测结果
 eval/results/
+
+# === IDE / 工具缓存（非代码文件）===
+note-assistant.srctrlbm
+note-assistant.srctrldb
+note-assistant.srctrlprj
+note-assistant.und/
+excalidraw.log
 
 # === 数据库文件 ===
 *.sqlite3
