@@ -5,15 +5,16 @@ Reranker 重排模块 —— 对混合检索的 top-k 候选做交叉编码器�
 import logging
 import time
 from typing import List
-
 from note_assistant.config import settings
 from note_assistant.retrieval.types import RetrievalResult
+from transformers import PreTrainedTokenizerBase
+from FlagEmbedding import FlagReranker
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
 # ─── 兼容层：FlagEmbedding 1.4.0 依赖 prepare_for_model（transformers < 4.34）───
 # transformers >= 4.34 移除了此方法，加回去让 FlagEmbedding 正常工作
-from transformers import PreTrainedTokenizerBase
 if not hasattr(PreTrainedTokenizerBase, "prepare_for_model"):
     def _prepare_for_model(self, text, text_pair=None, **kwargs):
         """
@@ -32,9 +33,6 @@ if not hasattr(PreTrainedTokenizerBase, "prepare_for_model"):
         return self(text, text_pair=text_pair, **kwargs)
     PreTrainedTokenizerBase.prepare_for_model = _prepare_for_model
 
-from FlagEmbedding import FlagReranker
-from functools import lru_cache
-
 
 @lru_cache(maxsize=None)
 def get_reranker(model_path: str | None = None, use_fp16: bool = True) -> "LocalReranker":
@@ -48,9 +46,6 @@ def get_reranker(model_path: str | None = None, use_fp16: bool = True) -> "Local
         LocalReranker 单例
     """
     return LocalReranker(model_path=model_path, use_fp16=use_fp16)
-
-
-
 
 
 class LocalReranker:

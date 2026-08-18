@@ -26,6 +26,7 @@ from note_assistant.config import settings
 from note_assistant.pipeline.image_answer import append_missing_images, postprocess_answer
 from note_assistant.security.output_guard import check_prompt_leakage, neutralize_remote_media
 from note_assistant.retrieval.types import RetrievalResult
+from note_assistant.llm.usage import get_token_handler
 
 OBS_TRUNCATE = 500  # observation 文本截断长度，避免轨迹过大
 
@@ -76,6 +77,15 @@ def reset_cache() -> None:
     """测试 / 重新配置时清空全局缓存（重新按当前 settings 构建）。"""
     global _cache
     _cache = None
+
+
+def get_cache_stats() -> dict:
+    """返回语义缓存统计（hits/misses/hit_rate/size/enabled/semantic）。
+
+    评测脚本在跑完一轮后调用，写入 ``EvalReport.semantic_cache_stats``。
+    仅 agent 链路有意义（naive 链路不使用 SemanticCache）。
+    """
+    return _get_cache().stats()
 
 
 # ──────────────────────────────────────────────
@@ -363,7 +373,8 @@ async def ainvoke(
             accumulated=seed,
             signal=signal,
             just_clarified=just_clarified,
-        )
+        ),
+        config={"callbacks": [get_token_handler()]},
     )
     elapsed = (time.perf_counter() - _t0) * 1000
     traj = _trajectory_from_state(final)
@@ -558,7 +569,7 @@ async def astream(
     clarified = False
     guarded = False  # L4：输出护栏是否命中（命中则不入缓存，防投毒回放）
 
-    async for chunk in graph.astream(state, stream_mode="updates"):
+    async for chunk in graph.astream(state, stream_mode="updates", config={"callbacks": [get_token_handler()]}):
         for node, update in chunk.items():
             update = update or {}
             ev = None

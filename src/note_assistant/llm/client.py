@@ -43,7 +43,10 @@ def get_llm(
     )
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
-    return init_chat_model(**kwargs)
+    # 零侵入 token 计量：挂全局 handler（评测 set_meter 才采集，默认零副作用）
+    from note_assistant.llm.usage import get_token_handler
+
+    return init_chat_model(**kwargs).with_config(callbacks=[get_token_handler()])
 
 
 @lru_cache(maxsize=None)
@@ -79,4 +82,7 @@ def get_vlm(
     )
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
-    return init_chat_model(**kwargs)
+    # 零侵入 token 计量：挂全局 handler（评测 set_meter 才采集，默认零副作用）
+    from note_assistant.llm.usage import get_token_handler
+
+    return init_chat_model(**kwargs).with_config(callbacks=[get_token_handler()])

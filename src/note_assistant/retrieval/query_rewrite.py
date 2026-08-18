@@ -23,10 +23,10 @@ class QueryRewriter:
             llm: 可选，传入自定义 LLM；默认用 DeepSeek-Chat
         """
         self.llm = llm or init_chat_model(
-            model=settings.longcat_model,
+            model=settings.agent_model,
             model_provider="openai",
-            api_key=settings.longcat_api_key,
-            openai_api_base=settings.longcat_base_url,
+            api_key=settings.agent_api_key,
+            openai_api_base=settings.agent_base_url,
             temperature=0.3,       # 稳定输出，不要创意
             max_tokens=100,        # 改写结果很短
         )

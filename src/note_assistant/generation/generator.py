@@ -54,6 +54,10 @@ class Generator:
             # 使用流式输出保证首字响应时间
             streaming=True,
         )
+        # 零侵入 token 计量：挂全局 handler（meter=None 时无副作用）
+        from note_assistant.llm.usage import get_token_handler
+
+        self.llm = self.llm.with_config(callbacks=[get_token_handler()])
 
 
     @staticmethod

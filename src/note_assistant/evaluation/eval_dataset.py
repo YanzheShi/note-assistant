@@ -26,23 +26,55 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+
+
+@dataclass
+class EvalTurn:
+    """多轮剧本中的单轮（字段同单轮 EvalQuestion，但作为独立一轮存在）。
+
+    多轮评测时，EvalQuestion.turns 是一串 EvalTurn，逐轮串联（naive 用 history、
+    agent 用 session_id），每轮独立算检索/生成指标与 token 用量。
+    """
+
+    question: str
+    golden_answer: str = ""
+    relevant_files: List[str] = field(default_factory=list)
+    relevant_chunk_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
 class EvalQuestion:
-    """单条评测样本。"""
+    """单条评测样本；可含多轮剧本（turns）。
+
+    ``turns=None`` 退化为现有单轮（向后兼容，内置 10 条数据集照常工作）。
+    """
+
     question: str
-    golden_answer: str
+    golden_answer: str = ""
     relevant_files: List[str] = field(default_factory=list)
     relevant_chunk_ids: List[str] = field(default_factory=list)
+    turns: Optional[List[EvalTurn]] = None
+
+    def is_multiturn(self) -> bool:
+        """是否为多轮剧本（turns 非空）。"""
+        return bool(self.turns)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> EvalQuestion:
-        return cls(**d)
+        turns = d.get("turns")
+        if turns is not None:
+            turns = [EvalTurn(**t) for t in turns]
+        return cls(
+            question=d["question"],
+            golden_answer=d.get("golden_answer", ""),
+            relevant_files=d.get("relevant_files", []),
+            relevant_chunk_ids=d.get("relevant_chunk_ids", []),
+            turns=turns,
+        )
 
 
 @dataclass

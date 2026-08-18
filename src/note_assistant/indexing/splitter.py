@@ -1,5 +1,4 @@
 from typing import List, Dict, Any
-from pathlib import Path
 
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
@@ -18,7 +17,7 @@ _HEADER_CONFIG = [
 
 
 # ================================================================
-# 工厂：两层 splitter（参数全暴露，你下午调）
+# 工厂：两层 splitter
 # ================================================================
 def make_splitters(
     chunk_size: int | None = None,
@@ -28,7 +27,7 @@ def make_splitters(
     return_each_line: bool = False,
 ) -> tuple[MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter]:
     """
-    v2/v3 共用工厂，你下午要调的核心参数：
+    v2/v3 共用工厂
     - separators：重点确认 "。" 的位置是否在 " " 之前（中文切分关键）
     - return_each_line：你的笔记 ## 起手，选 False（避免短标题单独成chunk）
     """
@@ -74,12 +73,11 @@ def docnode_to_lc_doc(node: DocNode) -> Document:
 
 
 # ================================================================
-# v1: 单层 Recursive（基线，你下午填实现）
+# v1: 单层 Recursive（基线）
 # ================================================================
 def split_v1(node: DocNode, sp: RecursiveCharacterTextSplitter) -> List[Chunk]:
     """
     基线版本：纯 Recursive 切分，不保留标题层级
-    你下午要实现的核心点：
     1. 调用 split_documents 前，先把 node 转成 LC Document
     2. metadata 仅包含 DocNode 基础字段，无 heading_path
     3. 确认 chunk 末尾是否被硬切（对比加 "。" 前后的差异）
@@ -103,7 +101,7 @@ def split_v1(node: DocNode, sp: RecursiveCharacterTextSplitter) -> List[Chunk]:
     return result
 
 # ================================================================
-# v2: 两层 Header + Recursive（生产路，你下午填实现）
+# v2: 两层 Header + Recursive
 # ================================================================
 def split_v2(
     node: DocNode,
@@ -151,6 +149,76 @@ def split_v2(
 
 
 # ================================================================
+# v2b 内部辅助函数（仅 split_v2b 使用，不对外暴露）
+# ================================================================
+def _heading_path(meta: Dict[str, Any]) -> str:
+    """从 metadata 的 h1-h4 拼接 heading_path；全空时回退 "无标题"。"""
+    parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4"]]
+    return " > ".join(p for p in parts if p) or "无标题"
+
+
+def _top_header(meta: Dict[str, Any]) -> str:
+    """取文档中最高（最浅）层级的『章节』标题，作为父块分段依据。
+
+    跳过 h1（通常是文档标题，所有章节共享），优先用 h1 之下的第一级
+    标题（h2/h3/h4）做换段键——否则带 h1 的文档所有章节会因共享同一个
+    h1 而被合并进同一个父块，父段 heading_path 塌缩成只剩文档标题。
+    无 h2/h3/h4 时才回退到 h1。
+    """
+    for k in ["h2", "h3", "h4", "h1"]:
+        v = meta.get(k, "")
+        if v:
+            return v
+    return ""
+
+
+def _common_prefix_hp(hps: List[str]) -> str:
+    """取若干 heading_path 的公共前缀（按 ' > ' 切分），作为合并父段的章节标题。
+
+    例：['A > 二、关键设计点 > 2.1 X', 'A > 二、关键设计点 > 2.2 Y']
+    → 'A > 二、关键设计点'（整节标题），而不是只取首个子节的标题。
+
+    这是修复「同一 ## 下多个 ### 子节被合并成一个父段时，父段 heading_path
+    只取首个子节、其余子节标题永久丢失」的根因：每个 child 仍保留自身子节
+    heading_path（见下），父段则用公共前缀表示「整节」。
+    """
+    if not hps:
+        return "无标题"
+    splits = [h.split(" > ") for h in hps]
+    prefix = splits[0]
+    for s in splits[1:]:
+        i = 0
+        while i < len(prefix) and i < len(s) and prefix[i] == s[i]:
+            i += 1
+        prefix = prefix[:i]
+    return " > ".join(prefix) if prefix else "无标题"
+
+
+def _merge_parent_segment(
+    run: List[Dict[str, Any]],
+    child_sp: RecursiveCharacterTextSplitter,
+    parent_sp: RecursiveCharacterTextSplitter,
+) -> List[Dict[str, Any]]:
+    """把同一章节下的连续细章节合并为一个父段，返回父段列表。
+
+    合并后仍超 parent_chunk_size 时，用 parent_sp 切成 bounded 段
+    （丢弃子节粒度，回退整段 hp）。
+    """
+    seg_text = "\n\n".join(x["text"] for x in run)   # 整节正文拼接 → 父块
+    seg_hp = _common_prefix_hp([x["hp"] for x in run])
+    kids: List[Dict[str, Any]] = []
+    for x in run:
+        kids.extend(x["kids"])
+    if len(seg_text) <= settings.parent_chunk_size:
+        return [{"hp": seg_hp, "text": seg_text, "kids": kids}]
+    segments = []
+    for p in parent_sp.split_text(seg_text):
+        p_kids = [{"hp": seg_hp, "text": cd} for cd in child_sp.split_text(p)]
+        segments.append({"hp": seg_hp, "text": p, "kids": p_kids})
+    return segments
+
+
+# ================================================================
 # v2b: Parent-Child 双存（检索用细块 child，返回用整节 parent）
 # ================================================================
 def split_v2b(
@@ -184,50 +252,11 @@ def split_v2b(
     # 1. 按标题拆成细章节（每个带 h1-h4 metadata）
     sections = header_sp.split_text(node.raw_md)
 
-    def _hp(meta: dict) -> str:
-        parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4"]]
-        return " > ".join(p for p in parts if p) or "无标题"
-
-    def _top_header(meta: dict) -> str:
-        """取文档中最高（最浅）层级的『章节』标题，作为父块分段依据。
-
-        跳过 h1（通常是文档标题，所有章节共享），优先用 h1 之下的第一级
-        标题（h2/h3/h4）做换段键——否则带 h1 的文档所有章节会因共享同一个
-        h1 而被合并进同一个父块，父段 heading_path 塌缩成只剩文档标题。
-        无 h2/h3/h4 时才回退到 h1。
-        """
-        for k in ["h2", "h3", "h4", "h1"]:
-            v = meta.get(k, "")
-            if v:
-                return v
-        return ""
-
-    def _common_prefix_hp(hps: List[str]) -> str:
-        """取若干 heading_path 的公共前缀（按 ' > ' 切分），作为合并父段的章节标题。
-
-        例：['A > 二、关键设计点 > 2.1 X', 'A > 二、关键设计点 > 2.2 Y']
-        → 'A > 二、关键设计点'（整节标题），而不是只取首个子节的标题。
-
-        这是修复「同一 ## 下多个 ### 子节被合并成一个父段时，父段 heading_path
-        只取首个子节、其余子节标题永久丢失」的根因：每个 child 仍保留自身子节
-        heading_path（见下），父段则用公共前缀表示「整节」。
-        """
-        if not hps:
-            return "无标题"
-        splits = [h.split(" > ") for h in hps]
-        prefix = splits[0]
-        for s in splits[1:]:
-            i = 0
-            while i < len(prefix) and i < len(s) and prefix[i] == s[i]:
-                i += 1
-            prefix = prefix[:i]
-        return " > ".join(prefix) if prefix else "无标题"
-
     # 2. 预切：每个 section 先细分成 child（各自带自身子节 heading_path），
     #    同时保留整节正文用于后续合并父段。
     section_data: List[Dict[str, Any]] = []
     for s in sections:
-        hp = _hp(s.metadata)
+        hp = _heading_path(s.metadata)
         key = _top_header(s.metadata)
         kids = [{"hp": hp, "text": cd} for cd in child_sp.split_text(s.page_content)]
         section_data.append({"hp": hp, "key": key, "text": s.page_content, "kids": kids})
@@ -237,30 +266,14 @@ def split_v2b(
     run: List[Dict[str, Any]] = []
     run_len = 0
 
-    def _flush(r: List[Dict[str, Any]]) -> None:
-        if not r:
-            return
-        seg_text = "\n\n".join(x["text"] for x in r)   # 整节正文拼接 → 父块
-        seg_hp = _common_prefix_hp([x["hp"] for x in r])
-        kids = []
-        for x in r:
-            kids.extend(x["kids"])
-        # 合并后仍超预算 → 用 parent_sp 再切成 bounded 段（丢弃子节粒度，回退整段 hp）
-        if len(seg_text) <= settings.parent_chunk_size:
-            parent_segments.append({"hp": seg_hp, "text": seg_text, "kids": kids})
-        else:
-            for p in parent_sp.split_text(seg_text):
-                p_kids = [{"hp": seg_hp, "text": cd} for cd in child_sp.split_text(p)]
-                parent_segments.append({"hp": seg_hp, "text": p, "kids": p_kids})
-
     for sd in section_data:
         if run and (sd["key"] != run[0]["key"] or run_len + len(sd["text"]) > settings.parent_chunk_size):
-            _flush(run)
+            parent_segments.extend(_merge_parent_segment(run, child_sp, parent_sp))
             run = []
             run_len = 0
         run.append(sd)
         run_len += len(sd["text"])
-    _flush(run)
+    parent_segments.extend(_merge_parent_segment(run, child_sp, parent_sp))
 
     # 4. 每个父段 → 1 个 parent Chunk + N 个 child Chunk
     #    parent 用整节公共前缀标题；child 各自保留自身子节 heading_path
@@ -341,8 +354,3 @@ if __name__ == "__main__":
     for i, c in enumerate(result):
         hp = c.metadata.get("heading_path", "N/A")
         print(f"[{i}] hp={hp} | {c.page_content[:60]!r}...")
-
-    # TODO: 初始化 splitter（调用 make_splitters）
-    # TODO: 分别调用 v1/v2 切分测试笔记
-    # TODO: 打印对比：v1/v2 的 chunk 数、heading_path、末尾5字（确认 "。" 是否生效）
-    # TODO: 可选：估算全库 chunk 数，记录到 DECISIONS.md
