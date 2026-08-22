@@ -47,6 +47,19 @@ class Settings(BaseSettings):
     agent_base_url: str
     agent_model: str
 
+    # === 上下文凝练 / 长程摘要 专属 LLM（可选，独立通道）===
+    # 设计：默认全部留空 → 凝练 / 摘要都复用 AGENT_* 主文本通道（与改造前逐字节等价，零回归）。
+    # 任一「专属模型字段」非空 → 用该独立模型专跑对应能力（消指代改写 / 滚动摘要），
+    # key/base_url 留空时回落到 AGENT_* 同款网关（同网关换模型最常见），三者全空才回落主通道。
+    # 用途：可让廉价/快模型专跑凝练与摘要，主模型只管答案生成，省钱省时且互不串台。
+    agent_condense_api_key: str = ""
+    agent_condense_base_url: str = ""
+    agent_condense_model: str = ""
+    # 同上，但作用于「长程摘要 LLM」（滚动摘要压缩）。
+    agent_summarize_api_key: str = ""
+    agent_summarize_base_url: str = ""
+    agent_summarize_model: str = ""
+
     # === VLM / 多模态理解（P1-c，OpenAI 兼容视觉通道）===
     # 注意：字段名与 AGENT_* 完全独立，避免纯文本 LLM 与视觉模型互相串台。
     vlm_api_key: str = ""          # 为空 → 不启用 VLM 理解（索引降级为 alt+上下文）

@@ -49,6 +49,76 @@ def get_llm(
     return init_chat_model(**kwargs).with_config(callbacks=[get_token_handler()])
 
 
+def _build_openai_llm(
+    model: str,
+    api_key: str,
+    base_url: str,
+    *,
+    temperature: float = 0.2,
+) -> "object":
+    """构造一个 OpenAI 兼容 ChatModel（凝练 / 摘要专属通道复用，不进 lru_cache）。
+
+    Args:
+        model: 模型名（必填）
+        api_key: API key；为空则用主通道 AGENT_API_KEY
+        base_url: 网关地址；为空则用主通道 AGENT_BASE_URL
+        temperature: 凝练/摘要追求确定性，默认 0.2
+
+    Returns:
+        langchain ChatModel 实例，已挂 token 计量 handler
+    """
+    kwargs: dict = dict(
+        model=model,
+        model_provider="openai",
+        api_key=api_key or settings.agent_api_key,
+        openai_api_base=base_url or settings.agent_base_url,
+        temperature=temperature,
+    )
+    from note_assistant.llm.usage import get_token_handler
+
+    return init_chat_model(**kwargs).with_config(callbacks=[get_token_handler()])
+
+
+@lru_cache(maxsize=None)
+def get_condense_llm():
+    """凝练（消指代改写）专属 LLM。
+
+    若 ``AGENT_CONDENSE_MODEL`` 非空 → 用专属模型（独立网关/密钥可单独配，留空回落主通道）；
+    否则复用主文本通道 ``get_llm()``（与改造前逐字节等价）。
+
+    Returns:
+        langchain ChatModel 实例
+    """
+    if settings.agent_condense_model:
+        return _build_openai_llm(
+            settings.agent_condense_model,
+            settings.agent_condense_api_key,
+            settings.agent_condense_base_url,
+            temperature=0.2,
+        )
+    return get_llm()
+
+
+@lru_cache(maxsize=None)
+def get_summarize_llm():
+    """长程摘要（滚动压缩）专属 LLM。
+
+    解析逻辑同 ``get_condense_llm()``，仅作用于 ``AGENT_SUMMARIZE_*`` 配置。
+    ``AGENT_SUMMARIZE_MODEL`` 非空 → 专属模型；否则复用主通道。
+
+    Returns:
+        langchain ChatModel 实例
+    """
+    if settings.agent_summarize_model:
+        return _build_openai_llm(
+            settings.agent_summarize_model,
+            settings.agent_summarize_api_key,
+            settings.agent_summarize_base_url,
+            temperature=0.2,
+        )
+    return get_llm()
+
+
 @lru_cache(maxsize=None)
 def get_vlm(
     *,

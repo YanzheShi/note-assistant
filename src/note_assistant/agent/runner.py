@@ -13,11 +13,7 @@ import uuid
 from typing import List, Optional
 
 from note_assistant.logger_util import set_request_id, get_request_id
-
-logger = logging.getLogger(__name__)
-
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
-
 from note_assistant.agent import agent as agent_mod
 from note_assistant.agent.cache import SemanticCache
 from note_assistant.agent.context import CondenseSignal, get_context_manager
@@ -27,6 +23,11 @@ from note_assistant.pipeline.image_answer import append_missing_images, postproc
 from note_assistant.security.output_guard import check_prompt_leakage, neutralize_remote_media
 from note_assistant.retrieval.types import RetrievalResult
 from note_assistant.llm.usage import get_token_handler
+
+
+logger = logging.getLogger(__name__)
+
+
 
 OBS_TRUNCATE = 500  # observation 文本截断长度，避免轨迹过大
 

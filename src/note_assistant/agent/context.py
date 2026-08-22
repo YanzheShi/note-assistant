@@ -9,8 +9,20 @@
     - token 计数依赖 tiktoken，加载失败则回退为「长度 / 2」的粗近似。
 
 术语对齐（见设计评审细化）：
-    - **总预算硬上限** ``agent_total_context_token_budget``：历史 + 累积 + 观察三段之和不可超过；
-      若三段之和超总预算，按 ``obs → accumulated → history`` 优先级压缩（history 最后才牺牲）。
+    - **总预算硬上限** ``agent_total_context_token_budget``：三段拼接成喂给 LLM 的上下文，
+      三段 token 数之和不可超过该上限。三段分别是：
+        * **obs（观察 Observation）**：工具节点 ``tools_node`` 调用检索 / RAG / 外部工具后
+          返回的观察文本——即检索命中的文档摘录、知识库片段、工具执行输出等。它是对话「一次性」
+          的外部信息，本轮消费完、下轮不再复用，因此优先级最低、最先被压缩。obs 段由 ``tools_node``
+          按 ``agent_obs_token_budget`` 独立截断，已是第一压缩位（见 ``truncate_observation``）。
+        * **accumulated（跨轮累积）**：累积的检索知识片段（``RetrievalResult`` 列表），通常 =
+          上一轮 seed（已乘 ``agent_accumulated_decay`` 衰减）+ 本轮新检索到的结果（见
+          ``seed_accumulated`` / ``merge_accumulated``）。它是对话「有用但不属于对话本身」的知识，
+          优先级居中：obs 压不动了才来压它。
+        * **history（对话历史）**：经 ``budget_history_messages`` 裁剪后的 user / assistant 轮次
+          消息，是维持对话连贯性与指代消解的根本依据，优先级最高。
+      若三段之和超总预算，按 ``obs → accumulated → history`` 优先级压缩（``fit_total_budget``
+      实现：先裁 accumulated，仍超再裁 history，history 最后才牺牲，保证对话上下文不丢）。
     - **跨轮累积双重保险**：① 每跨一轮每个片段 ``score *= agent_accumulated_decay``；
       ② 按 token 预算硬截断，只保留有效分最高的若干条。
     - **长程摘要触发**：用原文 user/assistant 轮次的 **token 总和** 是否超过
@@ -189,6 +201,32 @@ def _default_llm():
         return None
 
 
+def _get_condense_llm():
+    """延迟获取凝练专属 LLM（AGENT_CONDENSE_* 配置）；失败返回 None。
+
+    注入的 ``condense_llm`` 优先于配置文件；配置未设则回落主通道。
+    """
+    try:
+        from note_assistant.llm.client import get_condense_llm
+
+        return get_condense_llm()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _get_summarize_llm():
+    """延迟获取长程摘要专属 LLM（AGENT_SUMMARIZE_* 配置）；失败返回 None。
+
+    注入的 ``summarize_llm`` 优先于配置文件；配置未设则回落主通道。
+    """
+    try:
+        from note_assistant.llm.client import get_summarize_llm
+
+        return get_summarize_llm()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ──────────────────────────────────────────────
 # TokenCounter：tiktoken 精确计数（编码单例缓存）
 # ──────────────────────────────────────────────
@@ -306,7 +344,7 @@ class ContextManager:
         if not _needs_condense(current, effective_history):
             self._set_condense_signal(session_id, CondenseSignal())
             return current
-        llm = self._condense_llm or _default_llm()
+        llm = self._condense_llm or _get_condense_llm()
         if llm is None:
             # LLM 不可用：走零模型降级，而非裸返回原问题
             self._set_condense_signal(
@@ -664,7 +702,7 @@ class ContextManager:
     async def _summarize_batch(
         self, turns: Sequence[dict], prev_summary: Optional[str]
     ) -> Optional[str]:
-        llm = self._summarize_llm or _default_llm()
+        llm = self._summarize_llm or _get_summarize_llm()
         if llm is None:
             return None
         text = _format_turns_for_prompt(turns)

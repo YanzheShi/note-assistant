@@ -103,6 +103,7 @@ class SemanticCache:
         e = self._exact.get(k)
         if e is not None:
             if now - e.ts > self.ttl:
+                # 懒清除
                 self._exact.pop(k, None)
             else:
                 self._exact.move_to_end(k)
