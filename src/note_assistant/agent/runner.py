@@ -565,7 +565,17 @@ async def astream(
     )
     seq = 0
     traj: List[dict] = []
-    accumulated: List[RetrievalResult] = []
+    # ⚠️ 关键修复：用跨轮累积 seed 初始化，而非空列表。
+    # 问题：当某一轮 agent 节点判定上下文已够、直接 generate（复用前几轮
+    # seed，不再调工具），graph 不会经过 tools / graph_expand / rerank_* 节点，
+    # 这些分支（runner.py:595/639/649/658）才更新局部 accumulated 变量。
+    # 若不初始化为 seed，accumulated 一路保持 [] → 末尾 _sources_from_results([])
+    # 返回空 → sources 事件为空 → 前端不渲染来源，表现为「检索命中了文件却没显示
+    # 检索路径」。ainvoke 路径用 final.get("accumulated", seed) 兜底故无此问题，
+    # 这里与之一致，保证流式与非流式行为对称。
+    # 不会重复：tools / graph_expand / rerank_* 节点回写的是 state 完整 accumulated
+    # （seed + 本轮新结果），会覆盖此处初始值；本初值仅在「完全没走这些节点」时兜底。
+    accumulated: List[RetrievalResult] = list(seed)
     final_answer = ""
     clarified = False
     guarded = False  # L4：输出护栏是否命中（命中则不入缓存，防投毒回放）

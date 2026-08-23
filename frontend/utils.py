@@ -147,3 +147,48 @@ def ask_question_trace(
     app.py 在 trace_mode 下把 thought / tool_call / observation / judge 渲染为步骤面板。
     """
     yield from _sse_events(api_url, question, "agent/ask_stream", history, session_id, timeout)
+
+
+def ask_question_classic_stream(
+    api_url: str,
+    question: str,
+    history: list[dict] | None = None,
+    session_id: str = "",
+    timeout: float = 120.0,
+):
+    """
+    传统 RAG 流式调用 /ask_stream（SSE 逐字符事件流），支持多轮对话历史。
+
+    事件协议（与 Agentic 不同）：
+        meta    — 元信息（retrieve_ms / graph_expansion），前端忽略
+        char    — 答案逐字符片段，累积为完整 answer
+        sources — 检索来源列表（content 字段，非 sources 字段）
+        status  — 非 finished 时告警
+        error   — 错误
+        [DONE]
+
+    注意：传统 RAG 不经过 Router / 反思循环，无 thought / tool_call / judge 轨迹。
+    """
+    yield from _sse_events(api_url, question, "ask_stream", history, session_id, timeout)
+
+
+def ask_question_classic_trace(
+    api_url: str,
+    question: str,
+    history: list[dict] | None = None,
+    session_id: str = "",
+    timeout: float = 120.0,
+):
+    """
+    传统 RAG 追踪式流式调用 /ask_trace（检索过程实时输出），支持多轮对话历史。
+
+    在 /ask_stream 基础上，检索阶段额外逐步骤输出 trace 事件：
+        trace    — 单步检索（step: embedding / dense_retrieval / sparse_retrieval /
+                    hybrid_fusion / rerank / graph_expansion；附 ms / results）
+        char     — 答案逐字符片段
+        sources  — 检索来源列表
+        [DONE]
+
+    trace_mode 开启时，app.py 把 trace 步骤渲染为面板，让用户看到「正在检索什么」。
+    """
+    yield from _sse_events(api_url, question, "ask_trace", history, session_id, timeout)
