@@ -30,6 +30,8 @@ class GenerationMetrics:
         semantic_similarity: 语义相似度（embedding 余弦或 Jaccard）
         faithfulness: 忠诚度（答案是否忠于上下文，可选）
         answer_relevance: 答案相关性（答案是否直接回答问题，可选）
+        accuracy: 准确率（LLM-as-judge 对比金标准答案，0~1，可选）
+        confidence: 评分置信度（Judge 对自身 grading 的把握，0~1，可选）
     """
     rouge_l: float
     bleu_1: float
@@ -37,6 +39,8 @@ class GenerationMetrics:
     semantic_similarity: float
     faithfulness: Optional[float] = field(default=None)
     answer_relevance: Optional[float] = field(default=None)
+    accuracy: Optional[float] = field(default=None)
+    confidence: Optional[float] = field(default=None)
 
     def to_dict(self) -> dict:
         """转为字典，用于 JSON 序列化。"""
@@ -328,6 +332,81 @@ def answer_relevance(candidate: str, question: str, llm=None) -> float:
         return 0.0
 
 
+def compute_answer_accuracy(
+    candidate: str,
+    reference: str,
+    question: str = "",
+    llm=None,
+) -> tuple[float, float]:
+    """
+    准确率 + 评分置信度（LLM-as-judge，一次调用同时产出两个值）。
+
+    - accuracy（0~1）：待评测答案相对「金标准答案」在**事实正确性 + 内容覆盖度**
+      上的一致程度（1.0 = 事实全对且覆盖全部关键信息点；0.0 = 严重不符/答非所问）。
+    - confidence（0~1）：Judge 对自己这条评分的把握（信息充分、判断明确时高；
+      答案含糊、难以判断时低）。即评测框架所需的「置信度」维度。
+
+    合并为一次 LLM 调用，避免 accuracy / confidence 各占一次请求、拖慢评测。
+
+    Args:
+        candidate: 模型生成的答案
+        reference: 金标准答案（用于对比）
+        question: 用户原始问题（仅作参考，不计入评分）
+        llm: 可选的 LLM 实例（需有 invoke(messages)）
+
+    Returns:
+        (accuracy, confidence)，失败时返回 (0.0, 0.0)
+    """
+    if not llm or not candidate or not reference:
+        return 0.0, 0.0
+
+    prompt = (
+        "你是一个严格的评测员。我会给你一个「标准答案」和一个「待评测答案」，"
+        "请评估待评测答案相对于标准答案的「准确率」。\n\n"
+        "定义（accuracy）：衡量待评测答案在**事实正确性与内容覆盖度**上，"
+        "与标准答案的一致程度：\n"
+        "- 1.0：事实完全正确，且覆盖了标准答案的所有关键信息点\n"
+        "- 0.7：大部分关键信息正确，但有少量遗漏或轻微不精确\n"
+        "- 0.4：仅部分正确，有明显事实偏差或重大遗漏\n"
+        "- 0.0：与标准答案严重不符或答非所问\n\n"
+        "同时，请给出你对自己评分的「置信度」（confidence，0~1）："
+        "信息充分、判断明确时为高置信度；答案含糊、难以判断时为低置信度。\n\n"
+        "标准答案：\n{reference}\n\n"
+        "待评测答案：\n{candidate}\n\n"
+        "用户问题（仅供参考，不计入评分）：\n{question}\n\n"
+        "只输出 JSON，不要输出其他内容：\n"
+        "{{\n"
+        '  "accuracy": 0.0~1.0 的浮点数,\n'
+        '  "confidence": 0.0~1.0 的浮点数,\n'
+        '  "reason": "简短理由"\n'
+        "}}"
+    ).format(
+        reference=reference[:2500],
+        candidate=candidate[:2500],
+        question=question[:1000],
+    )
+
+    try:
+        messages = [{"role": "user", "content": prompt}]
+        response = llm.invoke(messages)
+        content = response.content if hasattr(response, "content") else str(response)
+
+        import json as json_mod
+        json_str = content.strip()
+        if "```" in json_str:
+            json_str = json_str.split("```")[1]
+            if json_str.startswith("json"):
+                json_str = json_str[4:]
+            json_str = json_str.strip()
+
+        result = json_mod.loads(json_str)
+        accuracy = max(0.0, min(1.0, float(result.get("accuracy", 0.0))))
+        confidence = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+        return accuracy, confidence
+    except Exception:
+        return 0.0, 0.0
+
+
 # ──────────────────────────────────────────────────────────────
 # 一站式入口
 # ──────────────────────────────────────────────────────────────
@@ -344,22 +423,23 @@ def compute_generation_metrics(
     """
     一站式计算所有生成指标。
 
-    - 始终计算：rouge_l / bleu_1 / bleu_4 / semantic_similarity
-    - 有条件计算（需 llm + context）：faithfulness
-    - 有条件计算（需 llm + question）：answer_relevance
-    - 缺少条件时，对应指标设为 None
+    - 始终计算：    rouge_l / bleu_1 / bleu_4 / semantic_similarity
+- 有条件计算（需 llm + context）：faithfulness
+- 有条件计算（需 llm + question）：answer_relevance
+- 有条件计算（需 llm + reference）：accuracy + confidence（一次 LLM 调用）
+- 缺少条件时，对应指标设为 None
 
-    Args:
-        candidate: 模型生成的答案
-        reference: 金标准答案（用于 ROUGE/BLEU/语义相似度）
-        embedder: 可选的 embedding 函数
-        llm: 可选的 LLM 实例（用于 faithfulness + answer_relevance）
-        context: 检索到的上下文（用于 faithfulness）
-        question: 用户问题（用于 answer_relevance）
+Args:
+    candidate: 模型生成的答案
+    reference: 金标准答案（用于 ROUGE/BLEU/语义相似度/accuracy）
+    embedder: 可选的 embedding 函数
+    llm: 可选的 LLM 实例（用于 faithfulness + answer_relevance + accuracy/confidence）
+    context: 检索到的上下文（用于 faithfulness）
+    question: 用户问题（用于 answer_relevance）
 
-    Returns:
-        GenerationMetrics
-    """
+Returns:
+    GenerationMetrics
+"""
     rouge_l_score = rouge_l(candidate, reference)
     bleu_1_score = bleu_1(candidate, reference)
     bleu_4_score = bleu_4(candidate, reference)
@@ -373,6 +453,11 @@ def compute_generation_metrics(
     if llm and question:
         rel = answer_relevance(candidate, question, llm)
 
+    acc = None
+    conf = None
+    if llm and reference:
+        acc, conf = compute_answer_accuracy(candidate, reference, question, llm)
+
     return GenerationMetrics(
         rouge_l=rouge_l_score,
         bleu_1=bleu_1_score,
@@ -380,4 +465,6 @@ def compute_generation_metrics(
         semantic_similarity=sim_score,
         faithfulness=faith,
         answer_relevance=rel,
+        accuracy=acc,
+        confidence=conf,
     )

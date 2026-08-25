@@ -76,6 +76,9 @@ class SingleEvalResult:
     elapsed_ms: float = 0.0
     turn_index: int = -1  # 多轮剧本中的轮次序号（单轮为 -1）
     token_usage: Dict[str, int] = field(default_factory=dict)  # 该轮 token（含 cache 维度）
+    # ── v3 新增（agent 链路过程量，naive 链路为 0 / []）──
+    iterations: int = 0                 # agentic 循环轮数（Judge 决策次数）
+    judge_verdicts: List[str] = field(default_factory=list)  # 每轮 Judge 的 verdict 序列
 
 
 @dataclass
@@ -92,6 +95,9 @@ class EvalReport:
     llm_cache_hit_rate: float = 0.0  # token 级缓存命中率 = cache_read / prompt
     semantic_cache_stats: Optional[Dict[str, Any]] = None  # 问答级语义缓存命中（仅 agent）
     per_conversation: List[Dict[str, Any]] = field(default_factory=list)  # 多轮剧本明细
+    # ── v3 新增（agent 链路过程量，naive 链路为 None）──
+    iterations_avg: Optional[float] = None  # 平均 agentic 循环轮数
+    judge_verdict_distribution: Optional[Dict[str, int]] = None  # verdict 频次分布
 
     def to_dict(self) -> dict:
         """转为字典，用于 JSON 序列化。"""
@@ -157,18 +163,19 @@ class Evaluator:
         finally:
             new_loop.close()
 
-    def _ask_one(self, question: str, history: list, session_id: str) -> Tuple[str, List[str], str]:
-        """调一次问答，返回 (answer, retrieved_files, context_text)。
+    def _ask_one(self, question: str, history: list, session_id: str) -> Tuple[str, List[str], str, int, List[str]]:
+        """调一次问答，返回 (answer, retrieved_files, context_text, iterations, judge_verdicts)。
 
-        - naive：``ask_target.ask(question, history=history)``
+        - naive：``ask_target.ask(question, history=history)``，无 agent 过程量（iterations=0）
         - agent：``runner.ainvoke(question, history=history, session_id=session_id,
-          return_contexts=True)``（用完整 chunk 正文作为 context，利于 faithfulness）
+          return_contexts=True)``（用完整 chunk 正文作为 context，利于 faithfulness）；
+          从轨迹里解析出 agentic 循环轮数与每轮 Judge 判定。
         """
         if self.target_kind == "naive":
             ans: AskResponse = self.ask_target.ask(question, history=history)
             retrieved_files = [s.filepath for s in ans.sources]
             context = " ".join(getattr(s, "preview", "") or "" for s in ans.sources)
-            return ans.answer, retrieved_files, context
+            return ans.answer, retrieved_files, context, 0, []
         else:
             from note_assistant.agent.runner import ainvoke
 
@@ -177,7 +184,21 @@ class Evaluator:
             )
             retrieved_files = [s.get("filepath") for s in result.sources]
             context = " ".join(result.contexts)
-            return result.answer, retrieved_files, context
+            iterations, verdicts = self._parse_trajectory(result.trajectory)
+            return result.answer, retrieved_files, context, iterations, verdicts
+
+    @staticmethod
+    def _parse_trajectory(trajectory: Optional[List[dict]]) -> Tuple[int, List[str]]:
+        """从 agent 轨迹里提取 agentic 循环轮数与 Judge 判定序列。
+
+        trajectory 中 ``type=="judge"`` 的条目对应每一次 reflect（Judge）决策，
+        其数量即检索循环轮数（每轮 tools → reflect 一次）；verdict 字段为
+        sufficient / need_rewrite / need_more / give_up / need_clarify。
+        """
+        judges = [e for e in (trajectory or []) if isinstance(e, dict) and e.get("type") == "judge"]
+        iterations = len(judges)
+        verdicts = [e.get("verdict") for e in judges if e.get("verdict")]
+        return iterations, verdicts
 
     @staticmethod
     def _meter_snapshot(meter: TokenMeter) -> Dict[str, int]:
@@ -257,6 +278,18 @@ class Evaluator:
                 sum(r.elapsed_ms for r in eval_results) / len(eval_results)
                 if eval_results else 0.0
             )
+            # v3：agentic 过程量（迭代轮数 / Judge 判定分布）
+            iter_vals = [r.iterations for r in eval_results]
+            iterations_avg = (
+                sum(iter_vals) / len(iter_vals) if iter_vals else None
+            )
+            verdict_counter: Dict[str, int] = defaultdict(int)
+            for r in eval_results:
+                for v in r.judge_verdicts:
+                    verdict_counter[v] += 1
+            judge_verdict_distribution = (
+                dict(verdict_counter) if verdict_counter else None
+            )
             return EvalReport(
                 dataset_name=dataset.name,
                 total_questions=len(dataset.questions),
@@ -268,6 +301,8 @@ class Evaluator:
                 llm_cache_hit_rate=meter.cache_hit_rate(),
                 semantic_cache_stats=get_cache_stats() if is_agent else None,
                 per_conversation=per_conversation,
+                iterations_avg=iterations_avg,
+                judge_verdict_distribution=judge_verdict_distribution,
             )
         finally:
             # 恢复 handler 现场（默认 None，零副作用，不影响线上）
@@ -285,10 +320,10 @@ class Evaluator:
         start = time.time()
         snap0 = self._meter_snapshot(meter)
         try:
-            answer, retrieved_files, context = self._ask_one(question.question, [], "")
+            answer, retrieved_files, context, iterations, verdicts = self._ask_one(question.question, [], "")
         except Exception as e:
             logger.error(f"评测失败: {e}")
-            answer, retrieved_files, context = "", [], ""
+            answer, retrieved_files, context, iterations, verdicts = "", [], "", 0, []
         snap1 = self._meter_snapshot(meter)
         elapsed = (time.time() - start) * 1000
         turn_tokens = {k: snap1[k] - snap0[k] for k in snap1}
@@ -314,18 +349,20 @@ class Evaluator:
             )
             generation_metrics_dict = generation_metrics.to_dict()
 
-        eval_results.append(
-            SingleEvalResult(
-                question=question.question,
-                retrieved_files=retrieved_files,
-                generated_answer=answer,
-                retrieval_metrics=_flatten_retrieval_metrics(retrieval_metrics),
-                generation_metrics=generation_metrics_dict,
-                elapsed_ms=elapsed,
-                turn_index=-1,
-                token_usage=turn_tokens,
+            eval_results.append(
+                SingleEvalResult(
+                    question=question.question,
+                    retrieved_files=retrieved_files,
+                    generated_answer=answer,
+                    retrieval_metrics=_flatten_retrieval_metrics(retrieval_metrics),
+                    generation_metrics=generation_metrics_dict,
+                    elapsed_ms=elapsed,
+                    turn_index=-1,
+                    token_usage=turn_tokens,
+                    iterations=iterations,
+                    judge_verdicts=verdicts,
+                )
             )
-        )
 
     def _run_multiturn(
         self,
@@ -344,10 +381,10 @@ class Evaluator:
             start = time.time()
             snap0 = self._meter_snapshot(meter)
             try:
-                answer, retrieved_files, context = self._ask_one(turn.question, history, session_id)
+                answer, retrieved_files, context, iterations, verdicts = self._ask_one(turn.question, history, session_id)
             except Exception as e:
                 logger.error(f"多轮评测失败 (conv {qi} turn {ti}): {e}")
-                answer, retrieved_files, context = "", [], ""
+                answer, retrieved_files, context, iterations, verdicts = "", [], "", 0, []
             snap1 = self._meter_snapshot(meter)
             elapsed = (time.time() - start) * 1000
             turn_tokens = {k: snap1[k] - snap0[k] for k in snap1}
@@ -375,6 +412,8 @@ class Evaluator:
                     elapsed_ms=elapsed,
                     turn_index=ti,
                     token_usage=turn_tokens,
+                    iterations=iterations,
+                    judge_verdicts=verdicts,
                 )
             )
             # 累积多轮上下文

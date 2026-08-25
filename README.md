@@ -41,7 +41,7 @@
 | **图片多模态理解 / 图片问答**               | 索引期对笔记插图做 VLM 结构化理解（描述/OCR/实体/类型），与文本同池检索；命中图时带出同章节文本邻居防误导，答案直接渲染原图                                                |
 | **Agentic RAG** | Router → 多轮检索 → Reflection Judge →（改写/换策略/澄清）→ 带引用生成；闲聊直接对话不检索                                     |
 | **澄清 / 反问**                      | Judge 判 `need_clarify` 且多道守卫通过时，返回带具体选项的澄清问句（而非空泛反问），跨轮靠历史自然消解                                                     |
-| **来源溯源与原文跳转**                    | 答案标注文件路径 / 标题路径 / 命中片段，并可一键跳回 Obsidian 原始笔记对应位置（见 §功能演示）                                                           |
+| **来源溯源与原文跳转**                    | 答案标注文件路径 / 标题路径 / 命中片段，并支持来源文档一键跳转（见 §功能演示）                                                           |
 | **语义缓存**                         | 精确命中 + 近邻命中（embedding 余弦）两级缓存，带 TTL/FIFO 淘汰，可省一半以上 LLM 调用                                                          |
 | **量化评测**                         | 检索指标（MRR/Recall/NDCG/Precision@K）+ 生成指标（手写 + Ragas）+ 轨迹级评测（路由/轮次/工具/Judge）                                         |
 | **可视化与对外服务**                     | Streamlit 前端「追踪模式」实时展示 Agent 思考/工具/观察/反思全过程；FastAPI 后端（`/ask`、`/agent/*`）对外提供问答服务                                  |
@@ -84,7 +84,7 @@
 | 2 | Naive RAG 答案 | Naive RAG 生产路径 | [naive RAG 答案.png](demo/naive%20RAG%20答案.png) | 标准 RAG 链路答案 + 来源 |
 | 3 | 传统 RAG 对照 | 对照基线 | [传统RAG.png](demo/传统RAG.png) | 单层检索基线，用于对比增益 |
 | 4 | 来源链路展示 | 来源溯源 | [来源链路展示.png](demo/来源链路展示.png) | 展示文件路径、标题路径、命中片段与来源链路，可验证答案出处 |
-| 5 | 直接跳转到原始文档 | 来源 → 原文跳转 | [直接跳转到原始文档.png](demo/直接跳转到原始文档.png) | 从答案引用的文档片段一键跳回 Obsidian 原始笔记对应位置 |
+| 5 | 直接跳转到原始文档 | 来源 → 原文跳转 | [直接跳转到原始文档.png](demo/直接跳转到原始文档.png) | 从答案引用的文档片段支持来源文档一键跳转 |
 | 6 | 指代消解 | 问题凝练 / 消指代 | [指代消解.png](demo/指代消解.png) | 将「它 / 那 / 这个」类追问结合历史合成为独立完整问题，避免指代导致检索错误 |
 
 ## 二、系统架构
@@ -307,7 +307,7 @@ flowchart TD
 - **索引期理解**（`indexing/understanding.py`）：`make_image_enricher` 注入 `RichPreprocessor`，对每张图分级路由——
   - SVG/Mermaid 原生解析（`SVGParser`/`MermaidParser`，**零 VLM 调用**）；
   - 装饰图（尺寸/比例/文件名命中）→ 只留 alt，不调 VLM；
-  - 其余送本地 VLM 做结构化理解（描述 / OCR 文字 / 实体 / 类型 / 置信度），结果写进 chunk metadata（`asset_id` + `image_description`/`image_ocr_text`）。
+  - 其余送云端 VLM（OpenAI 兼容网关，如商汤 SenseNova via agnes）做结构化理解（描述 / OCR 文字 / 实体 / 类型 / 置信度），结果写进 chunk metadata（`asset_id` + `image_description`/`image_ocr_text`）。
   - **G6 总开关**：`image_understand_enabled` 默认 `False`（关闭时 `enricher` 直接短路为 no-op，不下载远程图、不调 VLM、不解析 SVG，与未启用前逐字节等价）；本部署在 `.env.local` 钉 `True` 以启用图片理解。
 - **检索期加权**：query 命中图意图正则（`图|架构图|流程图|diagram|chart|…`）时，image chunk 融合分 `× (1 + image_intent_boost)`（默认 0.15），正则判定、零延迟。
 - **图文邻居扩展（双链路对称）**：命中 image chunk 时，自动把同 `heading_path` 的文本 chunk 补进生成上下文（防"图中三层架构"脱离正文被编造）。该逻辑抽成共享纯函数 `expand_image_neighbors`（`pipeline/image_answer.py`），**`/ask`（rag_chain）与 `/agent`（generate_node）两条链路共用**，保证对称；邻居**只进生成上下文、不回写累积结果**，不污染 sources / Judge 证据。图片 chunk 判定用 `_is_image_chunk`（先认 `kind=="image"`，兜底 `asset_id` + `image_description`/`image_ocr_text`，更鲁棒）。
