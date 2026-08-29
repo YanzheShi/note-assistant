@@ -331,9 +331,11 @@ async def ainvoke(
         effective_history = history or []
 
     # 上下文装配：凝练问题 + 预算历史 + 跨轮累积 + 缓存指纹 + 澄清旁路信号
+    _tc0 = time.perf_counter()
     condensed, history_messages, seed, ctx_key, signal, just_clarified = await _prepare_agent_context(
         question, session_id, store, effective_history
     )
+    condense_ms = (time.perf_counter() - _tc0) * 1000
 
     cache = _get_cache()
     if cache.enabled:
@@ -361,7 +363,7 @@ async def ainvoke(
                 trajectory=hit.trajectory,
                 cached=True,
                 run_id=rid,
-                timing={"total_ms": round(elapsed)},
+                timing={"total_ms": round(elapsed), "stages": agent_mod.get_node_timings(rid), "condense_ms": round(condense_ms)},
             )
 
     graph = agent_mod.build_graph()
@@ -394,13 +396,14 @@ async def ainvoke(
     ans, media_hits = neutralize_remote_media(ans)
     leaked = check_prompt_leakage(ans)
     guarded = bool(media_hits) or bool(leaked)
+    stages = agent_mod.get_node_timings(rid)
     result = AgentRunResult(
         answer=ans,
         sources=sources,
         trajectory=traj,
         contexts=contexts,
         run_id=rid,
-        timing={"total_ms": round(elapsed)},
+        timing={"total_ms": round(elapsed), "stages": stages, "condense_ms": round(condense_ms)},
     )
     logger.info(
         "ainvoke.done",

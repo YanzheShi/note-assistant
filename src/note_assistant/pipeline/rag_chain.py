@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import AsyncIterator, List
 
 from langchain_core.messages import HumanMessage
@@ -136,6 +136,7 @@ class AskResponse:
     sources: List[SourceInfo]
     graph_expansion: int = 0
     retrieved: int = 0
+    timing: dict = field(default_factory=dict)  # 分环节耗时(ms)：检索/重排/生成
 
     def to_dict(self) -> dict:
         """转为字典，用于 JSON 序列化。"""
@@ -269,11 +270,15 @@ class RAGChain:
             return AskResponse(answer="你好，我是知识库问答助手，可以帮你检索个人知识库内容，回答相关的问题", sources=[], graph_expansion=0, retrieved=0)
 
         # ── 需要检索：正常流程 ──
+        _t0 = time.perf_counter()
         hybrid_result = self.retriever.search(question, top_k=top_k)
+        _t_retrieve = (time.perf_counter() - _t0) * 1000
         # 图片保位：全量精排 → 截断 → 图意图 query 的 top-k 无图时补入最高分图片
         # （融合阶段的图意图 boost 会被交叉编码器 rerank 清零，需要这道确定性护栏）
         k = top_k if top_k is not None else settings.top_k_rerank
+        _t0 = time.perf_counter()
         full_ranked = self.reranker.rerank(question, hybrid_result, top_k=max(1, len(hybrid_result)))
+        _t_rerank = (time.perf_counter() - _t0) * 1000
         rerank_result = ensure_image_selected(question, full_ranked, full_ranked[:k])
 
         hit_files_paths = [doc.metadata.get("filepath", "") for doc in rerank_result if doc.metadata.get("filepath")]
@@ -289,8 +294,11 @@ class RAGChain:
         merge_chunks = rerank_result + graph_expand_chunks + image_neighbor_chunks
 
         answer = ""
+        _t_generate = 0.0
         if self.generator:
+            _t0 = time.perf_counter()
             answer = self.generator.generate(question, merge_chunks, history=history)
+            _t_generate = (time.perf_counter() - _t0) * 1000
             # P2：把答案里的 [[IMG:asset_id]] 替换为真实图片 markdown；
             # LLM 未引用的 context 图片确定性补在末尾（有图且相关就尽量显示）
             answer = finalize_answer_images(answer, merge_chunks)
@@ -305,6 +313,11 @@ class RAGChain:
             sources=sources,
             graph_expansion=len(graph_expand_chunks),
             retrieved=len(hybrid_result),
+            timing={
+                "检索": round(_t_retrieve, 1),
+                "重排": round(_t_rerank, 1),
+                "生成": round(_t_generate, 1),
+            },
         )
 
     # ------------------------------------------------------------------

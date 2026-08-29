@@ -25,7 +25,9 @@ from functools import lru_cache
 from typing import Annotated, List, TypedDict
 
 import logging
+import time
 
+from note_assistant.logger_util import get_request_id
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -895,20 +897,45 @@ def _reflect_branch(state: AgentState) -> str:
 # 编译
 # ──────────────────────────────────────────────
 
+# ──────────────────────────────────────────────
+# 分环节耗时采集（评测用，行为零改变）
+# 用 request_id 作 key 暂存各图节点 wall-time；runner.ainvoke 结束后取走并清除。
+# ──────────────────────────────────────────────
+_NODE_TIMINGS: "dict[str, dict]" = {}
+
+
+def _timed_node(name: str, fn):
+    """包装图节点：把节点 wall-time 累加到 _NODE_TIMINGS[request_id][name]。"""
+    async def _wrapper(state):
+        t0 = time.perf_counter()
+        result = await fn(state)
+        rid = get_request_id() or "default"
+        bucket = _NODE_TIMINGS.setdefault(rid, {})
+        bucket[name] = bucket.get(name, 0.0) + (time.perf_counter() - t0) * 1000.0
+        return result
+    _wrapper.__name__ = f"timed_{name}"
+    return _wrapper
+
+
+def get_node_timings(rid: str) -> dict:
+    """runner.ainvoke 结束后取走本请求的节点耗时并清除。"""
+    return _NODE_TIMINGS.pop(rid, {})
+
+
 @lru_cache(maxsize=None)
 def build_graph():
     g = StateGraph(AgentState)
-    g.add_node("router", router)
-    g.add_node("agent", agent_node)
-    g.add_node("tools", tools_node)
-    g.add_node("graph_expand_node", graph_expand_node)
-    g.add_node("rerank_loop", rerank_loop)
-    g.add_node("reflect", reflect)
-    g.add_node("rerank_exit", rerank_exit)
-    g.add_node("rewrite", rewrite_node)
-    g.add_node("generate", generate_node)
-    g.add_node("direct_chat", direct_chat)
-    g.add_node("clarify", clarify_node)
+    g.add_node("router", _timed_node("router", router))
+    g.add_node("agent", _timed_node("agent", agent_node))
+    g.add_node("tools", _timed_node("tools", tools_node))
+    g.add_node("graph_expand_node", _timed_node("graph_expand_node", graph_expand_node))
+    g.add_node("rerank_loop", _timed_node("rerank_loop", rerank_loop))
+    g.add_node("reflect", _timed_node("reflect", reflect))
+    g.add_node("rerank_exit", _timed_node("rerank_exit", rerank_exit))
+    g.add_node("rewrite", _timed_node("rewrite", rewrite_node))
+    g.add_node("generate", _timed_node("generate", generate_node))
+    g.add_node("direct_chat", _timed_node("direct_chat", direct_chat))
+    g.add_node("clarify", _timed_node("clarify", clarify_node))
 
     g.add_edge(START, "router")
     g.add_conditional_edges(

@@ -79,6 +79,8 @@ class SingleEvalResult:
     # ── v3 新增（agent 链路过程量，naive 链路为 0 / []）──
     iterations: int = 0                 # agentic 循环轮数（Judge 决策次数）
     judge_verdicts: List[str] = field(default_factory=list)  # 每轮 Judge 的 verdict 序列
+    # ── v4 新增：分环节耗时(ms)，agent 与 naive 统一口径便于对齐（见 _agent_canonical_stages）──
+    stage_timings: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -175,7 +177,8 @@ class Evaluator:
             ans: AskResponse = self.ask_target.ask(question, history=history)
             retrieved_files = [s.filepath for s in ans.sources]
             context = " ".join(getattr(s, "preview", "") or "" for s in ans.sources)
-            return ans.answer, retrieved_files, context, 0, []
+            stages = dict(getattr(ans, "timing", {}) or {})
+            return ans.answer, retrieved_files, context, 0, [], stages
         else:
             from note_assistant.agent.runner import ainvoke
 
@@ -185,7 +188,8 @@ class Evaluator:
             retrieved_files = [s.get("filepath") for s in result.sources]
             context = " ".join(result.contexts)
             iterations, verdicts = self._parse_trajectory(result.trajectory)
-            return result.answer, retrieved_files, context, iterations, verdicts
+            stages = self._agent_canonical_stages(getattr(result, "timing", None))
+            return result.answer, retrieved_files, context, iterations, verdicts, stages
 
     @staticmethod
     def _parse_trajectory(trajectory: Optional[List[dict]]) -> Tuple[int, List[str]]:
@@ -210,6 +214,33 @@ class Evaluator:
             "cache_read_tokens": meter.cache_read_tokens,
             "total_tokens": meter.total_tokens,
             "llm_calls": meter.llm_calls,
+        }
+
+    @staticmethod
+    def _agent_canonical_stages(timing) -> Dict[str, float]:
+        """把 agent 图节点耗时归并成统一环节口径，便于与 naive 链路对齐比较。
+
+        节点 → 环节映射：
+            router / agent / rewrite + 凝练(condense_ms) → 规划决策
+            tools                                     → 检索
+            graph_expand_node                         → 图扩展
+            rerank_loop + rerank_exit                 → 重排
+            reflect                                   → 判定
+            generate / direct_chat / clarify          → 生成
+        naive 链路只产出 检索/重排/生成，其余环节缺省为 0。
+        """
+        timing = timing or {}
+        stages = timing.get("stages", {}) or {}
+        condense = timing.get("condense_ms", 0) or 0
+        return {
+            "规划决策": round(stages.get("router", 0) + stages.get("agent", 0)
+                              + stages.get("rewrite", 0) + condense, 1),
+            "检索": round(stages.get("tools", 0), 1),
+            "图扩展": round(stages.get("graph_expand_node", 0), 1),
+            "重排": round(stages.get("rerank_loop", 0) + stages.get("rerank_exit", 0), 1),
+            "判定": round(stages.get("reflect", 0), 1),
+            "生成": round(stages.get("generate", 0) + stages.get("direct_chat", 0)
+                          + stages.get("clarify", 0), 1),
         }
 
     # ──────────────────────────────────────────────
@@ -320,10 +351,11 @@ class Evaluator:
         start = time.time()
         snap0 = self._meter_snapshot(meter)
         try:
-            answer, retrieved_files, context, iterations, verdicts = self._ask_one(question.question, [], "")
+            answer, retrieved_files, context, iterations, verdicts, stages = self._ask_one(question.question, [], "")
         except Exception as e:
             logger.error(f"评测失败: {e}")
             answer, retrieved_files, context, iterations, verdicts = "", [], "", 0, []
+            stages = {}
         snap1 = self._meter_snapshot(meter)
         elapsed = (time.time() - start) * 1000
         turn_tokens = {k: snap1[k] - snap0[k] for k in snap1}
@@ -361,6 +393,7 @@ class Evaluator:
                     token_usage=turn_tokens,
                     iterations=iterations,
                     judge_verdicts=verdicts,
+                    stage_timings=stages,
                 )
             )
 
@@ -381,10 +414,11 @@ class Evaluator:
             start = time.time()
             snap0 = self._meter_snapshot(meter)
             try:
-                answer, retrieved_files, context, iterations, verdicts = self._ask_one(turn.question, history, session_id)
+                answer, retrieved_files, context, iterations, verdicts, stages = self._ask_one(turn.question, history, session_id)
             except Exception as e:
                 logger.error(f"多轮评测失败 (conv {qi} turn {ti}): {e}")
                 answer, retrieved_files, context, iterations, verdicts = "", [], "", 0, []
+                stages = {}
             snap1 = self._meter_snapshot(meter)
             elapsed = (time.time() - start) * 1000
             turn_tokens = {k: snap1[k] - snap0[k] for k in snap1}
@@ -414,6 +448,7 @@ class Evaluator:
                     token_usage=turn_tokens,
                     iterations=iterations,
                     judge_verdicts=verdicts,
+                    stage_timings=stages,
                 )
             )
             # 累积多轮上下文
