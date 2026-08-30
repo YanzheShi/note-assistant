@@ -203,6 +203,13 @@ flowchart LR
 
 前端占位（代码/表格/mermaid/图片）经 `RichPreprocessor` 占位 → 切分 → `restore()` 还原，并为每段富结构生成"摘要块"以保证可检索。
 
+**索引忽略规则**（`indexing/ignore.py`，四处入口共用：全量索引 / 增量索引 / 附件索引 / `autoindex` watcher）：
+
+- 隐藏目录（`.obsidian`、`.git`、`.trash`、`.workbuddy`）始终忽略，无需配置。
+- `INDEX_IGNORE_DIRS=["templates", "附件"]` 追加忽略与笔记无关的非隐藏目录（模板、纯附件、vault 里 clone 的代码仓库）；按路径段匹配、任意层级生效、大小写不敏感。
+- `autoindex` 把该规则下沉为 `watchfiles` 事件过滤器（`watch_filter`），Obsidian 高频写自身配置时不再产生 Python 侧空转；并开启 `ignore_permission_denied`，避免 vault 内无权限目录打崩 watcher。
+- 改配置后需重启并跑一次全量 `/reindex`：靠"已索引但不在扫描结果 → 删除"的比对清掉旧 chunks。
+
 ### 4.2 混合检索 + 结构优先
 
 `HybridRetriever` 两路并行：

@@ -4,8 +4,8 @@
 
 架构（docs/自动增量索引（auto-reindex）设计方案.md）：
 
-    vault/*.md 变更 ──► watchfiles.awatch()
-        │ 过滤 .md + 排除隐藏目录（与 VaultLoader.scan 同规则）
+    vault/*.md 变更 ──► watchfiles.awatch(watch_filter=忽略规则)
+        │ 过滤 .md + 排除隐藏目录与 INDEX_IGNORE_DIRS（规则见 indexing/ignore.py）
         │ debounce 收集窗口（默认 3s，合并 Obsidian 保存的多事件）
         ▼
     change_queue (asyncio.Queue) ──► worker 单飞（asyncio.Lock）
@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from note_assistant.config import settings
+from note_assistant.indexing.ignore import is_ignored
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +44,17 @@ _FULL: str = "full"
 
 
 def is_indexable_md(rel: str) -> bool:
-    """watcher 过滤：只看 .md 且排除隐藏目录（与 VaultLoader.scan 同规则）。
+    """watcher 过滤：只看 .md，且套用统一忽略规则（与 VaultLoader.scan 同源）。
 
     Args:
-        rel: 相对 vault 根的路径（正斜杠分隔）
+        rel: 相对 vault 根的路径（正斜杠或反斜杠分隔）
 
     Returns:
         True 表示该路径值得进入索引队列
     """
     if not rel.lower().endswith(".md"):
         return False
-    return not any(part.startswith(".") for part in Path(rel).parts)
+    return not is_ignored(rel)
 
 
 class AutoIndexService:
@@ -165,16 +166,25 @@ class AutoIndexService:
     # watcher：事件吸收 + debounce + 入队
     # ──────────────────────────────────────────────
 
+    def _rel_if_indexable(self, path) -> Optional[str]:
+        """绝对路径 → 值得索引的 vault 相对路径；vault 外或被忽略则 None。"""
+        try:
+            rel = Path(str(path)).resolve().relative_to(self.vault_path.resolve())
+        except ValueError:
+            return None
+        rel_str = rel.as_posix()
+        return rel_str if is_indexable_md(rel_str) else None
+
+    def _watch_filter(self, _event_type, path: str) -> bool:
+        """交给 watchfiles 的事件级过滤：忽略路径不进 Python，省掉无谓的 absorb 空转。"""
+        return self._rel_if_indexable(path) is not None
+
     def _absorb(self, changes) -> bool:
         """吸收一批 watchfiles 事件到 pending；返回是否有值得入队的 .md 变更。"""
         dirty = False
         for change, path in changes:
-            try:
-                rel = Path(str(path)).resolve().relative_to(self.vault_path.resolve())
-                rel_str = rel.as_posix()
-            except ValueError:
-                continue
-            if not is_indexable_md(rel_str):
+            rel_str = self._rel_if_indexable(path)
+            if rel_str is None:
                 continue
             from watchfiles import Change
 
@@ -186,7 +196,13 @@ class AutoIndexService:
         """watchfiles 事件循环：事件 → pending，重置 debounce 窗口。"""
         from watchfiles import awatch
 
-        async for changes in awatch(self.vault_path):
+        # ignore_permission_denied：vault 内偶发的无权限目录（同步占位/临时锁目录）
+        # 只跳过，不让它把整个 watcher 打崩（watcher 一崩，自动索引就静默失效）
+        async for changes in awatch(
+            self.vault_path,
+            watch_filter=self._watch_filter,
+            ignore_permission_denied=True,
+        ):
             if self._absorb(changes) and self._debounce_task is None:
                 self._debounce_task = asyncio.create_task(self._debounce_flush())
 

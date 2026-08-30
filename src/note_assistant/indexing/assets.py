@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
+from note_assistant.indexing.ignore import is_ignored
+
 
 # 当作图片处理的扩展名（SVG 同时是结构化图，路由交给理解层）
 IMAGE_EXTS = {
@@ -138,7 +140,8 @@ def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
 class AttachmentIndex:
     """Obsidian 短名 `![[Pasted image.png]]` 解析（复刻最短唯一路径规则）。
 
-    按图片扩展名 rglob 全 vault（排除隐藏目录），建 `filename → [paths]` 索引。
+    按图片扩展名 rglob 全 vault（排除隐藏目录与 indexing.ignore 配置的忽略目录），
+    建 `filename → [paths]` 索引。
     """
 
     def __init__(self, vault_path: Path):
@@ -151,8 +154,7 @@ class AttachmentIndex:
             return
         for ext in IMAGE_EXTS | CHART_EXTS:
             for p in self.vault_path.rglob(f"*{ext}"):
-                # 排除隐藏目录（.obsidian / .trash 等）
-                if any(part.startswith(".") for part in p.relative_to(self.vault_path).parts):
+                if is_ignored(p.relative_to(self.vault_path)):
                     continue
                 self._by_name.setdefault(p.name, []).append(p)
 

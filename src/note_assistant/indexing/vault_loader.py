@@ -4,6 +4,7 @@ import yaml
 from typing import List, Dict, Any
 
 from note_assistant.indexing.types import DocNode  # 导入DocNode
+from note_assistant.indexing.ignore import is_ignored
 from note_assistant.config import settings
 
 
@@ -12,11 +13,10 @@ class VaultLoader:
         self.vault_path = Path(vault_path) if vault_path else settings.vault_path.resolve()
 
     def scan(self) -> List[Path]:
-        """扫所有.md，排除隐藏目录"""
+        """扫所有.md，按 indexing.ignore 规则排除隐藏目录与配置的忽略目录"""
         md_paths = []
         for p in self.vault_path.rglob("*.md"):
-            # 排除.obsidian/.trash等隐藏目录
-            if not any(part.startswith('.') for part in p.relative_to(self.vault_path).parts):
+            if not is_ignored(p.relative_to(self.vault_path)):
                 md_paths.append(p)
         return md_paths
 

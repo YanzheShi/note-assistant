@@ -15,6 +15,11 @@ class Settings(BaseSettings):
 
     # === Obsidian Vault ===
     vault_path: Path = Path("./vault")
+    # 索引忽略的目录名（大小写不敏感，vault 内任意层级命中即跳过）。
+    # 隐藏目录（.obsidian / .git / .trash 等）无需配置，始终忽略。
+    # 生效范围：全量索引、增量索引、附件索引、autoindex watcher，
+    # 判定集中在 indexing/ignore.py。示例：INDEX_IGNORE_DIRS=["templates", "附件"]
+    index_ignore_dirs: list[str] = []
 
     # === Embedding (bge-m3 via Ollama) ===
     ollama_base_url: str = "http://localhost:11434"
