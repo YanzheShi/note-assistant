@@ -13,11 +13,14 @@ from note_assistant.pipeline.image_answer import (
     MAX_AUTO_IMAGES,
     ImageMarkerStreamer,
     append_missing_images,
+    append_missing_mermaid,
     ensure_image_selected,
     finalize_answer_images,
     has_image_intent,
+    has_mermaid_chunks,
     has_teachable_image_assets,
     missing_images_block,
+    missing_mermaid_block,
     render_image_block,
     collect_image_assets,
     postprocess_answer,
@@ -301,10 +304,17 @@ class TestImageMarkerStreamer:
         out = self._run(["a", "[[IMG:", "ffffffffffffffff", "]]", "b"], chunks=[])
         assert out == "ab"
 
-    def test_no_assets_nonhex_marker_unchanged(self):
-        # 非十六进制的 [[IMG:...]] 形状文本不认作标记，原样保留（与 postprocess 同口径）
+    def test_no_assets_nonhex_marker_stripped(self):
+        # 2026-09-01 修订：LLM 会照抄教学文本的字面 [[IMG:asset_id]] 占位符（非 hex），
+        # 旧「非 hex 不认作标记」策略让这种噪音暴露给用户。放宽正则后：
+        # 任意 [[IMG:...]] 形状均按标记处理，无对应资产一律删除。
         out = self._run(["a", "[[IMG:", "x", "]]", "b"], chunks=[])
-        assert out == "a[[IMG:x]]b"
+        assert out == "ab"
+
+    def test_literal_placeholder_marker_stripped(self):
+        # 实测回归（2026-09-01）：LLM 原样抄了教学文本里的 [[IMG:asset_id]] 字面量
+        out = self._run(["流程：**主通道** ", "[[IMG:", "asset_id", "]]"], chunks=[])
+        assert out == "流程：**主通道** "
 
     def test_partial_open_prefix_not_swallowed(self):
         # 以 "[[" 结尾但后面不是 IMG:，不能把这两个字符吞掉
@@ -324,3 +334,91 @@ class TestImageMarkerStreamer:
         tokens = ["对比 [[IMG:", self.AID, "]] 和 [[IMG:", aid2, "]] 两张"]
         out = self._run(tokens, chunks=chunks)
         assert out == f"对比 ![架构图](/assets/{self.AID}) 和 ![流程图](/assets/{aid2}) 两张"
+
+
+# ── mermaid 保位与确定性补齐（2026-09-01：来源面板有图、答案正文没图的护栏）──
+_MERMAID_SRC = "```mermaid\nflowchart TD\n    A[开始] --> B[结束]\n```"
+
+
+class TestMermaidHelpers:
+    def _mm(self, score=1.0, title="流程笔记"):
+        return _chunk({"kind": "mermaid", "title": title}, content=_MERMAID_SRC, score=score)
+
+    def test_has_mermaid_chunks_true_by_kind(self):
+        assert has_mermaid_chunks([self._mm()])
+
+    def test_has_mermaid_chunks_true_by_fence(self):
+        # 无 kind 标记但正文含 ```mermaid 围栏（回退口径）
+        assert has_mermaid_chunks([_chunk({}, content="说明文字\n" + _MERMAID_SRC)])
+
+    def test_has_mermaid_chunks_false(self):
+        assert not has_mermaid_chunks([_chunk({"kind": "text"}, content="纯文本")])
+        assert not has_mermaid_chunks([])
+        assert not has_mermaid_chunks(None)
+
+
+class TestEnsureMermaidSelected:
+    def _mm(self, score=0.5):
+        return _chunk({"kind": "mermaid", "title": "流程图笔记"}, content=_MERMAID_SRC, score=score)
+
+    def _text(self, score, content="正文"):
+        return _chunk({"kind": "text"}, content=content, score=score)
+
+    def test_pins_mermaid_when_intent_and_cut(self):
+        # 图意图 query：mermaid chunk 被 rerank 长文本挤出 top-k → 从全量补回
+        ranked = [self._text(0.9, "t1"), self._text(0.8, "t2"), self._mm(0.3)]
+        selected = ranked[:2]
+        out = ensure_image_selected("画一下处理流程图", ranked, selected)
+        assert len(out) == 2  # 替换末位，长度不变
+        assert any(r.metadata.get("kind") == "mermaid" for r in out)
+        assert all("t2" != r.page_content for r in out)
+        assert out == sorted(out, key=lambda r: r.score, reverse=True)
+
+    def test_no_intent_no_mermaid_pin(self):
+        # 无图意图（如「核心逻辑是什么」）：不干预 —— mermaid 只靠教学 + 补齐兜底
+        ranked = [self._text(0.9), self._text(0.8), self._mm(0.3)]
+        selected = ranked[:2]
+        assert ensure_image_selected("出题子系统的核心逻辑是什么", ranked, selected) == selected
+
+    def test_image_still_pinned_when_no_mermaid(self):
+        # 原有 image 保位行为不受泛化影响
+        aid = "aabbccddeeff0011"
+        img = _chunk({"kind": "image", "asset_id": aid, "img_url": f"/assets/{aid}"},
+                     content="图片理解", score=0.2)
+        ranked = [self._text(0.9), self._text(0.8), img]
+        out = ensure_image_selected("架构图长什么样", ranked, ranked[:2])
+        assert any(r.metadata.get("kind") == "image" for r in out)
+
+
+class TestMissingMermaidBlock:
+    def _mm(self, score=1.0, title="流程笔记"):
+        return _chunk({"kind": "mermaid", "title": title}, content=_MERMAID_SRC, score=score)
+
+    def test_appends_best_diagram_when_answer_has_none(self):
+        chunks = [self._mm(score=0.5), self._mm(score=2.0)]
+        out = append_missing_mermaid("纯文字概括，没有图。", chunks)
+        assert "相关流程图" in out
+        assert "纯文字概括" in out  # 原答案保留
+        assert _MERMAID_SRC in out  # 补的是最高分（score=2.0）那张的围栏块
+
+    def test_no_append_when_answer_already_has_mermaid(self):
+        # LLM 已复现 mermaid（教学生效）：不重复补
+        answer = "回答如下：\n" + _MERMAID_SRC
+        assert missing_mermaid_block(answer, [self._mm()]) == ""
+
+    def test_no_append_without_mermaid_chunks(self):
+        assert append_missing_mermaid("纯文本", [_chunk({"kind": "text"}, content="正文")]) == "纯文本"
+
+    def test_extracts_only_the_fence_block(self):
+        # chunk 正文围栏外有说明文字时，只补围栏块本身
+        chunk = _chunk({"kind": "mermaid", "title": "T"}, content="图前的说明段落。\n" + _MERMAID_SRC + "\n图后的杂文字。")
+        out = append_missing_mermaid("回答。", [chunk])
+        assert _MERMAID_SRC in out
+        assert "图前的说明段落" not in out
+        assert "图后的杂文字" not in out
+
+    def test_finalize_answer_images_also_appends_mermaid(self):
+        # naive /ask 的统一出口：图片闭环 + mermaid 补齐一步到位
+        chunks = [self._mm()]
+        out = finalize_answer_images("纯文本回答。", chunks)
+        assert _MERMAID_SRC in out

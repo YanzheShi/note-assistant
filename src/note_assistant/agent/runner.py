@@ -19,7 +19,11 @@ from note_assistant.agent.cache import SemanticCache
 from note_assistant.agent.context import CondenseSignal, get_context_manager
 from note_assistant.agent.store import AgentStore
 from note_assistant.config import settings
-from note_assistant.pipeline.image_answer import append_missing_images, postprocess_answer
+from note_assistant.pipeline.image_answer import (
+    append_missing_images,
+    append_missing_mermaid,
+    postprocess_answer,
+)
 from note_assistant.pipeline.source_kind import classify_source
 from note_assistant.security.output_guard import check_prompt_leakage, neutralize_remote_media
 from note_assistant.retrieval.types import RetrievalResult
@@ -401,12 +405,14 @@ async def ainvoke(
     traj.append({"type": "sources", "sources": sources})
     contexts = _contexts_from_results(acc) if return_contexts else []
     # P2：把答案里的 [[IMG:asset_id]] 替换为真实图片 markdown；
-    # 再确定性补齐 context 里 LLM 未引用的图片。
+    # 再确定性补齐 context 里 LLM 未引用的图片、以及 LLM 未复现的 mermaid 流程图
+    # （2026-09-01：来源面板有图、答案正文没图的兜底）。
     # 仅检索生成路径补图：澄清问句与闲聊（direct_chat）不补，
     # 避免闲聊轮带着上一轮 seed 里的图片乱入。
     ans = postprocess_answer(final.get("answer", ""), acc)
     if not final.get("clarified") and final.get("route") != "chat":
         ans = append_missing_images(ans, acc)
+        ans = append_missing_mermaid(ans, acc)
     # L4 输出治理：远程图片中和（防渲染期外泄）+ system prompt 泄露指纹
     ans, media_hits = neutralize_remote_media(ans)
     leaked = check_prompt_leakage(ans)
@@ -651,8 +657,10 @@ async def astream(
                     # P2：把答案里的 [[IMG:asset_id]] 替换为真实图片 markdown
                     ans = postprocess_answer(ans, accumulated)
                     if node == "generate":
-                        # 确定性补图：LLM 没写标记时，context 里的相关图片也尽量显示
+                        # 确定性补图：LLM 没写标记时，context 里的相关图片也尽量显示；
+                        # 确定性补 mermaid：LLM 没复现时补最高分一张（同 ainvoke 路径）
                         ans = append_missing_images(ans, accumulated)
+                        ans = append_missing_mermaid(ans, accumulated)
                     # L4 输出治理：远程图片中和 + 泄露指纹（generate 路径计入门禁）
                     ans, media_hits = neutralize_remote_media(ans)
                     if node == "generate":

@@ -26,7 +26,10 @@ _IMAGE_INTENT_RE = re.compile(
 )
 
 # [[IMG:asset_id]] 标记（设计 8.3），asset_id 为 sha256[:16] 十六进制。
-_IMG_REF_RE = re.compile(r"\[\[IMG:([0-9a-fA-F]+)\]\]")
+# 2026-09-01 放宽为「任意非空非 ] 内容」：LLM 会照抄教学文本里的字面
+# [[IMG:asset_id]] 占位符（"asset_id" 非 hex），旧正则匹配不到 → 裸标记暴露
+# 给用户。放宽后由 postprocess_answer 统一裁决：有资产替换、无资产删除。
+_IMG_REF_RE = re.compile(r"\[\[IMG:([^\]\s]+)\]\]")
 
 
 def has_image_intent(query: str) -> bool:
@@ -39,24 +42,26 @@ def ensure_image_selected(
     ranked_all: List[RetrievalResult],
     selected: List[RetrievalResult],
 ) -> List[RetrievalResult]:
-    """rerank 截断的图片保位：图意图 query 的 top-k 里没有 image chunk 时，
-    从全量精排结果里把分数最高的 image chunk 补进 selected（替换末位）。
+    """rerank 截断的图示保位：图意图 query 的 top-k 里没有 image/mermaid chunk 时，
+    从全量精排结果里把分数最高的可渲染图示 chunk 补进 selected（替换末位）。
 
     背景：hybrid 融合阶段的图意图 boost 会被后续交叉编码器 rerank 清零——
-    rerank 纯按文本相关性重排，图片摘要块文本短、形态特殊，常被长正文挤出
-    top-k，于是「检索明明命中了图，生成上下文里却没有图」。本函数是确定性护栏：
-    只要 query 有图意图且候选里存在 image chunk，就保证 selected 里至少有一个。
+    rerank 纯按文本相关性重排，图片摘要块与 mermaid 代码块（代码文本 vs 自然语言
+    query，交叉编码器打分天然低）常被长正文挤出 top-k，于是「检索明明命中了图，
+    生成上下文里却没有图」。本函数是确定性护栏：只要 query 有图意图且候选里存在
+    image / mermaid chunk，就保证 selected 里至少有一个（2026-09-01 从 image-only
+    泛化到 mermaid——两者是同一症状：来源面板有图、答案正文没图）。
 
-    - 非图意图 query / selected 已有 image chunk / 候选无 image chunk → 原样返回。
+    - 非图意图 query / selected 已有可渲染图示 chunk / 候选无 → 原样返回。
     - ranked_all 须为同一次 rerank 的全量降序结果（selected 是其前缀截断），
-      保位取的正是 image chunk 的真实 rerank 分，不引入额外打分口径。
+      保位取的正是图示 chunk 的真实 rerank 分，不引入额外打分口径。
     - 替换 selected 末位（分数最低者）后重排，保持结果按分降序、长度不变。
     """
     if not has_image_intent(question or ""):
         return selected
-    if any(_is_image_chunk(r) for r in selected):
+    if any(_is_visual_chunk(r) for r in selected):
         return selected
-    best = next((r for r in ranked_all if _is_image_chunk(r)), None)
+    best = next((r for r in ranked_all if _is_visual_chunk(r)), None)
     if best is None:
         return selected
     if not selected:
@@ -75,6 +80,22 @@ def _is_image_chunk(item: RetrievalResult) -> bool:
     return bool(meta.get("asset_id")) and (
         bool(meta.get("image_description")) or bool(meta.get("image_ocr_text"))
     )
+
+
+_MERMAID_FENCE = "```mermaid"
+
+
+def _is_mermaid_chunk(item: RetrievalResult) -> bool:
+    """是否为 mermaid 图示 chunk：metadata kind 标记，或正文含 ```mermaid 围栏。"""
+    meta = item.metadata if isinstance(item.metadata, dict) else {}
+    if str(meta.get("kind")) == "mermaid":
+        return True
+    return _MERMAID_FENCE in (getattr(item, "page_content", "") or "")
+
+
+def _is_visual_chunk(item: RetrievalResult) -> bool:
+    """是否为「可渲染图示 chunk」：图片理解块或 mermaid 块（保位护栏的判定口径）。"""
+    return _is_image_chunk(item) or _is_mermaid_chunk(item)
 
 
 def _chunk_key(result: RetrievalResult):
@@ -197,6 +218,15 @@ def has_teachable_image_assets(chunks: List[RetrievalResult]) -> bool:
     return bool(collect_image_assets(chunks or []))
 
 
+def has_mermaid_chunks(chunks: List[RetrievalResult]) -> bool:
+    """context 中是否存在 mermaid 图示 chunk（决定是否教 LLM 复现 mermaid）。
+
+    与 ``has_teachable_image_assets`` 同一设计：教学是软引导，条件化追加避免
+    对没有 mermaid 的上下文产生诱导（LLM 凭空画图 = 幻觉）。
+    """
+    return any(_is_mermaid_chunk(r) for r in (chunks or []))
+
+
 def postprocess_answer(answer: str, chunks: List[RetrievalResult]) -> str:
     """把答案里的 [[IMG:asset_id]] 替换为 ![title](img_url)（设计 8.3）。
 
@@ -252,9 +282,50 @@ def append_missing_images(answer: str, chunks: List[RetrievalResult]) -> str:
     return (answer or "") + missing_images_block(answer or "", chunks)
 
 
+# ── 确定性补 mermaid（2026-09-01，对称图片的确定性补齐）──────────────
+# 与 [[IMG:]] 标记不同，mermaid 的「复现」由 LLM 直接把 ```mermaid 代码块写进
+# 答案（无标记替换层），prompt 只是软引导——问「处理流程」这类不带图意图词的
+# query 时 LLM 常常用文字概括而不复现代码块（实测：上下文含 mermaid 排第 2、
+# 答案却无图）。护栏：进入生成上下文的 mermaid chunk 都是检索+精排筛过的，
+# 视为「相关」；答案完全没有 mermaid 块时补分数最高的一张，已有块则不补
+# （避免多图刷屏；LLM 已复现说明软引导生效）。
+MAX_AUTO_MERMAID = 1
+
+# 抽取 chunk 正文里的第一个完整 ```mermaid ... ``` 围栏块（chunk 可能含围栏外
+# 的说明文字，不能整段照搬）
+_MERMAID_BLOCK_RE = re.compile(r"(```mermaid[\s\S]*?```)", re.IGNORECASE)
+
+
+def missing_mermaid_block(answer: str, chunks: List[RetrievalResult]) -> str:
+    """返回需要补在答案末尾的 mermaid 区块；无缺失时返回空串。"""
+    text = answer or ""
+    if _MERMAID_FENCE in text:
+        return ""  # 答案已有 mermaid 块：LLM 已复现，不重复补
+    diagrams = [r for r in (chunks or []) if _is_mermaid_chunk(r)]
+    if not diagrams:
+        return ""
+    best = max(diagrams, key=lambda r: r.score)
+    m = _MERMAID_BLOCK_RE.search(getattr(best, "page_content", "") or "")
+    if not m:
+        return ""
+    meta = best.metadata if isinstance(best.metadata, dict) else {}
+    title = meta.get("title", "") or ""
+    lines = ["\n\n---\n**相关流程图：**"]
+    if title:
+        lines.append(f"（来源：{title}）\n")
+    lines.append(m.group(1))
+    return "\n".join(lines) + "\n"
+
+
+def append_missing_mermaid(answer: str, chunks: List[RetrievalResult]) -> str:
+    """答案完全没有 mermaid 块时，把 context 里分数最高的 mermaid 补到末尾。"""
+    return (answer or "") + missing_mermaid_block(answer or "", chunks)
+
+
 def finalize_answer_images(answer: str, chunks: List[RetrievalResult]) -> str:
-    """一步到位的生成后图片闭环：标记替换 + 未引用图片补齐。"""
-    return append_missing_images(postprocess_answer(answer or "", chunks), chunks)
+    """一步到位的生成后图示闭环：标记替换 + 未引用图片补齐 + 缺失 mermaid 补齐。"""
+    out = append_missing_images(postprocess_answer(answer or "", chunks), chunks)
+    return append_missing_mermaid(out, chunks)
 
 
 # ── 流式后处理 ────────────────────────────────────────────────
@@ -333,7 +404,9 @@ class ImageMarkerStreamer:
         """
         rest, self._buf = self._buf, ""
         if rest.startswith(_MARKER_OPEN):
-            m = re.match(r"\[\[IMG:[0-9a-fA-F]{0,16}(?:\]\])?", rest)
+            # 与 _IMG_REF_RE 同口径（2026-09-01 放宽）：任意非空非 ] 内容均按标记
+            # 处理，被截断的未闭合标记直接删除（不留噪音）
+            m = re.match(r"\[\[IMG:[^\]\s]{0,64}(?:\]\])?", rest)
             if m:
                 rest = rest[m.end():]
         return rest

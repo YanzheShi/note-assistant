@@ -9,6 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from note_assistant.config import settings
 from note_assistant.pipeline.image_answer import (
+    has_mermaid_chunks,
     has_teachable_image_assets,
     render_image_block,
 )
@@ -50,6 +51,15 @@ class Generator:
         "系统会自动替换为图片。只能使用参考笔记中出现过的 asset_id，严禁编造。"
     )
 
+    # mermaid 复现教学（2026-09-01 条件化，与 agent 链路 GENERATE_MERMAID_TEACHING 同源）：
+    # 上下文有 mermaid chunk 才教，避免诱导 LLM 凭空画图。
+    MERMAID_TEACHING = (
+        "\n8. 参考笔记中可能包含 mermaid 流程图代码块（```mermaid 围栏）。"
+        "当回答涉及流程、架构、时序等内容且参考笔记中有对应的 mermaid 图时，"
+        "请在答案相应位置**原样复现**该 mermaid 代码块（保持源码一字不改），"
+        "前端会渲染为流程图。只能复现参考笔记中出现过的 mermaid 源码，严禁编造或修改。"
+    )
+
     def __init__(self, llm=None):
         """
         Args:
@@ -72,10 +82,13 @@ class Generator:
 
 
     def _system_prompt(self, context: list[RetrievalResult]) -> str:
-        """按 context 内容组装 system prompt：仅当存在可解析图片资产时才教 [[IMG:]] 语法。"""
+        """按 context 内容组装 system prompt：条件化教学 [[IMG:]] 与 mermaid 复现。"""
+        prompt = self.SYSTEM_PROMPT
         if has_teachable_image_assets(context):
-            return self.SYSTEM_PROMPT + self.IMG_MARK_TEACHING
-        return self.SYSTEM_PROMPT
+            prompt += self.IMG_MARK_TEACHING
+        if has_mermaid_chunks(context):
+            prompt += self.MERMAID_TEACHING
+        return prompt
 
     @staticmethod
     def _format_history(history: list[dict]) -> list[tuple[str, str]]:

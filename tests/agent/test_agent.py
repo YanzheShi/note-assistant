@@ -4,7 +4,7 @@ import logging
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from note_assistant.agent import agent as agent_mod
@@ -762,3 +762,74 @@ def test_rerank_loop_pins_image_on_image_intent(monkeypatch):
     kinds = [r.metadata.get("kind") for r in out["accumulated"]]
     assert "image" in kinds
     assert len(out["accumulated"]) == settings.agent_reranker_loop_top_k
+
+
+# ──────────────────────────────────────────────
+# generate_node：mermaid 教学 + 图示保位（2026-09-01）
+# ──────────────────────────────────────────────
+
+_MERMAID_CHUNK_CONTENT = "```mermaid\nflowchart TD\n    A[开始] --> B[结束]\n```"
+
+
+def _mk_mermaid(score: float, filepath: str = "a.md", heading: str = "h-flow") -> RetrievalResult:
+    return RetrievalResult(
+        score=score,
+        page_content=_MERMAID_CHUNK_CONTENT,
+        metadata={"title": "流程笔记", "filepath": filepath, "heading_path": heading, "kind": "mermaid"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_node_mermaid_teaching_conditional(monkeypatch):
+    """上下文含 mermaid chunk → system prompt 教复现；不含 → 不教（防幻觉引导）。"""
+    _CaptureLLM.captured = []
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
+
+    await generate_node({"accumulated": [_mk_mermaid(0.9)], "iteration": 1,
+                         "judge_verdict": "sufficient", "widen_context": False, "gate_overrode": False,
+                         "question": "处理流程是什么", "condensed_question": "处理流程是什么",
+                         "history": [], "history_messages": []})
+    sys_with = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, SystemMessage))
+    assert "mermaid" in sys_with and "原样复现" in sys_with
+
+    await generate_node({"accumulated": [_mk(0.9)], "iteration": 1,
+                         "judge_verdict": "sufficient", "widen_context": False, "gate_overrode": False,
+                         "question": "q", "condensed_question": "q",
+                         "history": [], "history_messages": []})
+    sys_without = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, SystemMessage))
+    assert "mermaid" not in sys_without
+
+
+@pytest.mark.asyncio
+async def test_generate_node_pins_mermaid_for_image_intent_query(monkeypatch):
+    """图意图 query：低分 mermaid chunk 被长文本挤出 top-k 时，保位进生成上下文。"""
+    _CaptureLLM.captured = []
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
+    # top_k_rerank(5) 条正文分数 0.5~0.9，mermaid 只有 0.1 → 裸排序必出局
+    results = [_mk(round(0.9 - i * 0.1, 2), "a.md", f"h{i}") for i in range(5)]
+    results.append(_mk_mermaid(0.1))
+
+    await generate_node({"accumulated": results, "iteration": 1,
+                         "judge_verdict": "sufficient", "widen_context": False, "gate_overrode": False,
+                         "question": "画一下处理流程图", "condensed_question": "画一下处理流程图",
+                         "history": [], "history_messages": []})
+    ctx = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, HumanMessage))
+    assert _MERMAID_CHUNK_CONTENT in ctx  # mermaid 保位进上下文
+    # 保位替换末位：分数最低的正文（content-0.5）出局
+    assert "content-0.5" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_generate_node_no_pin_without_image_intent(monkeypatch):
+    """无图意图 query：纯分数排序，低分 mermaid 不保位（不干预既有行为）。"""
+    _CaptureLLM.captured = []
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
+    results = [_mk(round(0.9 - i * 0.1, 2), "a.md", f"h{i}") for i in range(5)]
+    results.append(_mk_mermaid(0.1))
+
+    await generate_node({"accumulated": results, "iteration": 1,
+                         "judge_verdict": "sufficient", "widen_context": False, "gate_overrode": False,
+                         "question": "核心逻辑是什么", "condensed_question": "核心逻辑是什么",
+                         "history": [], "history_messages": []})
+    ctx = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, HumanMessage))
+    assert _MERMAID_CHUNK_CONTENT not in ctx

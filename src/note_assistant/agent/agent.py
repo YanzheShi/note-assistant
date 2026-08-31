@@ -55,6 +55,7 @@ from note_assistant.retrieval.types import RetrievalResult
 from note_assistant.pipeline.image_answer import (
     ensure_image_selected,
     expand_image_neighbors,
+    has_mermaid_chunks,
     has_teachable_image_assets,
 )
 from note_assistant.security.guardrails import (
@@ -234,6 +235,17 @@ GENERATE_IMG_TEACHING = (
     "\n5. 参考笔记中的图片条目若标注了「引用方式：如需引用此图，在回答中写 "
     "[[IMG:asset_id]]」，且展示该图对回答有帮助，就在相应位置**原样**插入该标记，"
     "系统会自动替换为图片。只能使用参考笔记中出现过的 asset_id，严禁编造。"
+)
+
+# mermaid 复现教学（2026-09-01 条件化）：只在生成上下文里存在 mermaid chunk
+# 时追加。实测（2026-09-01）：上下文含 mermaid 排第 2，问「处理流程」时 LLM
+# 倾向文字概括而不复现代码块 → 来源面板有图、答案正文没图。教学是软引导，
+# 配套 runner 的 append_missing_mermaid 确定性兜底。
+GENERATE_MERMAID_TEACHING = (
+    "\n6. 参考笔记中可能包含 mermaid 流程图代码块（```mermaid 围栏）。"
+    "当回答涉及流程、架构、时序等内容且参考笔记中有对应的 mermaid 图时，"
+    "请在答案相应位置**原样复现**该 mermaid 代码块（保持源码一字不改），"
+    "前端会渲染为流程图。只能复现参考笔记中出现过的 mermaid 源码，严禁编造或修改。"
 )
 
 CHAT_SYSTEM = (
@@ -825,8 +837,12 @@ async def generate_node(state: AgentState) -> dict:
     """
     llm = get_llm(temperature=0.6, max_tokens=2048)
     top_k = settings.agent_generate_widen_top_k if state.get("widen_context") else settings.top_k_rerank
+    q = state.get("condensed_question") or state["question"]
     # #4：先 Top-K 裁剪，再把图片邻居补在末尾（邻居 score=0，确保不被截断出局）
-    top_results = _top_k_context(state["accumulated"], top_k=top_k)
+    # 图示保位（2026-09-01）：图意图 query 的 top-k 若被长文本挤出 image/mermaid
+    # chunk，从全量降序结果里补回（与 naive /ask 的 rag_chain 同一护栏）。
+    ranked_all = sorted(state["accumulated"], key=lambda r: r.score, reverse=True)
+    top_results = ensure_image_selected(q, ranked_all, ranked_all[:top_k])
     expanded = expand_image_neighbors(state["accumulated"], _fetch_text_neighbors_by_heading)
     context = _format_context(top_results + expanded)
     degraded = (
@@ -845,14 +861,16 @@ async def generate_node(state: AgentState) -> dict:
         note = ""
     # 2026-08-31：[[IMG:]] 教学条件化 —— 仅当生成上下文里存在可解析图片资产时追加，
     # 避免诱导 LLM 对无资产图片编造标记（噪音 [[IMG:xxx]] 的根因之一）。
+    # 2026-09-01：mermaid 复现教学同理条件化（上下文有 mermaid chunk 才教）。
     generate_system = GENERATE_SYSTEM
     if has_teachable_image_assets(top_results):
         generate_system += GENERATE_IMG_TEACHING
+    if has_mermaid_chunks(top_results):
+        generate_system += GENERATE_MERMAID_TEACHING
     msgs: list[BaseMessage] = [SystemMessage(append_guardrail(generate_system))]
     # 预算裁剪后的历史（含长程摘要），与 agent/direct_chat 同源，避免重复
     history_msgs = state.get("history_messages") or _fmt_history(state["history"])
     msgs.extend(wrap_history_messages(history_msgs))
-    q = state.get("condensed_question") or state["question"]
     msgs.append(
         HumanMessage(
             f"## 参考笔记\n{wrap_retrieved_context(context)}\n\n"
