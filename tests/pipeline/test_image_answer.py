@@ -16,6 +16,7 @@ from note_assistant.pipeline.image_answer import (
     ensure_image_selected,
     finalize_answer_images,
     has_image_intent,
+    has_teachable_image_assets,
     missing_images_block,
     render_image_block,
     collect_image_assets,
@@ -118,10 +119,11 @@ class TestPostprocessAnswer:
         assert out == "见 ![记忆架构](/assets/abc123def4567890) 所示。"
         assert "[[IMG:" not in out
 
-    def test_unknown_asset_preserved(self):
-        # 无对应资产：标记原样保留，绝不凭空造图（防幻觉）
+    def test_unknown_asset_stripped(self):
+        # 无对应资产：直接删除标记（不幻觉造图，也不留裸标记噪音；2026-08-31 修订）
         out = postprocess_answer("见 [[IMG:deadbeefdeadbeef]] 所示。", [])
-        assert out == "见 [[IMG:deadbeefdeadbeef]] 所示。"
+        assert "[[IMG:" not in out
+        assert out == "见  所示。"
 
     def test_multiple_markers(self):
         chunks = [
@@ -140,6 +142,24 @@ class TestPostprocessAnswer:
 
     def test_empty_answer(self):
         assert postprocess_answer("", []) == ""
+
+
+# ── 图片教学开关（system prompt 条件化依据）──
+class TestHasTeachableImageAssets:
+    def test_true_when_resolvable(self):
+        chunks = [_chunk({"kind": "image", "asset_id": "abc123def4567890",
+                          "img_url": "/assets/abc123def4567890"})]
+        assert has_teachable_image_assets(chunks)
+
+    def test_false_without_img_url(self):
+        # asset_id 存在但 img_url 缺失 → 后处理替换不了 → 不教学
+        chunks = [_chunk({"kind": "image", "asset_id": "abc123def4567890"})]
+        assert not has_teachable_image_assets(chunks)
+
+    def test_false_without_assets(self):
+        assert not has_teachable_image_assets([_chunk({"kind": "image"})])
+        assert not has_teachable_image_assets([])
+        assert not has_teachable_image_assets(None)
 
 
 # ── rerank 图片保位（图意图 boost 被交叉编码器清零后的确定性护栏）──
@@ -267,16 +287,22 @@ class TestImageMarkerStreamer:
     def test_plain_text_passthrough(self):
         assert self._run(["纯", "文本", "回答"]) == "纯文本回答"
 
-    def test_unknown_asset_marker_preserved(self):
-        # 未知 asset_id 原样保留，绝不幻觉造图
+    def test_unknown_asset_marker_stripped(self):
+        # 未知 asset_id：删除标记，不幻觉也不留噪音（2026-08-31 修订）
         tokens = ["x", "[[IMG:", "ffffffffffffffff", "]]", "y"]
-        assert self._run(tokens) == "x[[IMG:ffffffffffffffff]]y"
+        assert self._run(tokens) == "xy"
 
-    def test_unclosed_marker_flushed_raw(self):
-        assert self._run(["文本 [[IMG:", self.AID]) == f"文本 [[IMG:{self.AID}"
+    def test_unclosed_marker_stripped_on_flush(self):
+        # 流结束时标记未闭合：截断的标记片段剥离，其余文本保留
+        assert self._run(["文本 [[IMG:", self.AID]) == "文本 "
 
-    def test_no_assets_passthrough_verbatim(self):
-        # 无图片资产时零开销透传，且内容不被改动
+    def test_no_assets_unknown_hex_stripped(self):
+        # 无图片资产时也不能透传：未解析的十六进制标记要被剥离（2026-08-31 修订）
+        out = self._run(["a", "[[IMG:", "ffffffffffffffff", "]]", "b"], chunks=[])
+        assert out == "ab"
+
+    def test_no_assets_nonhex_marker_unchanged(self):
+        # 非十六进制的 [[IMG:...]] 形状文本不认作标记，原样保留（与 postprocess 同口径）
         out = self._run(["a", "[[IMG:", "x", "]]", "b"], chunks=[])
         assert out == "a[[IMG:x]]b"
 

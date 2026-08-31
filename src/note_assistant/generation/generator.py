@@ -8,7 +8,10 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from note_assistant.config import settings
-from note_assistant.pipeline.image_answer import render_image_block
+from note_assistant.pipeline.image_answer import (
+    has_teachable_image_assets,
+    render_image_block,
+)
 from note_assistant.retrieval.types import RetrievalResult
 from note_assistant.security.guardrails import (
     append_guardrail,
@@ -35,8 +38,16 @@ class Generator:
         "5. 引用来源时标注笔记标题\n"
         "6. 参考笔记中标注【图片】的条目来自笔记里的插图，其内容由视觉模型解析得到。\n"
         "   - 引用图片信息时，说明\"根据笔记中的架构图/流程图\"，不要说\"根据文档描述\"\n"
-        "   - 如果图片信息对回答有帮助，在相应位置插入 [[IMG:asset_id]] 标记，系统会自动替换为图片\n"
         "   - 严禁描述图片解析结果中不存在的细节"
+    )
+
+    # 图片引用教学（2026-08-31 条件化）：只在 context 里存在可解析资产
+    # （asset_id + img_url 双全）时才拼进 system prompt。静态教学会诱导 LLM
+    # 对没有资产的图 chunk 凭空编 id，产出 [[IMG:xxx]] 噪音。
+    IMG_MARK_TEACHING = (
+        "\n7. 参考笔记中的图片条目若标注了「引用方式：如需引用此图，在回答中写 "
+        "[[IMG:asset_id]]」，且展示该图对回答有帮助，就在相应位置**原样**插入该标记，"
+        "系统会自动替换为图片。只能使用参考笔记中出现过的 asset_id，严禁编造。"
     )
 
     def __init__(self, llm=None):
@@ -59,6 +70,12 @@ class Generator:
 
         self.llm = self.llm.with_config(callbacks=[get_token_handler()])
 
+
+    def _system_prompt(self, context: list[RetrievalResult]) -> str:
+        """按 context 内容组装 system prompt：仅当存在可解析图片资产时才教 [[IMG:]] 语法。"""
+        if has_teachable_image_assets(context):
+            return self.SYSTEM_PROMPT + self.IMG_MARK_TEACHING
+        return self.SYSTEM_PROMPT
 
     @staticmethod
     def _format_history(history: list[dict]) -> list[tuple[str, str]]:
@@ -92,7 +109,7 @@ class Generator:
             ChatPromptTemplate
         """
         context_text = self._format_context(context)
-        messages = [("system", append_guardrail(self.SYSTEM_PROMPT))]
+        messages = [("system", append_guardrail(self._system_prompt(context)))]
         if history:
             messages.extend(wrap_history_tuples(self._format_history(history)))
         messages.append(("human", "## 参考笔记\n{context_text}\n\n## 问题\n{question}"))
@@ -129,7 +146,7 @@ class Generator:
             每个 token 的文本片段
         """
         context_text = self._format_context(context)
-        messages = [("system", append_guardrail(self.SYSTEM_PROMPT))]
+        messages = [("system", append_guardrail(self._system_prompt(context)))]
         if history:
             messages.extend(wrap_history_tuples(self._format_history(history)))
         messages.append((

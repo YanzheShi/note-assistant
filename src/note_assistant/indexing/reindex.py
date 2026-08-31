@@ -129,6 +129,10 @@ def _index_one(doc, ing) -> None:
         c.page_content = f"{prefix}\n\n{c.page_content}"
 
     summary_chunks = ing.preprocessor.generate_summaries()
+    # 与全量索引同步：把图片资产定位回绑到内联该图的正文/父块（须在
+    # generate_summaries 之后、父块写 docstore 之前，见 RichPreprocessor.bind_inline_images）
+    ing.preprocessor.bind_inline_images(chunks)
+    ing.preprocessor.bind_inline_images(parents)
     for sc in summary_chunks:
         sc.metadata["filepath"] = doc.filepath
         sc.metadata["title"] = doc.title

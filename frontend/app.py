@@ -88,6 +88,52 @@ def _typewriter(placeholder, text: str, chunk: int = 4, delay: float = 0.008):
     placeholder.markdown(shown or text)
 
 
+import re as _re
+
+# 只匹配显式标注的 ```mermaid ... ``` 围栏；口径与索引期一致
+# （preprocessor._extract_mermaid / source_kind._MERMAID_RE）。
+# 不能把 mermaid 做成可选：那样等于在尝试匹配任意三反引号围栏，答案里有多个裸
+# 围栏代码块时，会把第一块的结束 ``` 当开始、把中间正文吞成 mermaid 源码——正文消失。
+# 代价：未标注 mermaid 的裸围栏图只会显示成代码块（与后端同一口径）。
+_MERMAID_RE = _re.compile(
+    r"```mermaid\s*\n(.*?)```", _re.DOTALL
+)
+
+
+def _render_markdown_with_mermaid(text: str) -> None:
+    """渲染答案正文：把其中的 mermaid 块拆出来用 render_mermaid 渲染，
+    其余文本照旧走 st.markdown。
+
+    背景：LLM 常在答案里直接吐 ```` ```mermaid ```` 流程图（如出题降级链路图），
+    Streamlit 的 st.markdown 不内置 mermaid 运行时，原样显示成代码块。
+    这里按围栏块切分，mermaid 段单独渲染，非 mermaid 段正常 markdown。
+
+    - 非 mermaid 文本可能夹在多个 mermaid 块之间，用 finditer 顺序扫描保留次序。
+    - 没有 mermaid 块时退化为一次 st.markdown，行为与改造前一致。
+    """
+    from frontend.components.mermaid import render_mermaid
+
+    if not text:
+        return
+
+    last_end = 0
+    for m in _MERMAID_RE.finditer(text):
+        # 围栏前的普通文本
+        before = text[last_end : m.start()].strip()
+        if before:
+            st.markdown(before)
+        mermaid_src = m.group(1).strip()
+        if mermaid_src:
+            render_mermaid(mermaid_src)
+        last_end = m.end()
+
+    # 末尾剩余普通文本。无 mermaid 块时 last_end 仍为 0，这里即全文渲染一次，
+    # 行为与改造前一致——不要再补一次兜底，否则整篇答案会连续显示两遍。
+    tail = text[last_end:].strip()
+    if tail:
+        st.markdown(tail)
+
+
 # ─────────────────────────────────────────────────────────────
 # 渲染单个问答通道（整段逻辑按 mode 分支事件协议）
 # ─────────────────────────────────────────────────────────────
@@ -227,13 +273,16 @@ def render_chat_pane(mode: str):
                     answer_text = event.get("content", "")
                     # 答案正文的图片 URL 是 /assets/{id} 相对路径，必须拼后端地址
                     render_text = rewrite_asset_urls(answer_text, API_URL)
+                    # 整体渲染：mermaid 块出图，其余 markdown。
+                    # 不再走 _typewriter——打字机逐字揭示与 mermaid 块的整段渲染冲突，
+                    # 且 mermaid 源码不能逐字符吐出。
                     if trace_container is not None:
                         with trace_container:
                             with st.expander("📝 答案", expanded=True):
-                                _aw = st.empty()
-                                _typewriter(_aw, render_text)
+                                _render_markdown_with_mermaid(render_text)
                     else:
-                        _typewriter(streaming_placeholder, render_text)
+                        streaming_placeholder.empty()
+                        _render_markdown_with_mermaid(render_text)
 
                 # ── 传统 RAG 检索步骤（仅 /ask_trace 产出）──
                 elif etype == "trace":
@@ -286,13 +335,14 @@ def render_chat_pane(mode: str):
             # ── 传统 RAG：答案以 char 累积，循环结束后统一渲染 ──
             if mode == "rag" and answer_text:
                 render_text = rewrite_asset_urls(answer_text, API_URL)
+                # 整体渲染：mermaid 块出图，其余 markdown（同 Agentic answer 事件处理）
                 if trace_container is not None:
                     with trace_container:
                         with st.expander("📝 答案", expanded=True):
-                            _aw = st.empty()
-                            _typewriter(_aw, render_text)
+                            _render_markdown_with_mermaid(render_text)
                 else:
-                    _typewriter(streaming_placeholder, render_text)
+                    streaming_placeholder.empty()
+                    _render_markdown_with_mermaid(render_text)
 
             if trace_container is not None:
                 with trace_container:

@@ -186,22 +186,32 @@ def collect_image_assets(chunks: List[RetrievalResult]) -> Dict[str, dict]:
     return out
 
 
+def has_teachable_image_assets(chunks: List[RetrievalResult]) -> bool:
+    """context 中是否存在「标记可被真实替换」的图片资产（asset_id + img_url 双全）。
+
+    决定 system prompt 是否教 ``[[IMG:asset_id]]`` 语法（2026-08-31）：教学是
+    软引导，LLM 会照着格式**编** id——context 里没有可解析资产时教学只会
+    诱导幻觉标记（26/30 图 chunk 无 asset_id 的教训）。所以只在 collect_image_assets
+    非空（即后处理真的能替换）时才教。
+    """
+    return bool(collect_image_assets(chunks or []))
+
+
 def postprocess_answer(answer: str, chunks: List[RetrievalResult]) -> str:
     """把答案里的 [[IMG:asset_id]] 替换为 ![title](img_url)（设计 8.3）。
 
-    标记不存在 / 无对应资产时原样保留（绝不凭空造图）。
+    标记无对应资产时**直接删除**（2026-08-31 修订）：此前「原样保留」的策略
+    在 LLM 编造 asset_id / 资产未注册时给用户留下 [[IMG:xxx]] 裸标记噪音。
+    现在绝不凭空造图（护栏不变），但也不保留无法解析的标记。
     """
     if not answer:
         return answer
     assets = collect_image_assets(chunks)
-    if not assets:
-        return answer
 
     def _repl(m: re.Match) -> str:
-        aid = m.group(1)
-        info = assets.get(aid)
+        info = assets.get(m.group(1))
         if not info:
-            return m.group(0)  # 无对应资产：保留标记，不幻觉
+            return ""  # 无对应资产：删除标记，不幻觉也不留噪音
         return f"![{info['title']}]({info['img_url']})"
 
     return _IMG_REF_RE.sub(_repl, answer)
@@ -288,15 +298,14 @@ class ImageMarkerStreamer:
             return marker
         info = self._assets.get(m.group(1))
         if not info:
-            return marker  # 无对应资产：保留标记，不幻觉
+            return ""  # 无对应资产：直接删除，不幻觉也不留噪音
         return f"![{info['title']}]({info['img_url']})"
 
     def feed(self, token: str) -> str:
         """喂入一个 token，返回此刻可以安全吐出的文本（可能为空字符串）。"""
         if not token:
             return ""
-        if not self._assets:
-            return token  # 没有可替换的图片资产，直接透传，零开销
+        # 注意：即使没有可替换资产也不能透传 —— 未解析标记要在这里被剥离
         self._buf += token
         out: List[str] = []
         while True:
@@ -317,6 +326,14 @@ class ImageMarkerStreamer:
         return "".join(out)
 
     def flush(self) -> str:
-        """流结束后吐出残留缓冲（未闭合的标记原样保留）。"""
+        """流结束后吐出残留缓冲；其中被截断的未闭合标记直接删除（不留噪音）。
+
+        feed 的缓冲区只可能残留「从 ``[[IMG:`` 开始的未闭合标记及其后文本」，
+        所以锚定开头剥离截断的标记片段，其余文本原样保留。
+        """
         rest, self._buf = self._buf, ""
+        if rest.startswith(_MARKER_OPEN):
+            m = re.match(r"\[\[IMG:[0-9a-fA-F]{0,16}(?:\]\])?", rest)
+            if m:
+                rest = rest[m.end():]
         return rest

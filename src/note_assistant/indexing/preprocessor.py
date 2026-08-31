@@ -20,6 +20,11 @@ def _note_dir_of(filepath: str) -> str:
     return _normalize_note_dir(str(Path(filepath or "").parent))
 
 
+# 资产定位字段：图片 summary chunk 由 enricher 算出，需回绑到内联同一张图的正文 chunk，
+# 否则来源面板拿到的只有裸相对路径（渲染必 404）。
+_ASSET_KEYS = ("asset_id", "img_url", "render_hint")
+
+
 # 所有占位符的统一形态（uuid4().hex[:8] → 8 位十六进制）。
 # 用于把 context 窗口里混入的占位符洗掉：抽取是分阶段的（code → table → mermaid → image），
 # 后一阶段取上下文时看到的文本已被前一阶段替换过，不清洗会把 "<CODE_UID_a3f2b1c8>"
@@ -200,9 +205,10 @@ class RichPreprocessor:
                 # 节点/边 label 拼成结构化文本入索引（比旧式「图类型 + 前一行 caption」
                 # 信息密度高得多），并写 render_hint 供前端原生渲染（mermaid.render）。
                 # 解析失败（罕见）降级为旧弱摘要，绝不中断索引。
-                # P1-b：原始 mermaid 源码恒入 metadata（mermaid_src），并经
+                # P1-b：原始 mermaid 源码恒入 metadata（mermaid_src/raw_mermaid），并经
                 #   classify_source → SourceInfo → SourceSchema → API 透传到前端
-                #   原生渲染（streamlit_mermaid）。render_hint 标记可安全渲染，
+                #   原生渲染（frontend/components/mermaid.py 注入 mermaid.js，
+                #   非 streamlit_mermaid 第三方图床）。render_hint 标记可安全渲染，
                 #   前端无该标记时退化为代码展示，避免幻觉。
                 meta_extra["mermaid_src"] = ext.raw
                 meta_extra["render_hint"] = "mermaid:inline"
@@ -236,6 +242,11 @@ class RichPreprocessor:
                     enriched = self._image_enricher(ext, hp)
                     if enriched is not None:
                         summary, meta_extra = enriched
+                        # 资产定位回写 ext.meta：供 bind_inline_images() 把它绑到
+                        # 内联了同一张图的正文 chunk（此刻只有 summary chunk 有 URL）
+                        for k in _ASSET_KEYS:
+                            if meta_extra.get(k):
+                                ext.meta[k] = meta_extra[k]
 
             elif ext.kind == "code":
                 # Code：取语言标记 + 前几行
@@ -277,6 +288,36 @@ class RichPreprocessor:
                 kind="extracted_summary",
             ))
         return summary_chunks
+
+    def bind_inline_images(self, chunks: list[Chunk]) -> list[Chunk]:
+        """把图片资产定位回绑到「正文内联了该图」的 chunk 上（原地修改）。
+
+        背景：资产信息只长在图片 summary chunk 上。正文 chunk 经 restore() 还原出
+        ``![alt](src)`` 后，只自带一个裸相对路径——来源面板据此渲染必然 404
+        （「图片文件不可见」）。这里把同一张图的 ``/assets/{asset_id}`` 补进它的
+        metadata，让面板与答案正文走同一个资产出口。
+
+        调用时机必须在 generate_summaries() **之后**：资产定位是 enricher 在那一步
+        才算出的。匹配只能按 ``ext.raw``（原始 markdown 语法）——占位符此刻已被
+        restore() 吃掉。已有 img_url 的 chunk（图片 summary 自身）不覆盖。
+        """
+        images = [e for e in self.extracted
+                  if e.kind == "image" and e.meta.get("img_url")]
+        if not images:
+            return chunks
+        for chunk in chunks:
+            if chunk.metadata.get("img_url"):
+                continue
+            content = chunk.page_content or ""
+            for ext in images:
+                # 一图一绑定：按抽取顺序取第一个命中的图，与 classify_source
+                # 的「取正文第一张图」口径保持一致
+                if ext.raw and ext.raw in content:
+                    for k in _ASSET_KEYS:
+                        if ext.meta.get(k):
+                            chunk.metadata[k] = ext.meta[k]
+                    break
+        return chunks
 
     # ──────────────────────────────────────────────
     # Front Matter → 可检索 chunk

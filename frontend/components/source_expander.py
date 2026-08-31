@@ -127,7 +127,9 @@ def render_sources(sources: list[dict], backend_base_url: str = ""):
     st.markdown(f"**📎 {len(sources)} 个来源** {badges}")
 
     # ── 全部展开/折叠 ──
-    show_all = st.checkbox("全部展开", value=(len(sources) <= 3), key=f"expand_all_{next(_render_counter)}")
+    # 默认全部折叠（即使含 mermaid/图片也不自动展开）：来源是辅助信息，
+    # 默认展开会把答案挤出视口（mermaid 图 800px 高尤甚）。要看就手动点。
+    show_all = st.checkbox("全部展开", value=False, key=f"expand_all_{next(_render_counter)}")
 
     type_icons = {"text": "📝", "table": "📊", "mermaid": "🔀", "image": "🖼️"}
 
@@ -149,7 +151,7 @@ def render_sources(sources: list[dict], backend_base_url: str = ""):
         abs_path = resolve_vault_path(filepath, vault_root=vault_root())
         obsidian_url = obsidian_open_url(filepath, vault_name=vault_name())
 
-        with st.expander(label, expanded=show_all or i == 0):
+        with st.expander(label, expanded=show_all):
             # 路径操作栏：复制绝对路径 + 在 Obsidian 中打开
             _render_path_actions(abs_path, obsidian_url, idx=i)
             # ── 预览（所有类型都有） ──
@@ -180,10 +182,12 @@ def render_sources(sources: list[dict], backend_base_url: str = ""):
                         f"类型：{src['diagram_type']} ｜ "
                         f"render_hint：{src.get('render_hint', 'mermaid:inline')}"
                     )
+                # 统一走前端 mermaid 运行时（components.html 注入 mermaid.js），
+                # 不再依赖 streamlit_mermaid（其走 mermaid.ink 第三方图床，有外泄风险）。
                 try:
-                    from streamlit_mermaid import st_mermaid
-                    st_mermaid(mermaid_src)
-                except ImportError:
+                    from frontend.components.mermaid import render_mermaid
+                    render_mermaid(mermaid_src)
+                except Exception:
                     st.code(mermaid_src, language="mermaid")
 
             if src.get("img_url") or src.get("img_path"):

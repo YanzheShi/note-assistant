@@ -353,7 +353,7 @@ def test_make_image_enricher_decorative_skips_vlm(tmp_path, monkeypatch):
         calls.append(1)
         return _VALID_JSON
 
-    U._default_vlm_call = fake_vlm
+        U._default_vlm_call = fake_vlm
     try:
         # G6：enricher 总开关默认 False，这里显式开启以验证装饰图跳过 VLM
         monkeypatch.setattr("note_assistant.config.settings.image_understand_enabled", True)
@@ -363,6 +363,59 @@ def test_make_image_enricher_decorative_skips_vlm(tmp_path, monkeypatch):
         ext = _img_ext(src=str(p))
         out = enricher(ext, "章节")
         assert out is None  # 装饰图 → 降级，不调 VLM
+        assert calls == []
+    finally:
+        U._default_vlm_call = orig
+
+
+# ───────────────── register-only 路由（G6 关闭：不 VLM 但注册资产，2026-08-31）─────────────────
+def test_make_image_enricher_disabled_registers_asset(tmp_path, monkeypatch):
+    """总开关关闭（默认）时：零 VLM、零网络，但本地 raster 图注册 asset_id/img_url。
+
+    2026-08-31：此前关闭 = 纯 no-op，raster 图 chunk 无资产定位 → [[IMG:]]
+    无法替换。注册与理解解耦：摘要保持 alt+上下文兜底格式，资产落盘 assets_dir。
+    """
+    import note_assistant.indexing.understanding as U
+
+    calls = []
+    orig = U._default_vlm_call
+
+    def fake_vlm(*a, **k):
+        calls.append(1)
+        return _VALID_JSON
+
+    U._default_vlm_call = fake_vlm
+    try:
+        # 显式压成 False：本仓库 .env 可能开了 IMAGE_UNDERSTAND_ENABLED（load_dotenv
+        # 进 os.environ），不显式压会走 VLM 路由而非 register-only
+        monkeypatch.setattr("note_assistant.config.settings.image_understand_enabled", False)
+        monkeypatch.setattr("note_assistant.config.settings.assets_dir", tmp_path / "assets")
+        enricher = make_image_enricher(tmp_path)
+
+        # 1) 本地非装饰 raster 图：注册资产、保持默认摘要
+        p = tmp_path / "arch.png"
+        _write_png(p, 200, 150)  # 非装饰（>100x100）
+        ext = _img_ext(src=str(p), alt="架构图", context="前文")
+        out = enricher(ext, "章节")
+        assert out is not None
+        summary, meta = out
+        assert calls == []  # 零 VLM 调用
+        assert summary.startswith("图片: ") and "架构图" in summary  # 默认摘要格式
+        assert meta["asset_id"] and meta["img_url"] == f"/assets/{meta['asset_id']}"
+        # 资产落盘 assets_dir/<id>.png（content-hash 命名，供 /assets 端点）
+        saved = list((tmp_path / "assets").glob(f"{meta['asset_id']}.*"))
+        assert len(saved) == 1
+
+        # 2) 远程图：VLM 关闭时绝不下载（allow_remote_fetch 强制 False）
+        ext_remote = _img_ext(src="https://example.com/remote.png", alt="远程图")
+        assert enricher(ext_remote, "章节") is None
+        assert calls == []
+
+        # 3) 装饰图：不注册（与 VLM 路由同口径）
+        logo = tmp_path / "logo.png"
+        _write_png(logo, 40, 40)
+        ext_deco = _img_ext(src=str(logo), alt="logo")
+        assert enricher(ext_deco, "章节") is None
         assert calls == []
     finally:
         U._default_vlm_call = orig

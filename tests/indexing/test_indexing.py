@@ -339,6 +339,59 @@ title: Test
 
 
 # ================================================================
+# RichPreprocessor — bind_inline_images（资产回绑到内联图片的正文 chunk）
+# ================================================================
+class TestBindInlineImages:
+    _MD = """---
+title: Test
+---
+
+# 标题
+
+![架构图](assets/arch.svg)
+
+正文一段。
+"""
+
+    def _processed(self, tmp_path, image_enricher=None):
+        """跑完「抽取 → 还原 → 富结构摘要」三步，返回 (正文 chunks, summaries)。"""
+        node = _make_node(tmp_path, "bind.md", self._MD)
+        pp = RichPreprocessor(image_enricher=image_enricher)
+        cleaned, _ = pp.process_with_meta(node)
+        chunks = pp.restore([Chunk(page_content=cleaned, metadata={"kind": "text"})])
+        summaries = pp.generate_summaries()
+        return pp, chunks, summaries
+
+    def test_binds_asset_to_text_chunk(self, tmp_path):
+        """enricher 富化后，正文 chunk 必须拿到 /assets 定位（否则面板只剩裸相对路径）"""
+        def enricher(ext, heading_path):
+            return "SVG 图: 输入→输出", {
+                "asset_id": "c2db18fdd53c6bb9",
+                "img_url": "/assets/c2db18fdd53c6bb9",
+                "render_hint": "svg:inline",
+                "trust": "svg",
+            }
+
+        pp, chunks, summaries = self._processed(tmp_path, image_enricher=enricher)
+        pp.bind_inline_images(chunks)
+
+        md = chunks[0].metadata
+        assert md["img_url"] == "/assets/c2db18fdd53c6bb9"
+        assert md["asset_id"] == "c2db18fdd53c6bb9"
+        assert md["render_hint"] == "svg:inline"
+        # summary chunk 自身的定位不被改写
+        assert summaries[0].metadata["img_url"] == "/assets/c2db18fdd53c6bb9"
+
+    def test_noop_without_asset(self, tmp_path):
+        """未富化（装饰图 / 取图失败 / 开关关闭）时不绑定，绝不凭空造 URL"""
+        pp, chunks, _ = self._processed(tmp_path)
+        pp.bind_inline_images(chunks)
+
+        assert "img_url" not in chunks[0].metadata
+        assert "asset_id" not in chunks[0].metadata
+
+
+# ================================================================
 # RichPreprocessor — front_matter chunks
 # ================================================================
 class TestPreprocessorFrontMatter:

@@ -43,7 +43,11 @@ from note_assistant.retrieval.reranker import get_reranker
 from note_assistant.config import settings
 from note_assistant.llm.client import get_llm
 from note_assistant.retrieval.types import RetrievalResult
-from note_assistant.pipeline.image_answer import ensure_image_selected, expand_image_neighbors
+from note_assistant.pipeline.image_answer import (
+    ensure_image_selected,
+    expand_image_neighbors,
+    has_teachable_image_assets,
+)
 from note_assistant.security.guardrails import (
     append_guardrail,
     wrap_history_messages,
@@ -206,8 +210,16 @@ GENERATE_SYSTEM = (
     "3. 回答要简洁、结构化，使用 Markdown，并标注引用笔记标题。\n"
     "4. 参考笔记中标注【图片】的条目来自笔记里的插图，其内容由视觉模型解析得到。\n"
     "   - 引用图片信息时，说明\"根据笔记中的架构图/流程图\"，不要说\"根据文档描述\"\n"
-    "   - 如果图片信息对回答有帮助，在相应位置插入 [[IMG:asset_id]] 标记，系统会自动替换为图片\n"
     "   - 严禁描述图片解析结果中不存在的细节\n"
+)
+
+# 图片引用教学（2026-08-31 条件化）：只在生成上下文里存在可解析资产
+# （asset_id + img_url 双全，见 has_teachable_image_assets）时才追加。
+# 静态教学会诱导 LLM 对没有资产的图凭空编 id，产出 [[IMG:xxx]] 噪音。
+GENERATE_IMG_TEACHING = (
+    "\n5. 参考笔记中的图片条目若标注了「引用方式：如需引用此图，在回答中写 "
+    "[[IMG:asset_id]]」，且展示该图对回答有帮助，就在相应位置**原样**插入该标记，"
+    "系统会自动替换为图片。只能使用参考笔记中出现过的 asset_id，严禁编造。"
 )
 
 CHAT_SYSTEM = (
@@ -761,7 +773,12 @@ async def generate_node(state: AgentState) -> dict:
         note = "\n\n（注：已多次检索但知识库中相关信息有限，以下回答可能不完整。）\n"
     else:
         note = ""
-    msgs: list[BaseMessage] = [SystemMessage(append_guardrail(GENERATE_SYSTEM))]
+    # 2026-08-31：[[IMG:]] 教学条件化 —— 仅当生成上下文里存在可解析图片资产时追加，
+    # 避免诱导 LLM 对无资产图片编造标记（噪音 [[IMG:xxx]] 的根因之一）。
+    generate_system = GENERATE_SYSTEM
+    if has_teachable_image_assets(top_results):
+        generate_system += GENERATE_IMG_TEACHING
+    msgs: list[BaseMessage] = [SystemMessage(append_guardrail(generate_system))]
     # 预算裁剪后的历史（含长程摘要），与 agent/direct_chat 同源，避免重复
     history_msgs = state.get("history_messages") or _fmt_history(state["history"])
     msgs.extend(wrap_history_messages(history_msgs))

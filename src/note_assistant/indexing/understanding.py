@@ -453,12 +453,48 @@ def make_image_enricher(vault_path, *, cache: Optional[VisionCache] = None):
 
     取不到图 / 解析失败 / VLM 失败 → 返回 None，退化为默认摘要，绝不中断索引。
 
-    G6 总开关（image_understand_enabled，默认 False）：关闭时整体短路为 no-op，
-    图片只贡献 alt+上下文，零 VLM 调用、零副作用（与未启用图片理解前的逐字节等价）。
+    G6 总开关（image_understand_enabled，默认 False）：关闭时**不调 VLM、不走网络**，
+    但仍做本地资产注册（2026-08-31 起）：resolve_image 把 vault 内本地图片复制进
+    assets_dir 并写 asset_id/img_url 进 metadata，供 [[IMG:]] 渲染与 /assets 端点定位；
+    理解内容仍是 alt+上下文兜底（desc 不变）。装饰图不注册，与 VLM 路由同口径。
     """
     if not settings.image_understand_enabled:
-        # 总开关关：直接返回 no-op，绝不触碰磁盘/网络（不 resolve_image、不下载远程图）
-        return lambda ext, heading_path: None
+        # 总开关关：不调 VLM、不走网络，但仍做**本地资产注册**（2026-08-31）。
+        # 此前直接 no-op，raster 图 chunk 无 asset_id/img_url → [[IMG:]] 无法
+        # 替换、LLM 编造的 id 无真实资产可兜底 → 答案里裸标记噪音。
+        # 注册与理解解耦：有资产定位 ≠ 有视觉理解，desc 仍是 alt+上下文兜底，
+        # trust 由 preprocessor 标注 alt_fallback。零网络（远程图一律不下载）。
+        from note_assistant.indexing.assets import resolve_image
+
+        vault_path_str = str(vault_path) if vault_path else None
+
+        def register_only(ext, heading_path: str):
+            src = ext.meta.get("src") or ext.raw
+            res = resolve_image(
+                src,
+                vault_path=vault_path_str,
+                note_dir=ext.meta.get("note_dir") or None,
+                allow_remote_fetch=False,  # 零网络：VLM 关闭时绝不下载远程图
+                assets_dir=settings.assets_dir,
+                image_max_bytes=settings.image_max_bytes,
+                host_policy=settings.image_remote_fetch_host_policy,
+                host_allowlist=settings.image_remote_fetch_allowlist,
+            )
+            if not res.ok or res.asset is None:
+                return None
+            asset = res.asset
+            if grading_route(asset) == "decorative":
+                return None  # 装饰图：与 VLM 路由同口径，不注册、不打扰答案
+            alt = ext.meta.get("alt") or ""
+            desc = " | ".join(p for p in (alt, ext.context) if p)
+            summary = f"图片: {src} ({desc})" if desc else f"图片: {src}"
+            meta = {
+                "asset_id": asset.asset_id,
+                "img_url": f"/assets/{asset.asset_id}",
+            }
+            return summary, meta
+
+        return register_only
 
     from note_assistant.indexing.assets import resolve_image
 
@@ -468,7 +504,6 @@ def make_image_enricher(vault_path, *, cache: Optional[VisionCache] = None):
     if cache is None:
         cache = VisionCache(settings.vision_cache_path)
 
-    vault_path = str(vault_path) if vault_path else None
     budget = {"left": settings.image_vlm_max_calls_per_run}
 
     def enricher(ext, heading_path: str):

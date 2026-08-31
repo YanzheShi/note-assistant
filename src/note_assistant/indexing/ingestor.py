@@ -190,6 +190,12 @@ class Ingestor:
 
             # 5. 辅路：富结构 summary chunks（补 metadata + 前缀）
             summary_chunks = preprocessor.generate_summaries()
+            # 5a. 资产回绑：正文/父块内联的图片此刻只有一个裸相对路径，来源面板据此
+            #     渲染必 404。把 summary chunk 才算得出的 asset_id/img_url 绑回去，
+            #     让面板与答案正文共用 /assets 出口。必须在 generate_summaries 之后、
+            #     5c 写 docstore 之前。
+            preprocessor.bind_inline_images(chunks)
+            preprocessor.bind_inline_images(parents)
             for sc in summary_chunks:
                 sc.metadata["filepath"] = node.filepath
                 sc.metadata["title"] = node.title
