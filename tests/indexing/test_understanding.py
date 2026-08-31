@@ -235,6 +235,27 @@ def test_resolve_missing(tmp_path):
     assert not res.ok
 
 
+def test_resolve_relative_to_note_dir(tmp_path):
+    """相对附件按「笔记所在目录」解析（回归：只按 vault 根会让笔记旁 assets/ 全落空）。"""
+    note_dir = tmp_path / "note"
+    (note_dir / "assets").mkdir(parents=True)
+    png = _write_png(note_dir / "assets" / "arch.png")
+
+    # vault 相对的 note_dir
+    res = resolve_image("assets/arch.png", vault_path=tmp_path, note_dir="note")
+    assert res.ok and res.asset.source_kind == "local"
+    # 绝对 note_dir（无 vault_path 也能用）
+    assert resolve_image("assets/arch.png", note_dir=str(note_dir)).ok
+    # 不传 note_dir：维持原「只按 vault 根」行为，纯追加不改旧语义
+    assert not resolve_image("assets/arch.png", vault_path=tmp_path).ok
+
+    # 两处同名时笔记目录优先——否则会取错图
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "arch.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"root")
+    res2 = resolve_image("assets/arch.png", vault_path=tmp_path, note_dir="note")
+    assert res2.ok and res2.asset.data == png
+
+
 def test_resolve_too_large(tmp_path):
     p = tmp_path / "big.png"
     _write_png(p, 200, 150)

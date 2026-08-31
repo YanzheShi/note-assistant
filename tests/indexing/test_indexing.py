@@ -141,6 +141,31 @@ title: Test
         assert len(pp.extracted) == 1
         assert pp.extracted[0].kind == "image"
 
+    def test_extract_image_meta_carries_note_dir(self, tmp_path):
+        """图片 meta 记录笔记所在目录，供下游按「相对笔记」解析附件。
+
+        回归：Obsidian 把图放在笔记旁的 assets/ 目录，只记 src 不记目录 → 索引期
+        取不到图 → chunk 没有 asset_id → 答案里只剩裸的 [[IMG:...]] 标记。
+        """
+        node = _make_node(tmp_path, Path("系统设计题") / "note.md", """---
+title: Test
+---
+
+# 标题
+
+![架构图](assets/arch.svg)
+
+正文。
+""")
+        pp = RichPreprocessor()
+        pp.process_with_meta(node)
+
+        ext = pp.get_extracted("image")[0]
+        assert ext.meta["src"] == "assets/arch.svg"
+        assert ext.meta["note_dir"] == "系统设计题"
+        # 只在抽取期用于取图，不进 summary chunk 的 metadata
+        assert "note_dir" not in pp.generate_summaries()[0].metadata
+
     def test_no_extraction_for_plain_text(self, tmp_path):
         """纯文本不应触发任何抽取"""
         node = _make_node(tmp_path, "plain.md", """---

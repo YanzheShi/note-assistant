@@ -245,6 +245,28 @@ def _looks_like_image(data: bytes) -> bool:
     return False
 
 
+def _candidate_bases(
+    vault_path: Optional[Path], note_dir: Optional[str]
+) -> List[Path]:
+    """相对 src 的解析基准目录，按优先级排列：笔记所在目录 > vault 根。
+
+    Markdown 相对链接的语义是「相对所在笔记」，Obsidian 默认把附件放在笔记旁的
+    ``assets/`` 目录；只按 vault 根解析会让这类图整体落空（索引期取不到图 →
+    没有 asset_id → 前端只剩裸标记）。vault 根的旧口径保留为兜底，纯尾部追加，
+    原本能解析到的图行为不变。
+    """
+    bases: List[Path] = []
+    if note_dir:
+        nd = Path(note_dir)
+        if nd.is_absolute():
+            bases.append(nd)
+        elif vault_path is not None:
+            bases.append(Path(vault_path) / nd)
+    if vault_path is not None:
+        bases.append(Path(vault_path))
+    return bases
+
+
 def _write_cached(local_path: str, data: bytes) -> None:
     """先写临时文件再原子 rename，防半截文件。"""
     parent = os.path.dirname(local_path)
@@ -267,6 +289,7 @@ def resolve_image(
     src: str,
     *,
     vault_path: Optional[Path] = None,
+    note_dir: Optional[str] = None,
     allow_remote_fetch: bool = True,
     assets_dir: Optional[Path] = None,
     fetcher: Optional[Callable[[str], bytes]] = None,
@@ -279,6 +302,9 @@ def resolve_image(
     Args:
         src: 笔记里的地址（远程 URL / 相对路径 / Obsidian 短名）。
         vault_path: vault 根（用于相对路径与短名解析）。
+        note_dir: 该图片所在笔记的目录（绝对路径，或相对 ``vault_path`` 的路径）。
+            相对 ``src`` 优先按它解析——Markdown 附件的相对语义是相对笔记文件，
+            Obsidian 常把图放在笔记旁的 ``assets/`` 里。省略时退化为纯 vault 根口径。
         allow_remote_fetch: 隐私开关，False 时远程图直接判 missing。
         assets_dir: 远程图本地缓存目录；None 时远程图仅取内存不落盘。
         fetcher: 注入式下载函数（测试用）；默认 urllib。
@@ -330,16 +356,18 @@ def resolve_image(
             ),
         )
 
-    # ── 本地（绝对路径 / vault 相对 / 短名）──
+    # ── 本地（绝对路径 / 笔记目录相对 / vault 相对 / 短名）──
     candidate: Optional[Path] = None
     as_path = Path(src)
     if as_path.is_absolute() and as_path.exists():
         candidate = as_path
-    elif vault_path is not None:
-        rel = Path(vault_path) / src
-        if rel.exists():
-            candidate = rel
-        else:
+    else:
+        for base in _candidate_bases(vault_path, note_dir):
+            p = base / src
+            if p.exists():
+                candidate = p
+                break
+        if candidate is None and vault_path is not None:
             # Obsidian 短名：![[x.png]] → 全局唯一文件名解析
             idx = AttachmentIndex(vault_path)
             resolved = idx.resolve(src)

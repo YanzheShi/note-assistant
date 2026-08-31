@@ -477,6 +477,7 @@ def make_image_enricher(vault_path, *, cache: Optional[VisionCache] = None):
         res = resolve_image(
             src,
             vault_path=vault_path,
+            note_dir=ext.meta.get("note_dir") or None,
             allow_remote_fetch=settings.image_allow_remote_fetch,
             assets_dir=settings.assets_dir,
             image_max_bytes=settings.image_max_bytes,

@@ -1,9 +1,23 @@
 import re
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from note_assistant.indexing.types import DocNode, ExtractedChunk, Chunk
+
+
+def _normalize_note_dir(note_dir: str) -> str:
+    """归一化笔记所在目录：vault 根（pathlib 给 ``.``）统一成空串，分隔符统一为 ``/``。"""
+    d = (note_dir or "").strip().replace("\\", "/")
+    if d in (".", "", "/"):
+        return ""
+    return d.strip("/")
+
+
+def _note_dir_of(filepath: str) -> str:
+    """从笔记路径取所在目录，保持「相对 vault 根」口径（join 动作交给 resolve_image）。"""
+    return _normalize_note_dir(str(Path(filepath or "").parent))
 
 
 # 所有占位符的统一形态（uuid4().hex[:8] → 8 位十六进制）。
@@ -39,6 +53,10 @@ class RichPreprocessor:
         """
         self.extracted: list[ExtractedChunk] = []
         self._image_enricher = image_enricher
+        # 当前笔记在 vault 内的所在目录（相对 vault 根，根目录为空串）。
+        # Markdown 相对链接的语义是「相对所在笔记」，Obsidian 附件常放在笔记旁的
+        # assets/ 目录里；不带这个信息，下游取图只能按 vault 根解析而整体落空。
+        self._note_dir: str = ""
         # placeholder → heading_path，在 restore() 阶段回填。
         # 富结构被抽走时还不知道它落在哪一节，只有切分后的 chunk 才带 heading_path，
         # 因此由 restore() 反查，供 generate_summaries() 给 summary chunk 补章节定位。
@@ -48,10 +66,17 @@ class RichPreprocessor:
     # 主入口
     # ──────────────────────────────────────────────
 
-    def process(self, md_text: str) -> str:
-        """将富结构替换为占位符，返回清洗后的文本"""
+    def process(self, md_text: str, *, note_dir: str = "") -> str:
+        """将富结构替换为占位符，返回清洗后的文本
+
+        Args:
+            md_text: 笔记原始 markdown
+            note_dir: 该笔记在 vault 内的所在目录（相对 vault 根；根目录传空串）。
+                图片抽取时记下它，供下游按「相对笔记」而非「相对 vault 根」解析附件。
+        """
         self.extracted = []
         self._placeholder_heading = {}
+        self._note_dir = _normalize_note_dir(note_dir)
         text = md_text
 
         # P1: 抽取 Mermaid（必须在 code fence 保护之前！否则 ```mermaid 会被
@@ -79,7 +104,7 @@ class RichPreprocessor:
         返回: (cleaned_text, extra_chunks)
             extra_chunks: list[Chunk] — front_matter 衍生的可检索 chunk
         """
-        cleaned = self.process(node.raw_md)
+        cleaned = self.process(node.raw_md, note_dir=_note_dir_of(node.filepath))
         extra_chunks = self._build_front_matter_chunks(node.front_matter)
         return cleaned, extra_chunks
 
@@ -345,11 +370,13 @@ class RichPreprocessor:
         """
         抽取图片，保留上下文作为描述。
 
-        两个关键约定（P0 修复）：
+        关键约定：
         1. `raw` 存**完整 markdown 语法**（`![alt](path)` / `![[embed]]`），而不是裸路径——
            否则 restore() 还原出来是一段孤零零的路径字符串，渲染语法永久丢失。
         2. 占位符**独立成 token**（不再拼 `": {alt}"` 尾巴），否则 restore 后会变成
            `![alt](path): alt` 的重复文本。alt 已通过 `meta` 结构化承载。
+        3. `meta.note_dir` 记下笔记所在目录——附件 `src` 的相对语义是相对笔记文件，
+           下游 enricher 取图必须靠它，否则笔记旁的 `assets/x.svg` 永远解析不到。
         """
         def replace_fn(m):
             uid = f"[IMAGE_UID_{uuid.uuid4().hex[:8]}]"
@@ -357,7 +384,7 @@ class RichPreprocessor:
             raw_target = embed or link or ""
             # Obsidian 尺寸后缀：![[img.png|300]] / ![[img.png|300x200]]
             src, _, dims = raw_target.partition("|")
-            meta = {"src": src.strip(), "alt": (alt or "").strip()}
+            meta = {"src": src.strip(), "alt": (alt or "").strip(), "note_dir": self._note_dir}
             if dims.strip():
                 meta["dims"] = dims.strip()
             # 前后 context_window 字符作为上下文；洗掉前序阶段留下的 code/table/mermaid 占位符
