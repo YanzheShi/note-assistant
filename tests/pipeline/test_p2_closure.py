@@ -170,7 +170,7 @@ class TestAskStreamPostprocess:
                     yield t
 
         chain = RAGChain(FakeRetriever(), FakeReranker(), None, FakeGenerator())
-        chain._needs_retrieval = _async_true
+        chain._needs_retrieval_async = _async_true
         chain._needs_retrieval_sync = lambda q: True
         return chain
 
@@ -191,11 +191,14 @@ class TestAskStreamPostprocess:
 
     @pytest.mark.asyncio
     async def test_stream_no_duplicate_emission(self):
-        # 不能既流原文、又在末尾整段补发一次（会重复）
+        # 不能既流原文、又在末尾整段补发一次（会重复）；
+        # 无 [[IMG:]] 标记时流末确定性补图（另一道护栏），核心文本仍只能出现一次
         tokens = ["纯", "文本", "回答"]
         chain = self._chain(tokens)
         text, _ = await self._collect(chain.ask_stream("架构图长什么样"))
-        assert text == "纯文本回答"
+        assert text.startswith("纯文本回答")
+        assert text.count("纯文本回答") == 1   # 核心文本不重复（回归点）
+        assert "![架构图](/assets/abc123def4567890)" in text
 
     @pytest.mark.asyncio
     async def test_trace_stream_replaces_marker(self):

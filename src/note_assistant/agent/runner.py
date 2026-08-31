@@ -248,6 +248,9 @@ def _initial_state(
         # 安全（L2/L3）：会话注入命中计数 + 已浮现笔记白名单
         "allowed_files": set(),
         "injection_hits": 0,
+        # 兜底强制检索（2026-08-31）：本轮是否真检索过 + 兜底次数（防循环）
+        "searched_once": False,
+        "force_search_tries": 0,
     }
 
 
@@ -674,6 +677,17 @@ async def astream(
                           "content": f"🔄 出口重排：全局精排后保留 top-{len(new_acc)} 片段用于生成"}
                 else:
                     ev = {"type": "thought", "content": "🔄 出口重排：未启用，跳过"}
+            elif node == "force_search":
+                # 兜底强制检索：LLM 本轮未主动调用工具时代码层补检（只改 accumulated，
+                # 无 ToolMessage），发 observation 事件让前端/轨迹可观测。
+                new_acc = update.get("accumulated")
+                if new_acc is not None:
+                    added = len(new_acc) - len(accumulated)
+                    accumulated = new_acc
+                    ev = {"type": "observation",
+                          "content": f"🔍 兜底强制检索：本轮 LLM 未调用检索工具，已代码层补检，新增 {added} 个片段"}
+                else:
+                    ev = {"type": "observation", "content": "🔍 兜底强制检索：未命中新片段"}
 
             if ev is not None:
                 yield ev

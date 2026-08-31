@@ -82,6 +82,7 @@ async def test_condense_success_uses_llm(monkeypatch):
 async def test_condense_degrades_without_llm(monkeypatch):
     # 真实 LLM 不可用（get_llm 返回 None）→ 降级走零模型兜底（方案1 历史增强），不抛异常
     monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: None)
+    monkeypatch.setattr("note_assistant.llm.client.get_condense_llm", lambda *a, **k: None)  # 5df66f9 专属入口，须一并拦截
     cm = ContextManager(condense_llm=None)
     out = await cm.condense_question(
         "它有什么优点？", [{"role": "user", "content": "FlashAttention 是什么"}]
@@ -172,6 +173,7 @@ async def test_plan0_no_false_positive_on_qi_compound():
 async def test_plan1_history_augmented_fallback(monkeypatch):
     # LLM 不可用（get_llm 返回 None）+ 有历史 → 降级返回「历史增强」版 query（方案1）
     monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: None)
+    monkeypatch.setattr("note_assistant.llm.client.get_condense_llm", lambda *a, **k: None)  # 5df66f9 专属入口，须一并拦截
     cm = ContextManager(condense_llm=None)
     hist = [
         {"role": "user", "content": "FlashAttention 比标准注意力快吗"},
@@ -187,6 +189,7 @@ async def test_plan1_history_augmented_fallback(monkeypatch):
 async def test_plan3_last_entity_resolves_pronoun(monkeypatch):
     # 方案3：LLM 不可用 + 已记 last_entity → 代词被规则替换为实体（零模型）
     monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: None)
+    monkeypatch.setattr("note_assistant.llm.client.get_condense_llm", lambda *a, **k: None)  # 5df66f9 专属入口，须一并拦截
     cm = ContextManager(condense_llm=None)
     cm.record_turn(
         "s1",

@@ -13,11 +13,20 @@
 状态图：
     START → router
     router --search--> agent ; router --chat--> direct_chat
-    agent --tool_calls--> tools ; agent --回答--> generate
-    tools → reflect（Judge）
-    reflect --sufficient/give_up/达上限--> generate
+    agent --tool_calls--> tools
+    agent --无 tool_calls 且本轮未检索过--> force_search（代码兜底检索，非 LLM 决策）
+    agent --无 tool_calls 且已检索过/兜底已用尽--> generate
+    tools / force_search → 公共下游（graph_expand → rerank_loop → reflect）
+    reflect --sufficient/give_up/达上限--> rerank_exit → generate
     reflect --need_rewrite/need_more--> rewrite → agent
-    generate/direct_chat → END
+    generate/direct_chat/clarify → END
+
+兜底强制检索（force_search，2026-08-31）：
+    多轮会话里 agent_node 的 LLM 看到 history 中自己上一轮的长答案后，常误以为
+    「资料已经有了」而直接输出纯文本（无 tool_calls）。旧行为直落 generate，
+    导致本轮**零检索**——生成只能吃上一轮 seed 衰减后的陈旧片段，表现为所有问题
+    都答「当前不包含」。该缺陷靠改 prompt 无法根治（LLM 不一定听），故在代码层
+    确定性兜底：路由判检索但本轮未检索过 → 强制执行一次 hybrid_search。
 """
 import json
 import operator
@@ -92,6 +101,9 @@ class AgentState(TypedDict):
     # === 安全（docs/prompt-injection-defense-design.md）===
     allowed_files: set                           # L3：本会话已浮现的 filepath 白名单（get_note/filtered_search 门禁）
     injection_hits: int                          # L2：会话内注入形状命中累计（升级护栏阈值用）
+    # === 兜底强制检索（2026-08-31 修「多轮后全部答当前不包含」）===
+    searched_once: bool                          # 本轮是否真的执行过检索（tools_node / force_search 置 True）
+    force_search_tries: int                      # force_search 已兜底次数（防循环，每请求上限 1 次）
 
 
 # ──────────────────────────────────────────────
@@ -108,13 +120,15 @@ AGENT_SYSTEM_PROMPT = (
     "- filtered_search(query, filepath, heading, tag, top_k)：按元数据过滤后再检索。\n"
     "- get_note(filepath)：读取整篇笔记的全部片段。\n\n"
     "工作规则：\n"
-    "1. 需要查知识库时，优先调用 hybrid_search。\n"
-    "2. 若已命中笔记之间有双链关联、或需要更多上下文，调用 graph_expand 扩展。\n"
-    "3. 当 hybrid 效果不佳时，尝试单独 vector_search / bm25_search 或 filtered_search 缩小范围。\n"
-    "4. 一轮检索通常足够；只有证据明显不足或问题含多个子话题时，才再次检索"
+    "1. 本轮尚未执行过任何检索时，必须先调用一次 hybrid_search 检索再作答；"
+    "禁止仅凭历史对话或自己上一轮的答案直接输出结论。\n"
+    "2. 需要查知识库时，优先调用 hybrid_search。\n"
+    "3. 若已命中笔记之间有双链关联、或需要更多上下文，调用 graph_expand 扩展。\n"
+    "4. 当 hybrid 效果不佳时，尝试单独 vector_search / bm25_search 或 filtered_search 缩小范围。\n"
+    "5. 一轮检索通常足够；只有证据明显不足或问题含多个子话题时，才再次检索"
     f"（最多 {MAX_ITER} 轮）。\n"
-    "5. 证据充分后，直接作答：基于笔记内容、不编造、用 Markdown 结构化，并标注引用笔记标题。\n"
-    "6. 若多次检索后仍无相关内容，明确告知用户知识库中缺少该信息。\n"
+    "6. 证据充分后，直接作答：基于笔记内容、不编造、用 Markdown 结构化，并标注引用笔记标题。\n"
+    "7. 若多次检索后仍无相关内容，明确告知用户知识库中缺少该信息。\n"
 )
 
 ROUTER_SYSTEM = (
@@ -532,6 +546,62 @@ async def tools_node(state: AgentState) -> dict:
         "iteration": state["iteration"] + 1,
         "allowed_files": allowed,
         "injection_hits": injection_hits,
+        "searched_once": True,
+    }
+
+
+async def force_search_node(state: AgentState) -> dict:
+    """兜底强制检索（2026-08-31）：LLM 多轮下直接纯文本作答（无 tool_calls）时，
+    由代码层强制执行一次 hybrid_search，保证本轮至少有一次真实检索。
+
+    与 ``tools_node`` 的差异：
+      - 不依赖 LLM 决策，直接 ``run_tool_call("hybrid_search", ...)``（含 retry/fallback）；
+      - 结果按 identity_key 去重并入 accumulated，补 allowed_files 白名单 + L2 注入扫描；
+      - ``force_search_tries = 1``：每请求兜底上限 1 次，防 agent 反复短路空转；
+      - 不 +1 iteration：避免提前撞 ``MAX_ITER``，挤占正常 rewrite/retry 轮次；
+      - 不生成 ToolMessage：结果只进 accumulated（reflect / generate 均只读 accumulated），
+        不回喂 LLM，避免幽灵 tool_call_id 污染 LLM 上下文；可观测性由 runner 的
+        ``astream`` 分支 + 本节点日志承担。
+    """
+    import asyncio
+
+    q = state.get("condensed_question") or state["question"]
+    args = {"query": q, "top_k": settings.top_k_retrieve}
+    logger.info("force_search.start", extra={"query_preview": q[:60]})
+    try:
+        obs_text, results = await asyncio.to_thread(run_tool_call, "hybrid_search", args)
+    except Exception:  # noqa: BLE001  run_tool_call 自带兜底，理论上到不了这里
+        logger.warning("force_search.run_failed", exc_info=True)
+        obs_text, results = "", []
+    accumulated = list(state.get("accumulated") or [])
+    seen = {r.identity_key() for r in accumulated}
+    new_before = len(accumulated)
+    allowed = set(state.get("allowed_files") or set())
+    injection_hits = int(state.get("injection_hits", 0))
+    for r in results:
+        key = r.identity_key()
+        if key not in seen:
+            seen.add(key)
+            accumulated.append(r)
+        # L2 注入扫描 + L3 白名单（与 tools_node 同规）
+        _, n = sanitize_text(r.page_content, source=r.filepath)
+        injection_hits += n
+        if r.filepath:
+            allowed.add(r.filepath)
+    logger.info(
+        "force_search.done",
+        extra={
+            "results_added": len(accumulated) - new_before,
+            "accumulated_total": len(accumulated),
+            "obs_len": len(obs_text),
+        },
+    )
+    return {
+        "accumulated": accumulated,
+        "allowed_files": allowed,
+        "injection_hits": injection_hits,
+        "force_search_tries": 1,
+        "searched_once": True,
     }
 
 
@@ -853,6 +923,15 @@ def _agent_branch(state: AgentState) -> str:
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.tool_calls:
         return "tools"
+    # 兜底强制检索（2026-08-31 修「多轮后全部答当前不包含」）：
+    # 路由判检索、但本轮尚未真正检索过、且兜底未用过 → 代码层补检，不靠 LLM 自觉。
+    # searched_once 缺失（旧 state / 未初始化）视为未检索过 → 也会触发兜底，符合预期。
+    if (
+        state.get("route") == "search"
+        and not state.get("searched_once")
+        and int(state.get("force_search_tries", 0)) < 1
+    ):
+        return "force_search"
     return "generate"
 
 
@@ -945,6 +1024,7 @@ def build_graph():
     g.add_node("router", _timed_node("router", router))
     g.add_node("agent", _timed_node("agent", agent_node))
     g.add_node("tools", _timed_node("tools", tools_node))
+    g.add_node("force_search", _timed_node("force_search", force_search_node))
     g.add_node("graph_expand_node", _timed_node("graph_expand_node", graph_expand_node))
     g.add_node("rerank_loop", _timed_node("rerank_loop", rerank_loop))
     g.add_node("reflect", _timed_node("reflect", reflect))
@@ -959,9 +1039,19 @@ def build_graph():
         "router", _route_branch, {"search": "agent", "chat": "direct_chat"}
     )
     g.add_conditional_edges(
-        "agent", _agent_branch, {"tools": "tools", "generate": "generate"}
+        "agent",
+        _agent_branch,
+        {"tools": "tools", "force_search": "force_search", "generate": "generate"},
     )
-    g.add_edge("tools", "graph_expand_node" if settings.agent_graph_expand_enabled else               ("rerank_loop" if settings.agent_reranker_loop_enabled else "reflect"))
+    # tools / force_search 共用同一公共下游（graph_expand → rerank_loop → reflect）：
+    # 兜底检索结果同样过 rerank + Judge，不裸奔进生成。
+    _tools_downstream = (
+        "graph_expand_node"
+        if settings.agent_graph_expand_enabled
+        else ("rerank_loop" if settings.agent_reranker_loop_enabled else "reflect")
+    )
+    g.add_edge("tools", _tools_downstream)
+    g.add_edge("force_search", _tools_downstream)
     g.add_edge("graph_expand_node", "rerank_loop" if settings.agent_reranker_loop_enabled else "reflect")
     g.add_edge("rerank_loop", "reflect")
     g.add_conditional_edges(

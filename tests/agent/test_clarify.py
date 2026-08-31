@@ -440,6 +440,9 @@ def e2e(monkeypatch):
     agent_mod.build_graph.cache_clear()
     set_context_manager_for_test(None)
     monkeypatch.setattr("note_assistant.llm.client.get_llm", lambda *a, **k: _ClarifyAgentLLM())
+    # 5df66f9 新增凝练专属入口，不拦则 condense 走真实 LLM 消解成功（置信度 1.0），
+    # clarify 前提（低置信度）永远不成立 → 反问测试恒失败
+    monkeypatch.setattr("note_assistant.llm.client.get_condense_llm", lambda *a, **k: _ClarifyAgentLLM())
     monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _ClarifyAgentLLM())
     monkeypatch.setattr(agent_mod, "run_tool_call", _fake_tool)
     reset_cache()

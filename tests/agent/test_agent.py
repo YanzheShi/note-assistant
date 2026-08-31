@@ -226,8 +226,9 @@ async def test_agent_node_uses_condensed_question(monkeypatch):
     msgs = _CaptureLLM.captured
     user_msgs = [m for m in msgs if isinstance(m, HumanMessage)]
     assert user_msgs, "agent_node 必须向 LLM 发送用户问题"
-    # 用户问题应为凝练版，而非原始未消解的「它有什么缺点？」
-    assert user_msgs[0].content == "FlashAttention 有什么缺点？"
+    # 用户问题应为凝练版（而非原始未消解的「它有什么缺点？」），
+    # 且被 wrap_user_question 包裹（9b74db9 防注入：唯一权威指令块）
+    assert user_msgs[0].content == "<user_question>FlashAttention 有什么缺点？</user_question>"
     assert HumanMessage("它有什么缺点？") not in msgs
 
 
@@ -249,8 +250,8 @@ async def test_agent_node_keeps_in_run_messages(monkeypatch):
     }
     await agent_node(state)
     msgs = _CaptureLLM.captured
-    # 凝练问题注入，且本轮内的工具调用 / 观察顺序保留
-    assert HumanMessage("FlashAttention 有什么缺点？") in msgs
+    # 凝练问题注入（带 wrap_user_question 包裹），且本轮内的工具调用 / 观察顺序保留
+    assert HumanMessage("<user_question>FlashAttention 有什么缺点？</user_question>") in msgs
     assert any(isinstance(m, ToolMessage) and m.content == "obs" for m in msgs)
     # 原始未消解问题不应再出现
     assert HumanMessage("它有什么缺点？") not in msgs
