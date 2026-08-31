@@ -20,6 +20,7 @@ from note_assistant.agent.context import CondenseSignal, get_context_manager
 from note_assistant.agent.store import AgentStore
 from note_assistant.config import settings
 from note_assistant.pipeline.image_answer import append_missing_images, postprocess_answer
+from note_assistant.pipeline.source_kind import classify_source
 from note_assistant.security.output_guard import check_prompt_leakage, neutralize_remote_media
 from note_assistant.retrieval.types import RetrievalResult
 from note_assistant.llm.usage import get_token_handler
@@ -131,15 +132,26 @@ def _sources_from_results(results: List[RetrievalResult]) -> List[dict]:
     out = []
     for r in ranked:
         meta = r.metadata if isinstance(r.metadata, dict) else {}
+        # 与 naive /ask 链路（SourceInfo.from_result）同源富解析：classify_source
+        # 从正文嗅探 + metadata 回退抽出 mermaid/表格/图片渲染载荷。
+        # 之前这里只裸透传 metadata，agentic 来源缺 preview/raw_mermaid/raw_table，
+        # 前端 mermaid/表格/图片渲染分支全部触发不了（同坑见设计 9.2 图片字段）。
+        rich = classify_source(r.page_content, meta)
         out.append({
             "filepath": r.filepath,
-            "title": r.metadata.get("title", ""),
-            "heading": r.metadata.get("heading_path", ""),
+            "title": meta.get("title", ""),
+            "heading": meta.get("heading_path", ""),
+            "preview": (r.page_content or "")[:200],
             "score": round(r.score, 4),
-            # 设计 9.2 /agent 适配项：把图片渲染字段透传给前端
-            "kind": str(meta.get("kind") or "text"),
-            "img_url": meta.get("img_url") or None,
-            "render_hint": meta.get("render_hint") or None,
+            "kind": rich["kind"],
+            # 渲染载荷：能抽就抽，前端按字段有无决定渲染什么
+            "raw_table": rich["raw_table"] or None,
+            "raw_mermaid": rich["raw_mermaid"] or None,
+            "render_hint": rich["render_hint"] or None,
+            "diagram_type": rich["diagram_type"] or None,
+            "img_path": rich["img_path"] or None,
+            "asset_id": rich["asset_id"] or None,
+            "img_url": rich["img_url"] or None,
         })
     return out
 

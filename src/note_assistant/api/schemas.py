@@ -145,8 +145,15 @@ class AgentSource(BaseModel):
     filepath: str = ""
     title: str = ""
     heading: str = ""
+    preview: str = ""                        # 正文摘要预览（page_content 截断，与 SourceSchema 对齐）
     score: Optional[float] = None
     kind: str = "text"                       # text | table | mermaid | image
+    # 渲染载荷：与 SourceSchema 对齐（naive /ask 链路同款），agentic 来源也能渲染 mermaid/表格/图片
+    raw_table: Optional[str] = None          # 仅 table 类型
+    raw_mermaid: Optional[str] = None        # 仅 mermaid 类型
+    diagram_type: Optional[str] = None       # graph TD / sequenceDiagram / classDiagram ...
+    img_path: Optional[str] = None           # 图片在 Obsidian vault 中的路径
+    asset_id: Optional[str] = None           # 图片资产内容哈希 id（供 /assets 端点定位）
     img_url: Optional[str] = None            # 图片服务 URL（/assets/{asset_id}）
     render_hint: Optional[str] = None        # mermaid:inline / svg:inline / image:...
 
