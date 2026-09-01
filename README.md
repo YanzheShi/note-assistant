@@ -512,7 +512,23 @@ note-assistant/
 
 > 注：naive 链路无语义缓存字段（`None`）；agent 链路语义缓存在本 10 题 run 命中 0 次。
 
-### 10.3 部署
+### 10.3 切块策略 & Rerank Loop 可视化对比
+
+两份交互式评测报告（横向对比 HTML），配合下方两张摘要图可快速把握结论：
+
+- **切块策略对比**（v2 vs v2b × 500/800 子块，variant A）：[`eval/report/chunk_strategy_compare.html`](eval/report/chunk_strategy_compare.html)
+- **Rerank Loop 对比**（run3：A=rerank+图扩展 / B=关 rerank loop / C=naive 基线 / D=关图扩展）：[`eval/report/run3/rerank_ab_compare.html`](eval/report/run3/rerank_ab_compare.html)
+
+![切块策略对比摘要](eval/report/chunk_strategy_summary.svg)
+
+![Rerank Loop 对比摘要](eval/report/rerank_ab_summary.svg)
+
+**核心结论**
+
+- **切块策略**：v2b（父子分块）因 `_expand_to_parents` 把命中子块回退为整节父块喂给 LLM，检索召回/MRR 更优，但父块噪声拉低了生成准确率（0.68/0.76）与忠实度；v2 直接喂 500/800 字切片反而更干净。综合准确率、忠实度与耗时，**推荐 `v2_800_150`** 作为默认（准确率 0.81、MRR 0.683、约 11.3s/题）。
+- **Rerank Loop**：rerank loop 与图扩展均对质量正向贡献——关循环（B）准确率骤降至 0.44，关图扩展（D）recall@10 仅 0.10；A 质量最佳（0.79）但最慢（16.8s），C 是性价比快速基线（5.2s）。生产默认保留 rerank loop + 图扩展开启。
+
+### 10.4 部署
 
 后端 FastAPI 可经 `uvicorn` 直接运行对外提供问答服务，前端 Streamlit 通过 CORS 访问 `/agent/*` 端点。索引产物在 `data/`，模型权重在 `models/`，运行需注意将 `VAULT_PATH`、模型路径与 `AGENT_*` 凭据注入运行环境。
 

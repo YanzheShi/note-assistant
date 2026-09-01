@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 400" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+  <rect width="680" height="400" fill="#ffffff"/>
+  <text x="24" y="34" font-size="18" font-weight="700" fill="#0f172a">Rerank Loop 对比（run3 · A/B/C/D）</text>
+  <text x="24" y="56" font-size="12" fill="#64748b">A=rerank+图扩展 · B=关 rerank loop · C=naive 基线 · D=关图扩展；横轴为生成准确率</text>
+
+  <!-- A -->
+  <text x="20" y="112" font-size="13" font-weight="600" fill="#0f172a">A rerank+expand</text>
+  <rect x="150" y="92" width="307" height="30" rx="4" fill="#3b82f6"/>
+  <text x="467" y="113" font-size="14" font-weight="700" fill="#1d4ed8">0.79</text>
+  <text x="150" y="138" font-size="11" fill="#64748b">recall@10 0.30 · 耗时 16.8s ★质量最好</text>
+
+  <!-- B -->
+  <text x="20" y="182" font-size="13" font-weight="600" fill="#0f172a">B 关rerank loop</text>
+  <rect x="150" y="162" width="171" height="30" rx="4" fill="#f43f5e"/>
+  <text x="331" y="183" font-size="14" font-weight="700" fill="#be123c">0.44</text>
+  <text x="150" y="208" font-size="11" fill="#64748b">recall@10 0.15 · 耗时 16.2s · 关循环后骤降</text>
+
+  <!-- C -->
+  <text x="20" y="252" font-size="13" font-weight="600" fill="#0f172a">C naive 基线</text>
+  <rect x="150" y="232" width="229" height="30" rx="4" fill="#14b8a6"/>
+  <text x="389" y="253" font-size="14" font-weight="700" fill="#0f766e">0.59</text>
+  <text x="150" y="278" font-size="11" fill="#64748b">recall@10 0.30 · 耗时 5.2s · 快速基线</text>
+
+  <!-- D -->
+  <text x="20" y="322" font-size="13" font-weight="600" fill="#0f172a">D 关图扩展</text>
+  <rect x="150" y="302" width="222" height="30" rx="4" fill="#8b5cf6"/>
+  <text x="382" y="323" font-size="14" font-weight="700" fill="#6d28d9">0.57</text>
+  <text x="150" y="338" font-size="11" fill="#64748b">recall@10 0.10 · 耗时 11.2s · 关图扩展召回最低</text>
+
+  <rect x="20" y="352" width="640" height="38" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="32" y="376" font-size="12" fill="#1e40af"><tspan font-weight="700">结论：</tspan>rerank loop 与图扩展均正向贡献（B 关循环准确率跌至 0.44，D 关图扩展召回仅 0.10）；A 质量最佳但最慢，C 是性价比快速基线。</text>
+</svg>

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 400" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+  <rect width="680" height="400" fill="#ffffff"/>
+  <text x="24" y="34" font-size="18" font-weight="700" fill="#0f172a">切块策略对比（variant A · 10 题同数据集）</text>
+  <text x="24" y="56" font-size="12" fill="#64748b">子块 500/800 字 × 父子分块 v2b；横轴为生成准确率（accuracy）</text>
+
+  <!-- v2_500_100 -->
+  <text x="20" y="112" font-size="13" font-weight="600" fill="#0f172a">v2_500_100</text>
+  <rect x="150" y="92" width="0" height="30" fill="#e2e8f0"/>
+  <rect x="150" y="92" width="315" height="30" rx="4" fill="#3b82f6"/>
+  <text x="475" y="113" font-size="14" font-weight="700" fill="#1d4ed8">0.81</text>
+  <text x="150" y="138" font-size="11" fill="#64748b">MRR 0.667 · recall@10 0.517 · 耗时 16.0s</text>
+
+  <!-- v2_800_150 -->
+  <text x="20" y="182" font-size="13" font-weight="600" fill="#0f172a">v2_800_150</text>
+  <rect x="150" y="162" width="315" height="30" rx="4" fill="#3b82f6"/>
+  <text x="475" y="183" font-size="14" font-weight="700" fill="#1d4ed8">0.81</text>
+  <text x="150" y="208" font-size="11" fill="#64748b">MRR 0.683 · recall@10 0.517 · 耗时 11.3s ★推荐</text>
+
+  <!-- v2b_500_100 -->
+  <text x="20" y="252" font-size="13" font-weight="600" fill="#0f172a">v2b_500_100</text>
+  <rect x="150" y="232" width="264" height="30" rx="4" fill="#f59e0b"/>
+  <text x="424" y="253" font-size="14" font-weight="700" fill="#b45309">0.68</text>
+  <text x="150" y="278" font-size="11" fill="#64748b">MRR 0.708 · recall@10 0.567 · 耗时 8.7s</text>
+
+  <!-- v2b_800_150 -->
+  <text x="20" y="322" font-size="13" font-weight="600" fill="#0f172a">v2b_800_150</text>
+  <rect x="150" y="302" width="296" height="30" rx="4" fill="#f59e0b"/>
+  <text x="456" y="323" font-size="14" font-weight="700" fill="#b45309">0.76</text>
+  <text x="150" y="338" font-size="11" fill="#64748b">MRR 0.703 · recall@10 0.533 · 耗时 10.0s</text>
+
+  <rect x="20" y="352" width="640" height="38" rx="6" fill="#f0fdf4" stroke="#86efac"/>
+  <text x="32" y="376" font-size="12" fill="#166534"><tspan font-weight="700">结论：</tspan>v2b 召回/MRR 更高（父块整节回退给 LLM），但父块噪声拉低准确率与忠实度；v2_800_150 在准确率(0.81)、忠实度、速度间最均衡，推荐作为默认。</text>
+</svg>
