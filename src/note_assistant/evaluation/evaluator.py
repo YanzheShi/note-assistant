@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections import defaultdict
@@ -147,6 +148,8 @@ class Evaluator:
         self.llm = llm
         self.use_ragas = use_ragas
         self.target_kind = target_kind
+        # 题间冷却秒数（默认 0 = 不额外等待）。免费额度网关按 RPM 限流时用它降速。
+        self.question_gap_seconds = float(os.getenv("EVAL_QUESTION_GAP_SECONDS", "0") or 0)
 
     # ──────────────────────────────────────────────
     # 调用封装（统一 naive / agent 接口）
@@ -278,6 +281,10 @@ class Evaluator:
                 ragas_ground_truths: List[str] = []
 
             for qi, question in enumerate(dataset.questions):
+                if qi and self.question_gap_seconds > 0:
+                    # 免费额度网关按 RPM 限流；429 被图内 try/except 吞成空答案，
+                    # 会让整列指标看起来「召回崩盘」。留出冷却窗口，别把限流读成回归。
+                    time.sleep(self.question_gap_seconds)
                 if question.is_multiturn():
                     conv = self._run_multiturn(question, qi, k_values, eval_results, meter)
                     per_conversation.append(conv)

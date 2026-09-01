@@ -41,6 +41,12 @@ import time
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 
+# 原生库载入顺序护栏：pyarrow 必须早于 torch 载入。
+# 否则 sentence_transformers → sklearn → pandas → pyarrow 会在 torch(cu126) 的 DLL 已就位后
+# 才首次加载 arrow.dll，触发 Windows access violation 直接终止进程——无 Python 异常可捕，
+# 现场只在事件日志里留下 arrow.dll 0xc0000005。显式先 import 一次即可稳定绕开。
+import pyarrow  # noqa: F401
+
 # 确保 src 在 path 里
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -643,6 +649,8 @@ def main():
     parser.add_argument("--subset", "-n", type=int, default=5, help="取前 N 条（pilot 默认 5）")
     parser.add_argument("--k", nargs="+", type=int, default=[3, 5, 10], help="检索指标截断点")
     parser.add_argument("--output-dir", "-o", default="./eval/report", help="报告输出目录")
+    parser.add_argument("--variants", nargs="+", choices=[v["key"] for v in VARIANTS], default=None,
+                        help="只跑指定列（如 --variants A 单跑生产默认列）；缺省=全跑")
     args = parser.parse_args()
 
     from note_assistant.evaluation.eval_dataset import get_builtin_dataset, load_eval_dataset
@@ -663,8 +671,10 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     # 预热：所有变体前跑一次完整 agentic rag 流程，避免首题被冷启动（reranker/GPU/连接）拖慢
     run_warmup()
+    selected = [v for v in VARIANTS if not args.variants or v["key"] in args.variants]
+    logger.info(f"本次跑列：{', '.join(v['key'] for v in selected)}")
     reports: "OrderedDict[str, object]" = OrderedDict()
-    for variant in VARIANTS:
+    for variant in selected:
         try:
             key, report = run_variant(variant, dataset, args.k, llm, rag_chain)
             reports[key] = report
