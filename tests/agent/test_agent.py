@@ -781,7 +781,11 @@ def _mk_mermaid(score: float, filepath: str = "a.md", heading: str = "h-flow") -
 
 @pytest.mark.asyncio
 async def test_generate_node_mermaid_teaching_conditional(monkeypatch):
-    """上下文含 mermaid chunk → system prompt 教复现；不含 → 不教（防幻觉引导）。"""
+    """上下文含 mermaid chunk → 教学出现（human 头部）；不含 → 不教（防幻觉引导）。
+
+    2026-09-07 P3 缓存优化：教学从 system 迁到 human 头部，system 全静态——
+    两种情况下 system 必须字节一致（网关前缀缓存依赖）。
+    """
     _CaptureLLM.captured = []
     monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _CaptureLLM())
 
@@ -789,15 +793,21 @@ async def test_generate_node_mermaid_teaching_conditional(monkeypatch):
                          "judge_verdict": "sufficient", "widen_context": False, "gate_overrode": False,
                          "question": "处理流程是什么", "condensed_question": "处理流程是什么",
                          "history": [], "history_messages": []})
-    sys_with = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, SystemMessage))
-    assert "mermaid" in sys_with and "原样复现" in sys_with
+    sys_with = next(m.content for m in _CaptureLLM.captured if isinstance(m, SystemMessage))
+    human_with = next(m.content for m in _CaptureLLM.captured if isinstance(m, HumanMessage))
+    assert "原样复现" in human_with
+    assert "## 参考笔记" in human_with
+    assert human_with.index("原样复现") < human_with.index("## 参考笔记")  # 教学在 human 头部
 
     await generate_node({"accumulated": [_mk(0.9)], "iteration": 1,
                          "judge_verdict": "sufficient", "widen_context": False, "gate_overrode": False,
                          "question": "q", "condensed_question": "q",
                          "history": [], "history_messages": []})
-    sys_without = "".join(m.content for m in _CaptureLLM.captured if isinstance(m, SystemMessage))
-    assert "mermaid" not in sys_without
+    sys_without = next(m.content for m in _CaptureLLM.captured if isinstance(m, SystemMessage))
+    human_without = next(m.content for m in _CaptureLLM.captured if isinstance(m, HumanMessage))
+    assert "原样复现" not in human_without
+    # P3：system 全静态——含/不含 mermaid 教学两种情况下 system 字节一致
+    assert sys_with == sys_without
 
 
 @pytest.mark.asyncio

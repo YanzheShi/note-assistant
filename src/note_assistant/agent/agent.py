@@ -248,6 +248,16 @@ GENERATE_MERMAID_TEACHING = (
     "前端会渲染为流程图。只能复现参考笔记中出现过的 mermaid 源码，严禁编造或修改。"
 )
 
+# 先引后答（2026-09-07 P1）：针对 judge 实测的忠实度缺口（run3 faith 0.82 /
+# v2_800_150 faith 0.74，约两成主张无上下文依据）。要求答案开头先列出所依据
+# 的参考笔记，再作答——迫使 LLM 在生成前先对齐证据，抑制「凭参数记忆补细节」。
+# 条件化：top_results 为空（闲聊/知识库无相关内容）时绝不注入。
+GENERATE_CITE_FIRST = (
+    "\n7. 先引后答：回答的第一行先单独列出本次作答所依据的参考笔记"
+    "（格式：「依据笔记：<标题1>、<标题2>」），然后再正式作答。"
+    "答案中的每个关键事实都必须能在参考笔记中找到依据，找不到的不要写。"
+)
+
 CHAT_SYSTEM = (
     "你是 Obsidian 个人知识库助手。用户现在在闲聊或询问你的能力，"
     "请用友好、简洁的语气直接回答，不需要检索知识库。"
@@ -859,21 +869,25 @@ async def generate_node(state: AgentState) -> dict:
         note = "\n\n（注：已多次检索但知识库中相关信息有限，以下回答可能不完整。）\n"
     else:
         note = ""
-    # 2026-08-31：[[IMG:]] 教学条件化 —— 仅当生成上下文里存在可解析图片资产时追加，
-    # 避免诱导 LLM 对无资产图片编造标记（噪音 [[IMG:xxx]] 的根因之一）。
-    # 2026-09-01：mermaid 复现教学同理条件化（上下文有 mermaid chunk 才教）。
+    # 2026-09-07（P3 缓存优化）：system prompt 保持全静态——条件化教学
+    # （先引后答/[[IMG:]]/mermaid 复现）迁移到 human 消息头部。教学按 context
+    # 内容开关，拼在 system 会让 system 跨问题字节不一致，打断网关 prompt
+    # 前缀缓存复用；挪到 human 头部后，静态 system 前缀可跨调用命中缓存。
     generate_system = GENERATE_SYSTEM
+    teaching = ""
+    if top_results:
+        teaching += GENERATE_CITE_FIRST
     if has_teachable_image_assets(top_results):
-        generate_system += GENERATE_IMG_TEACHING
+        teaching += GENERATE_IMG_TEACHING
     if has_mermaid_chunks(top_results):
-        generate_system += GENERATE_MERMAID_TEACHING
+        teaching += GENERATE_MERMAID_TEACHING
     msgs: list[BaseMessage] = [SystemMessage(append_guardrail(generate_system))]
     # 预算裁剪后的历史（含长程摘要），与 agent/direct_chat 同源，避免重复
     history_msgs = state.get("history_messages") or _fmt_history(state["history"])
     msgs.extend(wrap_history_messages(history_msgs))
     msgs.append(
         HumanMessage(
-            f"## 参考笔记\n{wrap_retrieved_context(context)}\n\n"
+            f"{teaching}## 参考笔记\n{wrap_retrieved_context(context)}\n\n"
             f"## 问题\n{wrap_user_question(q)}{note}"
         )
     )

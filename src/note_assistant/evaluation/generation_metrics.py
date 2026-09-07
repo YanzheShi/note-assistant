@@ -217,7 +217,7 @@ def semantic_similarity(candidate: str, reference: str, embedder=None) -> float:
 # ──────────────────────────────────────────────────────────────
 
 
-def faithfulness(candidate: str, context: str, llm=None) -> float:
+def faithfulness(candidate: str, context: str, llm=None) -> Optional[float]:
     """
     忠诚度：答案中的每个主张是否有上下文依据？
 
@@ -230,7 +230,7 @@ def faithfulness(candidate: str, context: str, llm=None) -> float:
         llm: 可选的 LLM 实例，需要有 invoke(messages) 方法
 
     Returns:
-        0.0 ~ 1.0，越高越忠于上下文
+        0.0 ~ 1.0，越高越忠于上下文；LLM 调用/解析彻底失败时返回 None（不计入均值）
     """
     if not llm or not candidate or not context:
         return 0.0
@@ -252,32 +252,71 @@ def faithfulness(candidate: str, context: str, llm=None) -> float:
         "- 每个主张必须是独立的、可验证的事实陈述\n"
         '- "supported" 为 true 表示上下文中有直接依据\n'
         '- 如果上下文没有提到该主张，则 supported 为 false'
-    ).format(context=context[:4000], candidate=candidate[:2000])
+    ).format(context=context[:8000], candidate=candidate[:2000])
 
-    try:
-        messages = [{"role": "user", "content": prompt}]
-        response = llm.invoke(messages)
+    messages = [{"role": "user", "content": prompt}]
+    for _attempt in range(_JUDGE_ATTEMPTS):
+        try:
+            response = llm.invoke(messages)
+        except Exception:
+            continue  # 网络/限流：重试
         content = response.content if hasattr(response, "content") else str(response)
-
-        import json as json_mod
-        json_str = content.strip()
-        if "```" in json_str:
-            json_str = json_str.split("```")[1]
-            if json_str.startswith("json"):
-                json_str = json_str[4:]
-            json_str = json_str.strip()
-
-        result = json_mod.loads(json_str)
-        verifications = result.get("verifications", [])
-        if not verifications:
-            return 0.0
-        supported_count = sum(1 for v in verifications if v.get("supported"))
+        data = _extract_judge_json(content, ("verifications",))
+        if data is None:
+            continue
+        verifications = data.get("verifications") or []
+        if not isinstance(verifications, list) or not verifications:
+            continue  # judge 没抽出任何主张 = 无法判定，重试
+        supported_count = sum(
+            1 for v in verifications
+            if isinstance(v, dict) and v.get("supported")
+        )
         return supported_count / len(verifications)
-    except Exception:
-        return 0.0
+    return None
 
 
-def answer_relevance(candidate: str, question: str, llm=None) -> float:
+# ──────────────────────────────────────────────────────────────
+# LLM-judge 共享辅助：JSON 提取 + 重试
+#
+# 背景（2026-09-07 修复）：judge 要求 LLM 返回 JSON，此前解析失败会
+# `except: return 0.0` 静默记假 0——出现「accuracy=1.0 而 faithfulness=0.0」
+# 的口径矛盾（答案全对却判零忠实，实际是卷子没判成）。
+# 现约定：**无法判定 ≠ 判 0**——重试后仍失败返回 None，聚合层跳过该题。
+# ──────────────────────────────────────────────────────────────
+
+_JUDGE_ATTEMPTS = 2  # LLM 调用次数上限（首判 + 一次重试）
+
+
+def _extract_judge_json(content: str, required_keys: tuple[str, ...]) -> Optional[dict]:
+    """从 LLM 回复中提取 JSON 对象并校验必需键。
+
+    提取顺序：```json ... ``` 围栏 → 首尾花括号整段。都解析失败或缺键返回 None。
+    """
+    if not content:
+        return None
+    text = content.strip()
+    raw_candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    first, last = text.find("{"), text.rfind("}")
+    if first != -1 and last > first:
+        raw_candidates.append(text[first:last + 1])
+
+    import json as json_mod
+    for raw in raw_candidates:
+        try:
+            data = json_mod.loads(raw)
+        except Exception:
+            continue
+        if isinstance(data, dict) and all(k in data for k in required_keys):
+            return data
+    return None
+
+
+def _clamp01(value) -> float:
+    """钳制到 [0, 1]，非数字视为无效（抛 ValueError 交给上层重试）。"""
+    return max(0.0, min(1.0, float(value)))
+
+
+def answer_relevance(candidate: str, question: str, llm=None) -> Optional[float]:
     """
     答案相关性：答案是否直接回答了问题？
 
@@ -290,7 +329,7 @@ def answer_relevance(candidate: str, question: str, llm=None) -> float:
         llm: 可选的 LLM 实例
 
     Returns:
-        0.0 ~ 1.0，越高越相关
+        0.0 ~ 1.0，越高越相关；LLM 调用/解析彻底失败时返回 None（不计入均值）
     """
     if not llm or not candidate or not question:
         return 0.0
@@ -312,24 +351,21 @@ def answer_relevance(candidate: str, question: str, llm=None) -> float:
         "注意：只输出 JSON，不要输出其他内容。"
     ).format(question=question[:1000], candidate=candidate[:2000])
 
-    try:
-        messages = [{"role": "user", "content": prompt}]
-        response = llm.invoke(messages)
+    messages = [{"role": "user", "content": prompt}]
+    for _attempt in range(_JUDGE_ATTEMPTS):
+        try:
+            response = llm.invoke(messages)
+        except Exception:
+            continue  # 网络/限流：重试
         content = response.content if hasattr(response, "content") else str(response)
-
-        import json as json_mod
-        json_str = content.strip()
-        if "```" in json_str:
-            json_str = json_str.split("```")[1]
-            if json_str.startswith("json"):
-                json_str = json_str[4:]
-            json_str = json_str.strip()
-
-        result = json_mod.loads(json_str)
-        score = float(result.get("score", 0.0))
-        return max(0.0, min(1.0, score))
-    except Exception:
-        return 0.0
+        data = _extract_judge_json(content, ("score",))
+        if data is None:
+            continue
+        try:
+            return _clamp01(data["score"])
+        except (TypeError, ValueError):
+            continue  # score 非数字：重试
+    return None
 
 
 def compute_answer_accuracy(
@@ -337,7 +373,7 @@ def compute_answer_accuracy(
     reference: str,
     question: str = "",
     llm=None,
-) -> tuple[float, float]:
+) -> tuple[Optional[float], Optional[float]]:
     """
     准确率 + 评分置信度（LLM-as-judge，一次调用同时产出两个值）。
 
@@ -355,7 +391,7 @@ def compute_answer_accuracy(
         llm: 可选的 LLM 实例（需有 invoke(messages)）
 
     Returns:
-        (accuracy, confidence)，失败时返回 (0.0, 0.0)
+        (accuracy, confidence)；LLM 调用/解析彻底失败时返回 (None, None)（不计入均值）
     """
     if not llm or not candidate or not reference:
         return 0.0, 0.0
@@ -369,8 +405,12 @@ def compute_answer_accuracy(
         "- 0.7：大部分关键信息正确，但有少量遗漏或轻微不精确\n"
         "- 0.4：仅部分正确，有明显事实偏差或重大遗漏\n"
         "- 0.0：与标准答案严重不符或答非所问\n\n"
-        "同时，请给出你对自己评分的「置信度」（confidence，0~1）："
-        "信息充分、判断明确时为高置信度；答案含糊、难以判断时为低置信度。\n\n"
+        "同时，请独立给出你对自己这条评分的「置信度」（confidence，0~1）。"
+        "置信度衡量的是「这一评分本身有多可靠」，与分数高低无关：\n"
+        "- 0.95~1.0：两个答案内容都清晰明确，对照毫无歧义，评分不会因重新审视而改变\n"
+        "- 0.7~0.9：判断基本明确，但答案有部分表述含糊或覆盖面难以精确衡量\n"
+        "- 0.4~0.6：答案与标准答案差距居中、表述风格差异大，评分带有较多主观判断\n"
+        "- 0.0~0.3：信息不足或答案含糊到难以可靠评分\n\n"
         "标准答案：\n{reference}\n\n"
         "待评测答案：\n{candidate}\n\n"
         "用户问题（仅供参考，不计入评分）：\n{question}\n\n"
@@ -386,25 +426,23 @@ def compute_answer_accuracy(
         question=question[:1000],
     )
 
-    try:
-        messages = [{"role": "user", "content": prompt}]
-        response = llm.invoke(messages)
+    messages = [{"role": "user", "content": prompt}]
+    for _attempt in range(_JUDGE_ATTEMPTS):
+        try:
+            response = llm.invoke(messages)
+        except Exception:
+            continue  # 网络/限流：重试
         content = response.content if hasattr(response, "content") else str(response)
-
-        import json as json_mod
-        json_str = content.strip()
-        if "```" in json_str:
-            json_str = json_str.split("```")[1]
-            if json_str.startswith("json"):
-                json_str = json_str[4:]
-            json_str = json_str.strip()
-
-        result = json_mod.loads(json_str)
-        accuracy = max(0.0, min(1.0, float(result.get("accuracy", 0.0))))
-        confidence = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+        data = _extract_judge_json(content, ("accuracy", "confidence"))
+        if data is None:
+            continue
+        try:
+            accuracy = _clamp01(data["accuracy"])
+            confidence = _clamp01(data["confidence"])
+        except (TypeError, ValueError):
+            continue  # 数值无效：重试
         return accuracy, confidence
-    except Exception:
-        return 0.0, 0.0
+    return None, None
 
 
 # ──────────────────────────────────────────────────────────────

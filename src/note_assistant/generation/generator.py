@@ -60,6 +60,15 @@ class Generator:
         "前端会渲染为流程图。只能复现参考笔记中出现过的 mermaid 源码，严禁编造或修改。"
     )
 
+    # 先引后答（2026-09-07 P1，与 agent 链路 GENERATE_CITE_FIRST 同源）：
+    # judge 实测 naive 忠实度显著偏低（run3 faith 0.32 / v2_800_150 faith 0.46）。
+    # 有参考笔记时才注入——空 context（闲聊路径）不要求列依据。
+    CITE_FIRST_TEACHING = (
+        "\n9. 先引后答：回答的第一行先单独列出本次作答所依据的参考笔记"
+        "（格式：「依据笔记：<标题1>、<标题2>」），然后再正式作答。"
+        "答案中的每个关键事实都必须能在参考笔记中找到依据，找不到的不要写。"
+    )
+
     def __init__(self, llm=None):
         """
         Args:
@@ -82,13 +91,28 @@ class Generator:
 
 
     def _system_prompt(self, context: list[RetrievalResult]) -> str:
-        """按 context 内容组装 system prompt：条件化教学 [[IMG:]] 与 mermaid 复现。"""
-        prompt = self.SYSTEM_PROMPT
+        """system prompt：保持全静态（P3 缓存优化，2026-09-07）。
+
+        条件化教学（先引后答/图片引用/mermaid 复现）已迁移到 human 消息头部
+        （_teaching_preamble）——教学按 context 内容开关，若拼进 system 会让
+        system 在不同问题间字节不一致，打断网关 prompt 前缀缓存的复用。
+        """
+        return self.SYSTEM_PROMPT
+
+    def _teaching_preamble(self, context: list[RetrievalResult]) -> str:
+        """按 context 内容组装条件化教学文本，拼在 human 消息最前面。
+
+        静态部分（system）在前、条件化部分在 human 头部、可变上下文在其后，
+        最大化网关 prompt 缓存可复用的前缀长度。
+        """
+        preamble = ""
+        if context:
+            preamble += self.CITE_FIRST_TEACHING
         if has_teachable_image_assets(context):
-            prompt += self.IMG_MARK_TEACHING
+            preamble += self.IMG_MARK_TEACHING
         if has_mermaid_chunks(context):
-            prompt += self.MERMAID_TEACHING
-        return prompt
+            preamble += self.MERMAID_TEACHING
+        return preamble
 
     @staticmethod
     def _format_history(history: list[dict]) -> list[tuple[str, str]]:
@@ -125,7 +149,8 @@ class Generator:
         messages = [("system", append_guardrail(self._system_prompt(context)))]
         if history:
             messages.extend(wrap_history_tuples(self._format_history(history)))
-        messages.append(("human", "## 参考笔记\n{context_text}\n\n## 问题\n{question}"))
+        preamble = self._teaching_preamble(context)
+        messages.append(("human", preamble + "## 参考笔记\n{context_text}\n\n## 问题\n{question}"))
         return ChatPromptTemplate.from_messages(messages).partial(
             context_text=wrap_retrieved_context(context_text)
         )
@@ -162,9 +187,11 @@ class Generator:
         messages = [("system", append_guardrail(self._system_prompt(context)))]
         if history:
             messages.extend(wrap_history_tuples(self._format_history(history)))
+        preamble = self._teaching_preamble(context)
         messages.append((
             "human",
-            f"## 参考笔记\n{wrap_retrieved_context(context_text)}\n\n"
+            preamble
+            + f"## 参考笔记\n{wrap_retrieved_context(context_text)}\n\n"
             f"## 问题\n{wrap_user_question(question)}",
         ))
 

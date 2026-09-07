@@ -129,7 +129,9 @@ def get_builtin_dataset() -> EvalDataset:
         EvalQuestion(
             question="BGE-M3 模型有什么特点？",
             golden_answer="BGE-M3 是一个多语言、多粒度、多功能的 embedding 模型。特点是支持多语言（中英文）、多粒度（单词/句子/文档）、多功能（密集/稀疏/多向量检索），embed_dim=1024。",
-            relevant_files=["06-向量嵌入Embedding.md", "11-向量化与相似度计算.md"],
+            # 2026-09-07 修正：11-向量化与相似度计算.md 全文无 "BGE-M3"（grep=0），
+            # BGE-M3 特点只在 06-向量嵌入Embedding.md。
+            relevant_files=["06-向量嵌入Embedding.md"],
         ),
         EvalQuestion(
             question="BM25 和向量检索有什么区别？",
@@ -154,7 +156,14 @@ def get_builtin_dataset() -> EvalDataset:
         EvalQuestion(
             question="Query Rewrite 的作用是什么？",
             golden_answer="Query Rewrite 对用户原始问题进行改写，包括：扩写（补充缩写/简称）、分句拆分、同义替换。目的是提高检索召回率——用户的问题往往表述不完整，改写后更容易命中相关文档。",
-            relevant_files=["Day2-混合检索与Reranker.md", "LangChain RAG优化实践.md"],
+            # 2026-09-07 修正：原标注 Day2/LangChain 两篇全文无 "Query Rewrite"
+            # 字样（grep=0），检索命中正确文件也不计分。真实出处是交接文档与
+            # 多轮对话优化笔记（query_rewrite.py 职责 + 多轮感知改写）。
+            relevant_files=[
+                "04-模块详解-检索系统.md",
+                "多轮对话优化.md",
+                "05-模块详解-AgenticRAG.md",
+            ],
         ),
         EvalQuestion(
             question="GraphRAG 和传统 RAG 的区别？",
