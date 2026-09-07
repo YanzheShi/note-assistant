@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     agent_api_key: str
     agent_base_url: str
     agent_model: str
+    # 单次 LLM 请求超时（秒）。网关偶发「已连接但永不响应」时，无超时会永久挂死
+    # （评测 faithfulness judge 实测卡 15min+）。httpx 超时抛异常 → 上层重试逻辑可接管。
+    # 注意：超时按「读间隔」计而非总时长，流式长回答不受影响。
+    agent_request_timeout: int = 180
 
     # === 上下文凝练 / 长程摘要 专属 LLM（可选，独立通道）===
     # 设计：默认全部留空 → 凝练 / 摘要都复用 AGENT_* 主文本通道（与改造前逐字节等价，零回归）。

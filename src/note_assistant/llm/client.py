@@ -40,6 +40,9 @@ def get_llm(
         openai_api_base=settings.agent_base_url,
         temperature=temperature,
         streaming=streaming,
+        # 网关挂起防护：无超时 + 服务端不回 → 同步 invoke 永久阻塞（评测 judge 实测挂死）。
+        # 超时抛 ReadTimeout → 各调用方的重试逻辑（except Exception: continue）可接管。
+        request_timeout=settings.agent_request_timeout,
     )
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
@@ -73,6 +76,7 @@ def _build_openai_llm(
         api_key=api_key or settings.agent_api_key,
         openai_api_base=base_url or settings.agent_base_url,
         temperature=temperature,
+        request_timeout=settings.agent_request_timeout,
     )
     from note_assistant.llm.usage import get_token_handler
 
