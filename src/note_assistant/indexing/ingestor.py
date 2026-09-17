@@ -1,4 +1,5 @@
 import chromadb
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import List
@@ -147,6 +148,12 @@ class Ingestor:
         docstore = ParentDocstore(settings.parent_docstore_path) if is_v2b else None
 
         for node in docs:
+            # 0a. 文件修改时间（跨文件/跨位置同内容去重时「留最新」用）
+            try:
+                node_mtime = float(os.path.getmtime(loader.vault_path / node.filepath))
+            except OSError:
+                node_mtime = 0.0
+
             # 0. 计算相对目录（层级结构前缀用，vault 内相对于根的路径父目录）
             dir_ = str(Path(node.filepath).parent)
             if dir_ == ".":
@@ -180,6 +187,7 @@ class Ingestor:
                 c.metadata["wikilinks"] = node.wikilinks
                 c.metadata["filepath"] = node.filepath
                 c.metadata["title"] = node.title
+                c.metadata["mtime"] = node_mtime
                 if dir_:
                     c.metadata["dir"] = dir_
                 # ChromaDB 不接受空列表作为 metadata 值，tags 为空则不设置
@@ -199,6 +207,7 @@ class Ingestor:
             for sc in summary_chunks:
                 sc.metadata["filepath"] = node.filepath
                 sc.metadata["title"] = node.title
+                sc.metadata["mtime"] = node_mtime
                 if dir_:
                     sc.metadata["dir"] = dir_
                 prefix = build_structural_prefix(node, sc.metadata, dir_)
@@ -208,6 +217,7 @@ class Ingestor:
             for fc in fm_chunks:
                 fc.metadata["filepath"] = node.filepath
                 fc.metadata["title"] = node.title
+                fc.metadata["mtime"] = node_mtime
                 if dir_:
                     fc.metadata["dir"] = dir_
                 prefix = build_structural_prefix(node, fc.metadata, dir_)
@@ -218,6 +228,7 @@ class Ingestor:
                 for p in parents:
                     p.metadata["filepath"] = node.filepath
                     p.metadata["title"] = node.title
+                    p.metadata["mtime"] = node_mtime
                     if dir_:
                         p.metadata["dir"] = dir_
                     # 父块的 heading_path 来自 split_v2b（章节级），此处不覆盖

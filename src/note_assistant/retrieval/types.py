@@ -1,3 +1,5 @@
+import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -40,6 +42,30 @@ class RetrievalResult:
             str(meta.get("kind") or ""),
             str(meta.get("placeholder") or meta.get("asset_id") or ""),
         )
+
+    @property
+    def mtime(self) -> float:
+        """来源文件修改时间（epoch 秒），由 ingest 写入 metadata；缺失/非法为 0.0。"""
+        v = self.metadata.get("mtime")
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _normalize_content(text: str) -> str:
+        """归一化正文：合并所有空白为单空格并去首尾，用于内容维度精确比对。"""
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    def content_key(self) -> str:
+        """内容维度身份键：归一化正文后取 md5。
+
+        用途：跨文件/跨位置「逐字相同」去重（区别于 identity_key 的位置去重）。
+        归一化仅合并空白，不做模糊匹配——改写/同义重写不算重复。
+        """
+        return hashlib.md5(
+            self._normalize_content(self.page_content).encode("utf-8")
+        ).hexdigest()
 
     def __repr__(self) -> str:
         parts = [f"score={self.score:.4f}"]

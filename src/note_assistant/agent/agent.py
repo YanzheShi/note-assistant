@@ -29,12 +29,12 @@
     确定性兜底：路由判检索但本轮未检索过 → 强制执行一次 hybrid_search。
 """
 import json
-import operator
-from functools import lru_cache
-from typing import Annotated, List, TypedDict
-
 import logging
+import operator
 import time
+from datetime import datetime
+from functools import lru_cache
+from typing import Annotated, Dict, List, TypedDict
 
 from note_assistant.logger_util import get_request_id
 from langchain_core.messages import (
@@ -375,6 +375,63 @@ def _format_judge_evidence(results: List[RetrievalResult]) -> str:
     return "\n\n".join(parts) + "\n\n" + coverage
 
 
+def _is_newer(candidate: "RetrievalResult", current: "RetrievalResult") -> bool:
+    """candidate 是否比 current 更「新」：mtime 更大者新；mtime 相同则分数高者新。"""
+    if candidate.mtime != current.mtime:
+        return candidate.mtime > current.mtime
+    return candidate.score > current.score
+
+
+def _dedup_accumulate(
+    accumulated: List["RetrievalResult"],
+    results: List["RetrievalResult"],
+) -> List["RetrievalResult"]:
+    """把 results 合并进 accumulated，双维度去重、冲突留最新。
+
+    - 位置维度：identity_key（同文件同章节同类型）沿用原逻辑去重；
+    - 内容维度：content_key（逐字相同，含跨文件/跨位置）新增去重；
+    两维度任一命中即视为重复，冲突时保留 mtime 最新者（mtime 相同则留分数高者）。
+    """
+    out: List["RetrievalResult"] = list(accumulated)
+    seen_identity = {r.identity_key() for r in out}
+    # content_key -> 在 out 中的下标，便于冲突时原地替换
+    content_index: Dict[str, int] = {}
+    for i, r in enumerate(out):
+        ck = r.content_key()
+        if ck not in content_index or _is_newer(r, out[content_index[ck]]):
+            content_index[ck] = i
+
+    for r in results:
+        ck = r.content_key()
+        ik = r.identity_key()
+        # 位置维度已存在：仅当内容相同且更新时替换，否则保持原样
+        # （兼容 image vs text 同 heading 的位置碰撞，不互相挤掉）
+        if ik in seen_identity:
+            if ck in content_index and _is_newer(r, out[content_index[ck]]):
+                out[content_index[ck]] = r
+            continue
+        # 内容维度已存在：留新
+        if ck in content_index:
+            if _is_newer(r, out[content_index[ck]]):
+                out[content_index[ck]] = r
+            continue
+        # 全新：加入
+        seen_identity.add(ik)
+        content_index[ck] = len(out)
+        out.append(r)
+    return out
+
+
+def _fmt_mtime(mtime: float) -> str:
+    """epoch 秒 → YYYY-MM-DD；缺失/非法返回空串。"""
+    if not mtime or mtime <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+    except (OSError, ValueError):
+        return ""
+
+
 def _format_context(results: List[RetrievalResult]) -> str:
     """把去重/裁剪后的结果格式化为生成上下文（经 L2 注入扫描）。"""
     if not results:
@@ -384,14 +441,16 @@ def _format_context(results: List[RetrievalResult]) -> str:
     parts = []
     for i, r in enumerate(results, 1):
         title = r.metadata.get("title", "未知笔记")
+        date_str = _fmt_mtime(r.mtime)
+        header = f"### [{i}] {title}" + (f"（修改于 {date_str}）" if date_str else "")
         block = render_image_block(r)
         if block is not None:
             # image chunk：结构化渲染 + [[IMG:asset_id]] 引用标记
             content, _ = sanitize_text(block, source=r.filepath)
-            parts.append(f"### [{i}] {title}\n{content}")
+            parts.append(f"{header}\n{content}")
             continue
         content, _ = sanitize_text(r.page_content, source=r.filepath)
-        parts.append(f"### [{i}] {title}\n{content}")
+        parts.append(f"{header}\n{content}")
     return "\n\n".join(parts)
 
 
@@ -520,7 +579,6 @@ async def tools_node(state: AgentState) -> dict:
     # 确定性去重：用 identity_key（filepath, heading, kind, placeholder）。
     # 不能只用 (filepath, heading)——image summary chunk 与同节正文/父块共享
     # heading，旧键会让二者按分数竞速二选一，图片常被长文本挤掉（图不显示的根因之一）。
-    seen = {r.identity_key() for r in accumulated}
     new_before = len(accumulated)
     # L3 白名单：已浮现 filepath = 历史累积 ∪ 本轮命中；兼容无新字段的旧 state
     allowed = set(state.get("allowed_files") or set())
@@ -547,11 +605,8 @@ async def tools_node(state: AgentState) -> dict:
         obs_text = cm.truncate_observation(obs_text, settings.agent_obs_token_budget)
         # 工具返回来自 vault，是最大注入载体：包数据边界（截断后包，闭标记不被切断）
         obs_text = wrap_tool_result(name, obs_text)
-        for r in results:
-            key = r.identity_key()
-            if key not in seen:
-                seen.add(key)
-                accumulated.append(r)
+        # 双维度去重（位置 + 内容）并入 accumulated，内容重复时留 mtime 最新者
+        accumulated = _dedup_accumulate(accumulated, results)
         new_messages.append(ToolMessage(content=obs_text, tool_call_id=tc["id"]))
     logger.info(
         "tools.summary",
@@ -596,20 +651,17 @@ async def force_search_node(state: AgentState) -> dict:
         logger.warning("force_search.run_failed", exc_info=True)
         obs_text, results = "", []
     accumulated = list(state.get("accumulated") or [])
-    seen = {r.identity_key() for r in accumulated}
     new_before = len(accumulated)
     allowed = set(state.get("allowed_files") or set())
     injection_hits = int(state.get("injection_hits", 0))
     for r in results:
-        key = r.identity_key()
-        if key not in seen:
-            seen.add(key)
-            accumulated.append(r)
-        # L2 注入扫描 + L3 白名单（与 tools_node 同规）
+        # L2 注入扫描 + L3 白名单（与 tools_node 同规，扫全部结果不漏）
         _, n = sanitize_text(r.page_content, source=r.filepath)
         injection_hits += n
         if r.filepath:
             allowed.add(r.filepath)
+    # 双维度去重（位置 + 内容）并入 accumulated，内容重复时留 mtime 最新者
+    accumulated = _dedup_accumulate(accumulated, results)
     logger.info(
         "force_search.done",
         extra={
