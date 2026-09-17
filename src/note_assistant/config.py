@@ -32,6 +32,10 @@ class Settings(BaseSettings):
 
     # === Reranker ===
     reranker_model: str = str(PROJECT_ROOT / "models" / "BAAI" / "bge-reranker-v2-m3")
+    # 重排交叉编码器最大输入长度（token）。FlagReranker 默认 512，会把超长块尾部截断。
+    # bge-reranker-v2-m3 模型本身支持到 max_position_embeddings=8194；取 2048 可覆盖 v2 的
+    # 800 字块与 v2b 的 2000 字父块，且代价可控（注意力平方级，但每轮仅重排 top-k 候选）。
+    reranker_max_length: int = 2048
 
     # === RAGAS ===
     ragas_base_url: str = "http://localhost:11434/v1"

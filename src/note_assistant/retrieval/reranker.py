@@ -109,7 +109,11 @@ class LocalReranker:
         documents = [r.page_content for r in results]
         pairs = [[query, doc] for doc in documents]
         # 2. batch 推理
-        scores = self.model.compute_score(pairs)
+        # max_length 透传：FlagReranker 默认 512 token，会把 800 字中文块（≈800 token）的
+        # 尾部 ~1/3 直接截断丢弃。bge-reranker-v2-m3 模型支持到 max_position_embeddings=8194，
+        # 用配置项放宽到 2048 即可覆盖 2000 字父块与 v2 的 800 字块（耗时约平方级增长，
+        # 但每轮仅重排 top-k 候选，GPU 下可接受）。
+        scores = self.model.compute_score(pairs, max_length=settings.reranker_max_length)
         # 3. 排序取 top_k，更新 score 并保留原始 metadata
         top_k_idx = sorted(range(len(scores)),
                            key=lambda k: scores[k],
