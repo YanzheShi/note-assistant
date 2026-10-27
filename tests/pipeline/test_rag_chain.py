@@ -161,7 +161,10 @@ class TestAsk:
             graph=_make_mock_graph(),
             generator=None,
         )
-        result = r.ask("无生成器测试")
+        # 必须 mock 路由：否则 _needs_retrieval_sync 真打云端 LLM，判成 false 就返回固定
+        # 问候语且跳过检索，本用例的断言随之随机翻转（固定问候语分支由上一条用例覆盖）。
+        with _patch_llm('{"need_retrieval": true}'):
+            result = r.ask("无生成器测试")
         # generator 为 None，answer 为空；但检索正常执行
         assert result.answer == ""
         assert result.retrieved == 1
