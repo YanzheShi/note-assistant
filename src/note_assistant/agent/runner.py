@@ -207,14 +207,18 @@ def _trajectory_from_state(final: dict) -> List[dict]:
     if msgs and isinstance(msgs[0], HumanMessage):
         msgs = msgs[1:]
     traj.extend(_trajectory_from_messages(msgs))
-    # 3. Judge 判定（每个 reflect 一次，按出现顺序）
+    # 3. Judge 判定（每个 reflect 一次，按出现顺序）；决策模型字段（影子/校准概率）顺带透出
     for entry in final.get("judge_log", []) or []:
-        traj.append({
+        ev = {
             "type": "judge",
             "verdict": entry.get("verdict"),
             "reason": entry.get("reason"),
             "iteration": entry.get("iteration"),
-        })
+        }
+        for k in ("source", "dm_verdict", "dm_probs", "dm_p_sufficient", "llm_verdict"):
+            if entry.get(k) is not None:
+                ev[k] = entry[k]
+        traj.append(ev)
     # 4. 答案
     ans = final.get("answer", "")
     if ans:
@@ -647,6 +651,9 @@ async def astream(
                     "reason": entry.get("reason"),
                     "iteration": entry.get("iteration"),
                 }
+                for k in ("source", "dm_verdict", "dm_probs", "dm_p_sufficient", "llm_verdict"):
+                    if entry.get(k) is not None:
+                        ev[k] = entry[k]
             elif node == "rewrite":
                 ev = {"type": "thought", "content": "（反思改写）重新检索"}
             elif node in ("generate", "direct_chat", "clarify"):

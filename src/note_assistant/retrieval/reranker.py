@@ -73,10 +73,13 @@ class LocalReranker:
             use_fp16: 是否用半精度推理（省显存，速度快）
         """
         self.model_path = model_path or settings.reranker_model
-        self.use_fp16 = use_fp16
+        devices = [d.strip() for d in (settings.reranker_devices or "").split(",") if d.strip()]
+        # CPU 上 fp16 无内核加速且部分算子不支持，显式切 CPU 时退回 fp32
+        self.use_fp16 = use_fp16 and not any(d.startswith("cpu") for d in devices)
         self.model = FlagReranker(
             model_name_or_path=self.model_path,
-            use_fp16=self.use_fp16
+            use_fp16=self.use_fp16,
+            **({"devices": devices} if devices else {}),
         )
 
     # ──────────────────────────────────────────────

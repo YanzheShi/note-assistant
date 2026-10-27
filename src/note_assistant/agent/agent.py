@@ -66,6 +66,7 @@ from note_assistant.security.guardrails import (
     wrap_user_question,
 )
 from note_assistant.security.sanitize import sanitize_text
+from note_assistant.decision.client import get_decision_client
 
 MAX_ITER = settings.agent_max_iter
 
@@ -105,6 +106,10 @@ class AgentState(TypedDict):
     # === 兜底强制检索（2026-08-31 修「多轮后全部答当前不包含」）===
     searched_once: bool                          # 本轮是否真的执行过检索（tools_node / force_search 置 True）
     force_search_tries: int                      # force_search 已兜底次数（防循环，每请求上限 1 次）
+    # === 决策模型（decision/client.py，2026-10-11）===
+    # 影子模式判定记录（router/reflect 各 append 一条；主链路判定不受影响）。
+    # 评测时逐题对比 dm_* 与 LLM 判定的一致率。
+    dm_shadow: Annotated[list, operator.add]
 
 
 # ──────────────────────────────────────────────
@@ -491,10 +496,50 @@ async def router(state: AgentState) -> dict:
     是否要检索个人知识库的关键信号；若用凝练（消指代）后的问题，这些词会被改写步骤抹掉，
     导致明明问笔记却被误判为闲聊 / 常识。凝练问题仅在原问题疑似纯指代、需要消歧时作为
     参考附上（兼顾「它有什么缺点？」这类追问的消歧）。
+
+    决策模型（decision/client.py，默认关）：ENABLED + SCOPE∈(router,all) 时优先用
+    决策模型 choice×2 判定（~50ms，校准概率）；影子模式（SHADOW）下 LLM 照常主判、
+    决策模型只并行记录 dm_shadow；任何失败（超时/网络/解析）自动回退下方 LLM 原路径。
     """
-    llm = get_llm(temperature=0.0)
     q = state["question"]
     condensed = state.get("condensed_question") or ""
+    import asyncio
+
+    dm = get_decision_client()
+    shadow_records: list = []
+    if dm is not None and settings.decision_model_scope in ("router", "all"):
+        if settings.decision_model_shadow:
+            try:
+                r = await asyncio.to_thread(dm.route_intent, q, condensed)
+                shadow_records.append({
+                    "node": "router",
+                    "dm_needs_search": r["needs_search"],
+                    "dm_p_search": round(r["p_search"], 4),
+                })
+                logger.info(
+                    "decision_model.shadow.router",
+                    extra={"dm_needs_search": r["needs_search"], "dm_p_search": r["p_search"]},
+                )
+            except Exception:  # noqa: BLE001  影子失败不影响主链路
+                logger.warning("decision_model.shadow.router_failed", exc_info=True)
+        else:
+            try:
+                r = await asyncio.to_thread(dm.route_intent, q, condensed)
+                needs = bool(r["needs_search"])
+                route = "search" if needs else "chat"
+                logger.info(
+                    "router.decision",
+                    extra={
+                        "route": route,
+                        "needs_search": needs,
+                        "reason": f"decision_model p_search={r['p_search']:.3f}",
+                    },
+                )
+                return {"route": route, "dm_shadow": shadow_records}
+            except Exception:  # noqa: BLE001  决策模型任何失败 → 回退 LLM 原路径
+                logger.warning("decision_model.router_fallback", exc_info=True)
+
+    llm = get_llm(temperature=0.0)
     if condensed and condensed != q:
         q = f"{q}\n（若原问题含指代或不完整，可参考已消歧的改写：{condensed}）"
     try:
@@ -510,7 +555,7 @@ async def router(state: AgentState) -> dict:
         reason = ""
     route = "search" if needs else "chat"
     logger.info("router.decision", extra={"route": route, "needs_search": needs, "reason": reason})
-    return {"route": route}
+    return {"route": route, "dm_shadow": shadow_records}
 
 
 async def agent_node(state: AgentState) -> dict:
@@ -679,6 +724,38 @@ async def force_search_node(state: AgentState) -> dict:
     }
 
 
+async def _dm_generate_rewrite(q: str, evidence: str) -> str:
+    """决策模型判 need_rewrite 后的轻量改写：只产改写检索词，不解释。
+
+    与原 Judge「判定+改写一次调用」相比拆成两步，prompt 带证据摘要以弥补
+    上下文损失（避免改写出与已检索内容重复的无效词）。
+    """
+    llm = get_llm(temperature=0.0)
+    prompt = (
+        "上一轮检索证据不足。请把用户问题改写成更适合检索的查询"
+        "（补全关键词、消除口语化；若原问题已足够精准则原样返回）。"
+        "只输出改写后的查询，不要解释。\n\n"
+        f"用户问题：{q}\n\n"
+        f"=== 已检索到的片段（供参考，避免重复无效改写）===\n{evidence[:600]}"
+    )
+    resp = await llm.ainvoke([HumanMessage(prompt)])
+    return str(resp.content).strip()
+
+
+async def _dm_generate_clarify(q: str, evidence: str) -> str:
+    """决策模型判 need_clarify 后的轻量澄清问句生成（与上面同思路）。"""
+    llm = get_llm(temperature=0.0)
+    prompt = (
+        "用户的问题指向多个互不相干的主题，需要向用户澄清。"
+        "请基于问题与命中的片段，生成一句具体的澄清问句（指出可能的歧义方向）。"
+        "只输出问句本身。\n\n"
+        f"用户问题：{q}\n\n"
+        f"=== 已检索到的片段 ===\n{evidence[:600]}"
+    )
+    resp = await llm.ainvoke([HumanMessage(prompt)])
+    return str(resp.content).strip()
+
+
 async def reflect(state: AgentState) -> dict:
     """Reflection Judge（独立可观测节点）：LLM 判定信息是否足够回答。
 
@@ -690,33 +767,103 @@ async def reflect(state: AgentState) -> dict:
     达到 max_iter 时无论判定如何都强制进入生成（硬性降级）。
 
     P0：这里必须把**片段内容**传给 Judge。改造前只传了片段数量，Judge 在盲判。
+
+    决策模型（decision/client.py，默认关）：ENABLED + SCOPE∈(judge,all) 时 verdict
+    改由决策模型 choice×5 产出（附校准概率）；决策模型不产文本，need_rewrite /
+    need_clarify 时按 ``decision_model_judge_rewrite_llm`` 追加轻量 LLM 生成改写/
+    澄清问句；决策模型任何失败自动回退下方 LLM 全功能路径。影子模式（SHADOW）
+    下 LLM 照常主判，决策模型并行判定只记 dm_shadow。收敛闸门 / 覆盖放宽 /
+    ``_should_clarify`` 等下游逻辑不感知判定来源，零改动。
     """
-    llm = get_llm(temperature=0.0)
+    import asyncio
+
     label = "达上限（强制生成）" if state["iteration"] >= MAX_ITER else "未达上限"
     q = state.get("condensed_question") or state["question"]
     evidence = _format_judge_evidence(state["accumulated"])
+
+    dm = get_decision_client()
+    dm_mode = None
+    if dm is not None and settings.decision_model_scope in ("judge", "all"):
+        dm_mode = "shadow" if settings.decision_model_shadow else "active"
+
+    verdict: str | None = None
+    rewritten = ""
+    clarify_q = ""
+    data: dict = {}
+    dm_record: dict | None = None
+
+    # ── 决策模型 active：verdict + 校准概率（失败回退 LLM）──
+    if dm_mode == "active":
+        try:
+            r = await asyncio.to_thread(
+                dm.judge_verdict, q, evidence, state["iteration"], MAX_ITER
+            )
+            verdict = _norm_verdict(r["verdict"])
+            data = {"verdict": verdict, "dm_probs": r["probs"],
+                    "dm_p_sufficient": r["p_sufficient"]}
+            dm_record = {
+                "node": "reflect", "source": "dm",
+                "dm_verdict": r["verdict"],
+                "dm_probs": r["probs"], "dm_p_sufficient": r["p_sufficient"],
+            }
+        except Exception:  # noqa: BLE001  决策模型任何失败 → 回退 LLM 全功能路径
+            logger.warning("decision_model.judge_fallback", exc_info=True)
+            verdict = None
+
     try:
-        msgs: list[BaseMessage] = [
-            SystemMessage(append_guardrail(JUDGE_SYSTEM)),
-            HumanMessage(
-                f"用户问题：{wrap_user_question(q)}\n\n"
-                f"=== 已检索到的知识库片段（共 {len(state['accumulated'])} 条，"
-                f"以下为分数最高的若干条）===\n{wrap_retrieved_context(evidence)}\n\n"
-                f"已检索轮次：{state['iteration']}/{MAX_ITER}（{label}）\n\n"
-                "请判断信息是否足够回答（输出 JSON）。"
-            ),
-        ]
-        resp = await llm.ainvoke(msgs)
-        data = json.loads(_extract_json(str(resp.content)))
-        verdict = _norm_verdict(data.get("verdict"))
-        rewritten = str(data.get("rewritten_query") or "").strip()
-        clarify_q = str(data.get("clarify_question") or "").strip()
+        if verdict is None:
+            llm = get_llm(temperature=0.0)
+            msgs: list[BaseMessage] = [
+                SystemMessage(append_guardrail(JUDGE_SYSTEM)),
+                HumanMessage(
+                    f"用户问题：{wrap_user_question(q)}\n\n"
+                    f"=== 已检索到的知识库片段（共 {len(state['accumulated'])} 条，"
+                    f"以下为分数最高的若干条）===\n{wrap_retrieved_context(evidence)}\n\n"
+                    f"已检索轮次：{state['iteration']}/{MAX_ITER}（{label}）\n\n"
+                    "请判断信息是否足够回答（输出 JSON）。"
+                ),
+            ]
+            resp = await llm.ainvoke(msgs)
+            data = json.loads(_extract_json(str(resp.content)))
+            verdict = _norm_verdict(data.get("verdict"))
+            rewritten = str(data.get("rewritten_query") or "").strip()
+            clarify_q = str(data.get("clarify_question") or "").strip()
     except Exception:
         # Judge 异常时保守处理：已达到上限就生成，否则再查一轮
         verdict = "sufficient" if state["iteration"] >= MAX_ITER else "need_more"
         rewritten = ""
         clarify_q = ""
         data = {}
+
+    # ── 决策模型 active：生成字段按需补 LLM（决策模型不产文本）──
+    if dm_mode == "active":
+        if not rewritten and verdict == "need_rewrite" and settings.decision_model_judge_rewrite_llm:
+            try:
+                rewritten = await _dm_generate_rewrite(q, evidence)
+            except Exception:  # noqa: BLE001  改写失败 → 留空走「换策略」提示
+                logger.warning("decision_model.rewrite_generate_failed", exc_info=True)
+        if not clarify_q and verdict == "need_clarify" and settings.decision_model_judge_rewrite_llm:
+            try:
+                clarify_q = await _dm_generate_clarify(q, evidence)
+            except Exception:  # noqa: BLE001  澄清问句失败 → 守卫会拦截空问句
+                logger.warning("decision_model.clarify_generate_failed", exc_info=True)
+
+    # ── 影子模式：LLM 已主判，决策模型并行判定只记录 ──
+    if dm_mode == "shadow":
+        try:
+            r = await asyncio.to_thread(
+                dm.judge_verdict, q, evidence, state["iteration"], MAX_ITER
+            )
+            dm_record = {
+                "node": "reflect", "source": "dm_shadow",
+                "llm_verdict": verdict,
+                "dm_verdict": r["verdict"],
+                "dm_probs": r["probs"], "dm_p_sufficient": r["p_sufficient"],
+            }
+        except Exception:  # noqa: BLE001  影子失败不影响主链路
+            dm_record = {"node": "reflect", "source": "dm_shadow", "error": True}
+        logger.info("decision_model.shadow.reflect", extra={k: dm_record.get(k) for k in ("source", "dm_verdict")})
+
     logger.info(
         "reflect.decision",
         extra={
@@ -759,17 +906,22 @@ async def reflect(state: AgentState) -> dict:
     # 闸门覆盖（Judge 本想继续但被强制停）或覆盖视图有额外章节 → 都需反向放宽生成窗口
     widen_context = widen_context or gate_overrode
 
+    judge_entry = {
+        "iteration": state["iteration"],
+        "verdict": verdict,
+        "reason": data.get("reason", ""),
+        "rewritten_query": rewritten,
+        "clarify_question": clarify_q,
+    }
+    if dm_record:
+        judge_entry.update({k: v for k, v in dm_record.items() if k != "node"})
+
     return {
         "judge_verdict": verdict,
         "rewritten_query": rewritten,
         "clarify_question": clarify_q,
-        "judge_log": [{
-            "iteration": state["iteration"],
-            "verdict": verdict,
-            "reason": data.get("reason", ""),
-            "rewritten_query": rewritten,
-            "clarify_question": clarify_q,
-        }],
+        "judge_log": [judge_entry],
+        "dm_shadow": [dm_record] if dm_record else [],
         "doc_count_at_last_reflect": current_doc_count,
         "no_new_doc_streak": streak,
         "widen_context": widen_context,

@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # bge-reranker-v2-m3 模型本身支持到 max_position_embeddings=8194；取 2048 可覆盖 v2 的
     # 800 字块与 v2b 的 2000 字父块，且代价可控（注意力平方级，但每轮仅重排 top-k 候选）。
     reranker_max_length: int = 2048
+    # 逗号分隔的设备列表（如 "cpu"）。留空=沿用 FlagEmbedding 自动选设备。
+    # 本地大模型占满显存时用它把重排切到 CPU：隐藏 CUDA 会让 FlagEmbedding 走
+    # 多进程池但拿到 0 个设备，直接崩在 encode_multi_process。
+    reranker_devices: str = ""
 
     # === RAGAS ===
     ragas_base_url: str = "http://localhost:11434/v1"
@@ -59,6 +63,9 @@ class Settings(BaseSettings):
     # （评测 faithfulness judge 实测卡 15min+）。httpx 超时抛异常 → 上层重试逻辑可接管。
     # 注意：超时按「读间隔」计而非总时长，流式长回答不受影响。
     agent_request_timeout: int = 180
+    # 429/连接抖动的重试次数（openai SDK 指数退避，上限 ~8s/次）。
+    # 默认 2 = 与改造前一致；免费网关按 rpm 限流时评测把它调大，避免整题被打成 None。
+    agent_max_retries: int = 2
 
     # === 上下文凝练 / 长程摘要 专属 LLM（可选，独立通道）===
     # 设计：默认全部留空 → 凝练 / 摘要都复用 AGENT_* 主文本通道（与改造前逐字节等价，零回归）。
@@ -232,6 +239,27 @@ class Settings(BaseSettings):
     # 生成窗口反向放宽：当靠覆盖视图 / 收敛闸门提前放行时，
     # 生成上下文从 top_k_rerank 放宽到该值，避免低分但相关的内容在生成端被裁掉。
     agent_generate_widen_top_k: int = 10
+
+    # === 决策模型（阿里云百炼 decision-model-preview，TypeSafe System One 协议）===
+    # 用小决策模型替代 router 意图识别 / Judge 五类 verdict 的 LLM 调用。
+    # 默认全关 = 与现状逐字节等价（零回归约定）；任何失败（超时/解析/网络）自动回退原 LLM 路径。
+    # 文档：docs.bailian.console.aliyun.com/zh/model-studio/decision-model-api
+    decision_model_enabled: bool = False
+    # 灰度粒度："router"（仅意图识别）/ "judge"（仅充分性判定）/ "all"
+    decision_model_scope: str = "all"
+    # 影子模式：LLM 照常主判（主链路零变化），决策模型并行判定只记 dm_shadow 日志，
+    # 评测时逐题对比一致率。建议先 shadow 跑一轮再直接切换。
+    decision_model_shadow: bool = False
+    # 单次决策请求超时（秒）。服务端实测 ~50ms，5s 已极宽松；超时即回退 LLM。
+    decision_model_timeout: int = 5
+    # 业务空间专属域名（形如 https://llm-xxx.cn-beijing.maas.aliyuncs.com）。
+    # 留空则依次探测 dashscope.aliyuncs.com / trial.cn-beijing.maas.aliyuncs.com。
+    decision_model_host: str = ""
+    # API Key：留空回落到环境变量 DASHSCOPE_API_KEY。
+    decision_model_api_key: str = ""
+    # 决策模型判 need_rewrite / need_clarify 后，改写问句/澄清问句是否仍走 LLM 生成
+    # （决策模型只产 verdict 不产文本；关掉则改写字段为空，走 rewrite 提示换策略）。
+    decision_model_judge_rewrite_llm: bool = True
 
 
 settings = Settings()
