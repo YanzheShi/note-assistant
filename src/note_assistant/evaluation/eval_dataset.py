@@ -94,7 +94,7 @@ class EvalDataset:
             "name": self.name,
             "questions": [q.to_dict() for q in self.questions],
         }
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> EvalDataset:
