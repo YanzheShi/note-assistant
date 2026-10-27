@@ -52,7 +52,7 @@ def test_svg_no_structure_text_only():
 def test_enricher_svg_route_zero_vlm(tmp_path, monkeypatch):
     """mime=svg 的图片走原生解析，零 VLM 调用，富化为 SVG 图摘要。"""
     p = tmp_path / "flow.svg"
-    p.write_text(SAMPLE_SVG)
+    p.write_text(SAMPLE_SVG, encoding="utf-8")
     # G6：enricher 总开关默认 False，这里显式开启以验证 svg 路由
     monkeypatch.setattr("note_assistant.config.settings.image_understand_enabled", True)
     enricher = make_image_enricher(tmp_path)
