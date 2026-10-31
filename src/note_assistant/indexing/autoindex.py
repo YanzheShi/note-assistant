@@ -4,8 +4,8 @@
 
 架构（docs/自动增量索引（auto-reindex）设计方案.md）：
 
-    vault/*.md 变更 ──► watchfiles.awatch(watch_filter=忽略规则)
-        │ 过滤 .md + 排除隐藏目录与 INDEX_IGNORE_DIRS（规则见 indexing/ignore.py）
+    vault/*.{md,html} 变更 ──► watchfiles.awatch(watch_filter=忽略规则)
+        │ 过滤 index_extensions + 排除隐藏目录与 INDEX_IGNORE_DIRS（见 indexing/ignore.py）
         │ debounce 收集窗口（默认 3s，合并 Obsidian 保存的多事件）
         ▼
     change_queue (asyncio.Queue) ──► worker 单飞（asyncio.Lock）
@@ -43,8 +43,11 @@ logger = logging.getLogger(__name__)
 _FULL: str = "full"
 
 
-def is_indexable_md(rel: str) -> bool:
-    """watcher 过滤：只看 .md，且套用统一忽略规则（与 VaultLoader.scan 同源）。
+def is_indexable_file(rel: str) -> bool:
+    """watcher 过滤：只看 index_extensions 内的文档，且套用统一忽略规则。
+
+    与 VaultLoader.scan 同源：两边都从 settings.index_extensions 取扩展名，
+    避免「全量索引扫到了但 watcher 不触发」这类规则漂移。
 
     Args:
         rel: 相对 vault 根的路径（正斜杠或反斜杠分隔）
@@ -52,7 +55,10 @@ def is_indexable_md(rel: str) -> bool:
     Returns:
         True 表示该路径值得进入索引队列
     """
-    if not rel.lower().endswith(".md"):
+    from pathlib import PurePosixPath
+
+    ext = PurePosixPath(rel.replace("\\", "/")).suffix.lower()
+    if ext not in {e.lower() for e in settings.index_extensions}:
         return False
     return not is_ignored(rel)
 
@@ -173,14 +179,14 @@ class AutoIndexService:
         except ValueError:
             return None
         rel_str = rel.as_posix()
-        return rel_str if is_indexable_md(rel_str) else None
+        return rel_str if is_indexable_file(rel_str) else None
 
     def _watch_filter(self, _event_type, path: str) -> bool:
         """交给 watchfiles 的事件级过滤：忽略路径不进 Python，省掉无谓的 absorb 空转。"""
         return self._rel_if_indexable(path) is not None
 
     def _absorb(self, changes) -> bool:
-        """吸收一批 watchfiles 事件到 pending；返回是否有值得入队的 .md 变更。"""
+        """吸收一批 watchfiles 事件到 pending；返回是否有值得入队的文档变更。"""
         dirty = False
         for change, path in changes:
             rel_str = self._rel_if_indexable(path)

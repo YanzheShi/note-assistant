@@ -43,7 +43,7 @@ def banner(t: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--file", default=None, help="指定单篇 md 相对 vault 的路径")
+    ap.add_argument("--file", default=None, help="指定单篇文档（md/html）相对 vault 的路径")
     ap.add_argument("--strategy", default=None, choices=["v1", "v2", "v2b"])
     ap.add_argument("--commit", action="store_true", help="真正写入 ChromaDB（默认只打印）")
     ap.add_argument("--embed", action="store_true", help="单独测试 Ollama embedding 维度")
@@ -59,7 +59,7 @@ def main() -> None:
     loader = VaultLoader()
     paths = loader.scan()
     if not paths:
-        print("[WARN] 没扫到 .md，检查 vault_path 配置")
+        print("[WARN] 没扫到可索引文档（INDEX_EXTENSIONS），检查 vault_path 配置")
         return
     target = None
     if args.file:

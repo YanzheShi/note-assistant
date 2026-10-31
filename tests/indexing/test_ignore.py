@@ -149,8 +149,8 @@ def test_attachment_index_excludes_ignored(wired_vault):
 
 
 def test_autoindex_filter_uses_same_rule(wired_vault):
-    from note_assistant.indexing.autoindex import is_indexable_md
+    from note_assistant.indexing.autoindex import is_indexable_file
 
-    assert is_indexable_md("note.md") is True
-    assert is_indexable_md("templates/tpl.md") is False
-    assert is_indexable_md(".workbuddy/memory/m.md") is False
+    assert is_indexable_file("note.md") is True
+    assert is_indexable_file("templates/tpl.md") is False
+    assert is_indexable_file(".workbuddy/memory/m.md") is False

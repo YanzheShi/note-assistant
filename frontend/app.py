@@ -167,12 +167,12 @@ def render_chat_pane(mode: str):
         st.rerun()
 
     # ── 历史回放 ──
-    for msg in messages:
+    for i, msg in enumerate(messages):
         with st.chat_message(msg["role"]):
             # 渲染时重写 /assets/ 相对 URL（存原文，API 地址变更后历史仍可渲染图片）
             st.markdown(rewrite_asset_urls(msg["content"], API_URL))
             if msg["role"] == "assistant" and "sources" in msg:
-                render_sources(msg["sources"], backend_base_url=API_URL)
+                render_sources(msg["sources"], backend_base_url=API_URL, render_id=f"msg_{i}")
 
     # ── 输入（必须在 tab 内；空输入直接 return，不 st.stop，避免误伤另一 tab）──
     question = st.chat_input("问我你的笔记里有什么...", key=f"input_{mode}")
@@ -349,7 +349,12 @@ def render_chat_pane(mode: str):
                     st.markdown("✅ 完成")
 
             if sources_list:
-                render_sources(sources_list, backend_base_url=API_URL)
+                # 助手消息随后会 append 到 len(messages) 的位置；流式当场与历史回放
+                # 用同一个 render_id，按钮点击 rerun 后才能命中同一个 widget。
+                render_sources(
+                    sources_list, backend_base_url=API_URL,
+                    render_id=f"msg_{len(messages)}",
+                )
 
             full_answer = answer_text
             result["run_id"] = run_id

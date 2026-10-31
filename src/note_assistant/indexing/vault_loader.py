@@ -5,6 +5,8 @@ from typing import List, Dict, Any
 
 from note_assistant.indexing.types import DocNode  # 导入DocNode
 from note_assistant.indexing.ignore import is_ignored
+from note_assistant.indexing.html_loader import load_html
+from note_assistant.indexing.markdown_utils import extract_headings, extract_wikilinks
 from note_assistant.config import settings
 
 
@@ -13,12 +15,16 @@ class VaultLoader:
         self.vault_path = Path(vault_path) if vault_path else settings.vault_path.resolve()
 
     def scan(self) -> List[Path]:
-        """扫所有.md，按 indexing.ignore 规则排除隐藏目录与配置的忽略目录"""
-        md_paths = []
-        for p in self.vault_path.rglob("*.md"):
-            if not is_ignored(p.relative_to(self.vault_path)):
-                md_paths.append(p)
-        return md_paths
+        """扫 index_extensions 内的文档（默认 md/html/htm），套用统一的忽略规则。"""
+        allowed = {ext.lower() for ext in settings.index_extensions}
+        paths = []
+        for p in self.vault_path.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in allowed:
+                continue
+            if is_ignored(p.relative_to(self.vault_path)):
+                continue
+            paths.append(p)
+        return sorted(paths)
 
     def _parse_front_matter(self, text: str) -> Dict[str, Any]:
         """解析front matter，无fm返回空字典"""
@@ -32,30 +38,18 @@ class VaultLoader:
 
     def _extract_wikilinks(self, text: str) -> List[str]:
         """提取[[link]]，去重保序"""
-        links = re.findall(r'\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]', text)
-        seen = set()
-        result = []
-        for link in links:
-            if link not in seen:
-                seen.add(link)
-                result.append(link)
-        return result
+        return extract_wikilinks(text)
 
     def _extract_headings(self, text: str) -> List[Dict[str, Any]]:
         """提取标题树，带行号"""
-        headings = []
-        for i, line in enumerate(text.split('\n'), 1):
-            match = re.match(r'^(#{1,6})\s+(.+)$', line)
-            if match:
-                headings.append({
-                    "level": len(match.group(1)),
-                    "text": match.group(2).strip(),
-                    "line": i
-                })
-        return headings
+        return extract_headings(text)
 
-    def load_file(self, md_path: Path) -> DocNode:
-        """加载单篇笔记，返回DocNode"""
+    def load_file(self, path: Path) -> DocNode:
+        """加载单篇文档：HTML 归一化为 Markdown，其余按 Markdown 读取。"""
+        if path.suffix.lower() in {".html", ".htm"}:
+            return load_html(path, self.vault_path)
+
+        md_path = path
         raw_full = md_path.read_text(encoding="utf-8")
         # 剥离front matter，取正文
         fm = self._parse_front_matter(raw_full)

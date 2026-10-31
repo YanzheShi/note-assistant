@@ -33,6 +33,11 @@ class AskRequest(BaseModel):
     )
 
 
+class SourceOpenRequest(BaseModel):
+    """用系统默认程序打开 vault 内文档的请求体。"""
+    filepath: str = Field(..., min_length=1, description="相对 vault 根的文档路径")
+
+
 # ═══════════════════════════════════════════════════════════════
 # 来源（响应中的单个来源片段）
 # ═══════════════════════════════════════════════════════════════

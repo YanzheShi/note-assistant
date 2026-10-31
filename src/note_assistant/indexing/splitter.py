@@ -13,6 +13,7 @@ from note_assistant.indexing.vault_loader import VaultLoader
 # ================================================================
 _HEADER_CONFIG = [
     ("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4"),
+    ("#####", "h5"), ("######", "h6"),
 ]
 
 
@@ -136,7 +137,7 @@ def split_v2(
         # 先放整篇级 metadata，再用 chunk 自身的 h1-h4 覆盖
         meta = {**base_meta, **fc.metadata}
         # 从metadata里取h1-h4，拼接成路径
-        hp_parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4"]]
+        hp_parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4", "h5", "h6"]]
 
         hp = " > ".join(p for p in hp_parts if p) or "无标题"
         meta["heading_path"] = hp
@@ -152,8 +153,8 @@ def split_v2(
 # v2b 内部辅助函数（仅 split_v2b 使用，不对外暴露）
 # ================================================================
 def _heading_path(meta: Dict[str, Any]) -> str:
-    """从 metadata 的 h1-h4 拼接 heading_path；全空时回退 "无标题"。"""
-    parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4"]]
+    """从 metadata 的 h1-h6 拼接 heading_path；全空时回退 "无标题"。"""
+    parts = [meta.get(k, "") for k in ["h1", "h2", "h3", "h4", "h5", "h6"]]
     return " > ".join(p for p in parts if p) or "无标题"
 
 
@@ -165,7 +166,7 @@ def _top_header(meta: Dict[str, Any]) -> str:
     h1 而被合并进同一个父块，父段 heading_path 塌缩成只剩文档标题。
     无 h2/h3/h4 时才回退到 h1。
     """
-    for k in ["h2", "h3", "h4", "h1"]:
+    for k in ["h2", "h3", "h4", "h5", "h6", "h1"]:
         v = meta.get(k, "")
         if v:
             return v

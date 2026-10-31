@@ -1,7 +1,12 @@
+import logging
+import time
+
 import ollama
 from typing import List
 
 from note_assistant.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaEmbedder:
@@ -13,11 +18,32 @@ class OllamaEmbedder:
         self._client = ollama.Client(host=self.base_url)
 
     def embed(self, texts: List[str]) -> List[List[float]]:
-        """批量嵌入，返回向量列表（每个长度=embed_dim）"""
+        """批量嵌入，返回向量列表（顺序与输入一致）。"""
         if not texts:
             return []
-        resp = self._client.embed(model=self.model, input=texts)
-        return resp["embeddings"]
+        batch_size = max(1, int(settings.embed_batch_size))
+        vectors: List[List[float]] = []
+        for start in range(0, len(texts), batch_size):
+            vectors.extend(self._embed_batch(texts[start:start + batch_size]))
+        return vectors
+
+    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """单批嵌入；Ollama 偶发 500（Compute error）时退避重试。"""
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = self._client.embed(model=self.model, input=texts)
+                return resp["embeddings"]
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                if attempt < 2:
+                    logger.warning(
+                        "ollama embed failed (attempt %d/3, %d texts): %s",
+                        attempt + 1, len(texts), e,
+                    )
+                    time.sleep(1.5 * (attempt + 1))
+        assert last_error is not None
+        raise last_error
 
     def embed_one(self, text: str) -> List[float]:
         """单条快捷方法"""

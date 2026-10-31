@@ -15,9 +15,9 @@ _root = Path(__file__).resolve().parents[2]
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-import pytest
+import pytest  # noqa: E402
 
-import frontend.components.source_expander as se
+import frontend.components.source_expander as se  # noqa: E402
 
 
 class _FakeSt:
@@ -39,6 +39,18 @@ class _FakeSt:
 
     def checkbox(self, *a, **k):
         return False
+
+    def button(self, *a, **k):
+        return False
+
+    def toast(self, *a, **k):
+        pass
+
+    def warning(self, *a, **k):
+        pass
+
+    def error(self, *a, **k):
+        pass
 
     def expander(self, *a, **k):
         # 用作 `with st.expander(...) as exp:` —— 返回支持上下文管理器的哑对象
@@ -101,3 +113,33 @@ def test_no_backend_base_url_shows_actionable_caption(fake_st):
     assert not fake_st.image_calls, "无后端地址时不应当尝试渲染图片"
     cap = " ".join(fake_st.caption_calls)
     assert "API 地址" in cap, f"caption 应提示填 API 地址，实际：{cap}"
+
+
+def test_html_source_uses_source_endpoint(fake_st, monkeypatch):
+    """HTML 来源应走 /source 原文查看，而不是 obsidian://。"""
+    calls = []
+    monkeypatch.setattr(se, "_render_path_actions", lambda *a, **k: calls.append((a, k)))
+
+    se.render_sources(
+        [{"filepath": "面试 题/doc.html", "kind": "text", "preview": "x"}],
+        backend_base_url="http://localhost:8005",
+    )
+    assert calls
+    args, kwargs = calls[0]
+    assert kwargs["source_url"] == "http://localhost:8005/source/%E9%9D%A2%E8%AF%95%20%E9%A2%98/doc.html"
+    assert args[1] == ""  # obsidian_url 为空
+    assert kwargs["rel_path"] == "面试 题/doc.html"
+
+
+def test_markdown_source_keeps_obsidian_link(fake_st, monkeypatch):
+    calls = []
+    monkeypatch.setattr(se, "_render_path_actions", lambda *a, **k: calls.append((a, k)))
+
+    se.render_sources(
+        [{"filepath": "note.md", "kind": "text", "preview": "x"}],
+        backend_base_url="http://localhost:8005",
+    )
+    assert calls
+    args, kwargs = calls[0]
+    assert kwargs["source_url"] == ""
+    assert args[1].startswith("obsidian://open")

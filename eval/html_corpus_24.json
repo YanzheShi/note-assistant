@@ -1,0 +1,173 @@
+{
+  "name": "html_corpus_24",
+  "questions": [
+    {
+      "question": "JVM 运行时内存区域有哪些？哪些是线程私有的？",
+      "golden_answer": "",
+      "relevant_files": ["jvm-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "JVM 的分代回收理论、CMS、G1、ZGC 有什么区别？",
+      "golden_answer": "",
+      "relevant_files": ["jvm-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "用表格总结 JVM 各内存区域是否线程私有以及会抛什么异常",
+      "golden_answer": "",
+      "relevant_files": ["jvm-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "消息队列怎么保证消息不丢、不重和顺序消费？",
+      "golden_answer": "",
+      "relevant_files": ["mq-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "Kafka 的分区和消费者组是怎么工作的？",
+      "golden_answer": "",
+      "relevant_files": ["mq-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "MySQL 索引失效的常见场景有哪些？",
+      "golden_answer": "",
+      "relevant_files": ["mysql-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "MySQL 的 MVCC 和事务隔离级别是怎么实现的？",
+      "golden_answer": "",
+      "relevant_files": ["mysql-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "Spring Bean 循环依赖怎么解决？三级缓存分别存什么？",
+      "golden_answer": "",
+      "relevant_files": ["springboot-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "Spring Cloud 里熔断、降级和限流有什么区别？",
+      "golden_answer": "",
+      "relevant_files": ["springcloud-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "synchronized 的锁升级过程是怎样的？",
+      "golden_answer": "",
+      "relevant_files": ["java-concurrent-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "Redis 缓存穿透、击穿、雪崩的区别和解决方案？",
+      "golden_answer": "",
+      "relevant_files": ["redis-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "ES 中 text 和 keyword 字段有什么区别，match 和 term 查询怎么选？",
+      "golden_answer": "",
+      "relevant_files": ["es-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "Flink 的 checkpoint 机制和背压是怎么工作的？",
+      "golden_answer": "",
+      "relevant_files": ["spark-flink-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "花旗项目里的蓝绿部署是怎么实现和回滚的？",
+      "golden_answer": "",
+      "relevant_files": ["花旗-CICD与DevOps面试笔记.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "K8s 的 API Server 和控制器控制循环是怎么工作的？",
+      "golden_answer": "",
+      "relevant_files": ["K8s-API与SDK-深度学习笔记.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "Dify 二次开发有哪些扩展点？按侵入度怎么排序？",
+      "golden_answer": "",
+      "relevant_files": ["Dify二次开发-面试题整理.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "上下文管理的 Write、Select、Compress、Isolate 四种通用手法是什么？",
+      "golden_answer": "",
+      "relevant_files": ["上下文管理-深度学习文档.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "智能座舱语音的端到端时延预算怎么拆？首音延迟怎么优化？",
+      "golden_answer": "",
+      "relevant_files": ["智能座舱语音交互-面试深度学习笔记.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "智能座舱打断仲裁的伪代码逻辑是什么？",
+      "golden_answer": "",
+      "relevant_files": ["智能座舱语音交互-面试深度学习笔记.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "多 Agent 系统怎么防止循环失控和死循环？",
+      "golden_answer": "",
+      "relevant_files": ["多Agent系统设计与实战-深度学习笔记.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "线上 CPU 100% 应该怎么排查？",
+      "golden_answer": "",
+      "relevant_files": ["后端线上问题排查-深度学习笔记.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "Java 手写 LRU 缓存怎么做？",
+      "golden_answer": "",
+      "relevant_files": ["java-algo-interview.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "如何设计支持断点恢复的 Agent 任务调度器？",
+      "golden_answer": "",
+      "relevant_files": ["AI应用设计题-深度学习笔记.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    },
+    {
+      "question": "Agent 工具调用失败时怎么重试和兜底？",
+      "golden_answer": "",
+      "relevant_files": ["字节跳动-Agent开发岗面试题深度整理.html"],
+      "relevant_chunk_ids": [],
+      "turns": null
+    }
+  ]
+}

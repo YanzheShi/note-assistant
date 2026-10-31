@@ -17,23 +17,29 @@ FastAPI 入口 —— RAG 对外接口。
         - 错误处理与限流
 """
 
+import os
 import re
+import subprocess
+import sys
 import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import chromadb
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 
 from note_assistant.config import settings
+from note_assistant.indexing.ignore import is_ignored
 from note_assistant.logger_util import set_request_id, setup_logging
 from note_assistant.agent import runner as agent_runner
 from note_assistant.api.schemas import (
     AskRequest,
     AskResponse,
+    SourceOpenRequest,
     SourceSchema,
     HealthResponse,
     ReindexResponse,
@@ -536,6 +542,95 @@ async def get_asset(asset_id: str):
     except Exception as e:
         logger.warning(f"asset serve failed: {e}")
         raise HTTPException(status_code=404, detail="asset not found")
+
+
+# ═══════════════════════════════════════════════════════════════
+# /source/{path} — 原文查看（HTML 安全预览 + 系统程序打开）
+# ═══════════════════════════════════════════════════════════════
+
+# 沙箱 CSP：允许内联样式与图片，禁用脚本/表单/顶层跳转。
+# 下载来的网页可能携带任意 JS，绝不能让它以 API 同源身份执行。
+_HTML_SOURCE_CSP = (
+    "sandbox; default-src 'none'; style-src 'unsafe-inline'; "
+    "img-src data: https: http:; font-src data:"
+)
+
+
+def _resolve_vault_file(rel_path: str) -> Path:
+    """把 vault 相对路径解析成真实文件，阻断穿越 / 隐藏目录 / 非索引后缀。"""
+    raw = (rel_path or "").replace("\\", "/").lstrip("/")
+    candidate = Path(raw)
+    if not raw or candidate.is_absolute() or ".." in candidate.parts:
+        raise HTTPException(status_code=404, detail="source not found")
+
+    root = settings.vault_path.resolve()
+    try:
+        target = (root / candidate).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=404, detail="source not found")
+
+    if not target.is_relative_to(root) or not target.is_file():
+        raise HTTPException(status_code=404, detail="source not found")
+    if target.suffix.lower() not in {ext.lower() for ext in settings.index_extensions}:
+        raise HTTPException(status_code=404, detail="source not found")
+    if is_ignored(target.relative_to(root)):
+        raise HTTPException(status_code=404, detail="source not found")
+    return target
+
+
+@app.get("/source/{rel_path:path}")
+async def get_source(rel_path: str, request: Request):
+    """返回 vault 内文档原文。
+
+    HTML 走 CSP sandbox：保留版式与图片，脚本/表单全部失效；
+    Markdown 以纯文本返回。两者都带 ETag，可条件请求。
+    """
+    target = _resolve_vault_file(rel_path)
+    stat = target.stat()
+    etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+
+    if target.suffix.lower() in (".html", ".htm"):
+        from note_assistant.indexing.html_loader import decode_html_bytes
+
+        headers["Content-Security-Policy"] = _HTML_SOURCE_CSP
+        return Response(
+            decode_html_bytes(target.read_bytes()),
+            media_type="text/html; charset=utf-8",
+            headers=headers,
+        )
+
+    return Response(
+        target.read_text(encoding="utf-8", errors="replace"),
+        media_type="text/plain; charset=utf-8",
+        headers=headers,
+    )
+
+
+@app.post("/source/open")
+async def open_source(req: SourceOpenRequest, request: Request):
+    """用系统默认程序打开 vault 内文档（仅接受本机调用）。"""
+    if request.client and request.client.host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="local only")
+
+    target = _resolve_vault_file(req.filepath)
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+    except Exception as e:
+        logger.warning("open source failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"打开失败: {e}")
+    return {"status": "opened", "path": str(target)}
 
 
 # ═══════════════════════════════════════════════════════════════

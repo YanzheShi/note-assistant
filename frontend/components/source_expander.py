@@ -90,7 +90,7 @@ def _render_image(img_path: str, caption: str = "", base_url: str = "") -> None:
     st.caption("图片文件不可见（vault 内短名引用需附件索引解析，见 P1）")
 
 
-def render_sources(sources: list[dict], backend_base_url: str = ""):
+def render_sources(sources: list[dict], backend_base_url: str = "", render_id: str = ""):
     """
     来源折叠展示，按类型区分渲染。
 
@@ -147,13 +147,21 @@ def render_sources(sources: list[dict], backend_base_url: str = ""):
         if score:
             label += f" `({score:.2f})`"
 
-        # 绝对路径与 obsidian:// 链接（点击跳到 Obsidian 或复制路径）
+        # 绝对路径与打开方式：md 走 obsidian://，html 走 /source 原文查看
         abs_path = resolve_vault_path(filepath, vault_root=vault_root())
-        obsidian_url = obsidian_open_url(filepath, vault_name=vault_name())
+        is_html = Path(filepath).suffix.lower() in (".html", ".htm")
+        obsidian_url = "" if is_html else obsidian_open_url(filepath, vault_name=vault_name())
+        source_url = _source_url(filepath, backend_base_url) if is_html else ""
 
         with st.expander(label, expanded=show_all):
-            # 路径操作栏：复制绝对路径 + 在 Obsidian 中打开
-            _render_path_actions(abs_path, obsidian_url, idx=i)
+            # 路径操作栏：复制绝对路径 + md 跳 Obsidian / html 查看原文
+            _render_path_actions(
+                abs_path, obsidian_url, idx=i,
+                source_url=source_url, rel_path=filepath,
+                # 流式当场渲染与落盘后的历史回放必须共用同一个键，
+                # 否则按钮点击触发的 rerun 找不到对应 widget，点击会被吞掉。
+                render_key=f"{render_id or filepath}:{i}",
+            )
             # ── 预览（所有类型都有） ──
             preview = src.get("preview", "")
             if preview:
@@ -279,13 +287,51 @@ def obsidian_open_url(filepath: str, vault_name: str = "") -> str:
     return f"obsidian://open?file={encoded_path}"
 
 
-def _render_path_actions(abs_path: str, obsidian_url: str, idx: int = 0) -> None:
-    """
-    在 expander 顶部渲染路径操作栏：[复制路径] 按钮 + [在 Obsidian 中打开] 链接。
+def _source_url(filepath: str, backend_base_url: str = "") -> str:
+    """构造后端原文查看 URL；没有后端地址时返回空串。"""
+    base = (backend_base_url or os.environ.get("BACKEND_BASE_URL", "")).rstrip("/")
+    if not base or not filepath:
+        return ""
+    return f"{base}/source/{_url_quote(filepath, safe='/')}"
 
-    两个能力互不依赖：
-      - 复制路径：即使没装 Obsidian 也有用，复制后手动打开编辑器/资源管理器
-      - obsidian://：装了 Obsidian 桌面版的用户点一下就跳过去，最省事
+
+def _open_with_system_app(backend_base_url: str, rel_path: str) -> None:
+    """请求后端用系统默认程序打开文件（仅本机可用）。"""
+    import json
+    import urllib.request
+
+    base = (backend_base_url or os.environ.get("BACKEND_BASE_URL", "")).rstrip("/")
+    if not base:
+        st.warning("未配置后端地址（BACKEND_BASE_URL），无法用系统程序打开。")
+        return
+    payload = json.dumps({"filepath": rel_path}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/source/open",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            st.toast("已用系统默认程序打开")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"打开失败：{e}")
+
+
+def _render_path_actions(
+    abs_path: str,
+    obsidian_url: str,
+    idx: int = 0,
+    source_url: str = "",
+    rel_path: str = "",
+    render_key: str = "",
+) -> None:
+    """
+    在 expander 顶部渲染路径操作栏：[复制路径] + 打开方式。
+
+    打开方式按文件类型分流：
+      - Markdown → obsidian://（装了 Obsidian 时最省事）
+      - HTML     → /source 浏览器预览 + 系统默认程序打开
 
     没有绝对路径信息时（filepath 为空）整个操作栏不渲染，避免空占位。
 
@@ -397,4 +443,12 @@ def _render_path_actions(abs_path: str, obsidian_url: str, idx: int = 0) -> None
         st.markdown(
             f"[🔗 在 Obsidian 中打开]({obsidian_url})",
         )
+
+    if source_url:
+        st.markdown(f"[🌐 在浏览器中打开原文]({source_url})")
+        if st.button(
+            "🖥️ 用系统默认程序打开",
+            key=f"open_source_{render_key}",
+        ):
+            _open_with_system_app(source_url.rsplit("/source/", 1)[0], rel_path)
 

@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from watchfiles import Change  # noqa: E402
 
 from note_assistant.config import settings  # noqa: E402
-from note_assistant.indexing.autoindex import AutoIndexService, is_indexable_md  # noqa: E402
+from note_assistant.indexing.autoindex import AutoIndexService, is_indexable_file  # noqa: E402
 from note_assistant.indexing.sync import SyncDB  # noqa: E402
 
 
@@ -92,26 +92,30 @@ def _sync_db(tmp_path) -> SyncDB:
 
 class TestFilter:
     def test_indexable_md(self):
-        assert is_indexable_md("a.md") is True
-        assert is_indexable_md("dir/sub/a.md") is True
+        assert is_indexable_file("a.md") is True
+        assert is_indexable_file("dir/sub/a.md") is True
 
-    def test_non_md_ignored(self):
-        assert is_indexable_md("a.txt") is False
-        assert is_indexable_md("assets/pic.png") is False
-        assert is_indexable_md("dir/noext") is False
+    def test_html_indexable(self):
+        assert is_indexable_file("a.html") is True
+        assert is_indexable_file("dir/sub/b.HTM") is True
+
+    def test_non_document_ignored(self):
+        assert is_indexable_file("a.txt") is False
+        assert is_indexable_file("assets/pic.png") is False
+        assert is_indexable_file("dir/noext") is False
 
     def test_hidden_dirs_ignored(self):
-        assert is_indexable_md(".obsidian/x.md") is False
-        assert is_indexable_md(".trash/x.md") is False
-        assert is_indexable_md("dir/.hidden/note.md") is False
+        assert is_indexable_file(".obsidian/x.md") is False
+        assert is_indexable_file(".trash/x.md") is False
+        assert is_indexable_file("dir/.hidden/note.md") is False
 
     def test_configured_ignore_dirs(self, monkeypatch):
         """INDEX_IGNORE_DIRS 配置的目录名同样不进队列（与 VaultLoader.scan 同规则）。"""
         monkeypatch.setattr(settings, "index_ignore_dirs", ["templates", "附件"])
-        assert is_indexable_md("templates/x.md") is False
-        assert is_indexable_md("a/b/templates/c.md") is False
-        assert is_indexable_md("Templates/x.md") is False
-        assert is_indexable_md("a.md") is True
+        assert is_indexable_file("templates/x.md") is False
+        assert is_indexable_file("a/b/templates/c.md") is False
+        assert is_indexable_file("Templates/x.md") is False
+        assert is_indexable_file("a.md") is True
 
     def test_watch_filter_drops_noisy_paths(self, mini_vault, monkeypatch):
         """传给 watchfiles 的事件级过滤：忽略路径不进 Python。"""

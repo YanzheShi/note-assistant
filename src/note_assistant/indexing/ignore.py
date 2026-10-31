@@ -8,7 +8,7 @@
    用于非隐藏但与笔记无关的目录（模板目录、纯附件目录、vault 里 clone 的代码仓库）。
 
 之所以单独成模块：这条规则此前在 vault_loader.scan、assets.AttachmentIndex._build、
-autoindex.is_indexable_md 三处各写了一遍，加配置项时容易漏改其中一处导致
+autoindex.is_indexable_file 三处各写了一遍，加配置项时容易漏改其中一处导致
 「全量索引忽略了但 watcher 仍在重建」这类不一致。三处共用本模块即消除漂移。
 
 注意：

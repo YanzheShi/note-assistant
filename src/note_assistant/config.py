@@ -15,6 +15,9 @@ class Settings(BaseSettings):
 
     # === Obsidian Vault ===
     vault_path: Path = Path("./vault")
+    # 参与索引的文档扩展名。HTML 在加载层归一化为 Markdown，后续链路与笔记完全同构。
+    # 生效范围：全量扫描、增量索引、autoindex watcher。改后需重启后端并全量重建。
+    index_extensions: list[str] = [".md", ".html", ".htm"]
     # 索引忽略的目录名（大小写不敏感，vault 内任意层级命中即跳过）。
     # 隐藏目录（.obsidian / .git / .trash 等）无需配置，始终忽略。
     # 生效范围：全量索引、增量索引、附件索引、autoindex watcher，
@@ -25,6 +28,9 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     embed_model: str = "bge-m3:latest"
     embed_dim: int = 1024
+    # 单次 Ollama embed 请求的批大小。HTML 单文件可能切出 200+ chunks，
+    # 整文件一次请求在部分机器上会触发 Compute error；分批 + 重试更稳。
+    embed_batch_size: int = 64
 
     # === Vector Store ===
     chroma_persist_dir: Path = Path("./data/chroma")
